@@ -21,3 +21,5 @@ s9/jailbreak/jb/
 s9/tools/frida/node_modules/
 shim/fw_a630_gmu.h
 s9/shim/fw_a630_gmu.h
+op6/out/
+op6/dtb/
