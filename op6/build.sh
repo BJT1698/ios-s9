@@ -20,9 +20,10 @@ STAGE=${1:-m1}
 case $STAGE in
 m1) main="m1.c screen.c" ;;
 m2) main="m2.c con.c" ;;
+m8) main="m8.c con.c plat.c" ;;
 m4) main="m4.c con.c plat.c loader.c"
     [ -f "${PAYLOAD:-}" ] || { echo "m4 needs PAYLOAD=path/to/payload.bin" >&2; exit 2; } ;;
-*) echo "usage: build.sh [m1|m2|m4]" >&2; exit 2 ;;
+*) echo "usage: build.sh [m1|m2|m8|m4]" >&2; exit 2 ;;
 esac
 
 mkdir -p out/obj

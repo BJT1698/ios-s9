@@ -28,14 +28,19 @@
 #define STEP		0x1000000UL	/* 16 MiB between samples */
 
 /* Numbers only: a static array of string pointers would need ABS relocations. */
-#define NREG 2
-static const uint64_t r_start[NREG] = { 0xa1800000UL, 0xd4000000UL };
-static const uint64_t r_end[NREG]   = { 0xc0000000UL, 0xff000000UL };
+/*
+ * OnePlus 6 (8 GB, DRAM 0x80000000-0x27c8a0000): everything above the
+ * splash framebuffer (ends 0x9f800000), skipping ramoops (0xac300000,
+ * 4 MiB, our flight recorder) and rmtfs (0xf5b00000, modem shared mem).
+ */
+#define NREG 4
+static const uint64_t r_start[NREG] = { 0xa0000000UL, 0xad000000UL, 0xf6000000UL, 0x100000000UL };
+static const uint64_t r_end[NREG]   = { 0xac000000UL, 0xf5000000UL, 0x100000000UL, 0x27c000000UL };
 
 /* Name chosen at runtime (PC-relative literal load, no relocation). */
 static const char *rname(unsigned r)
 {
-	return r == 0 ? "R1 487M" : "R2 688M";
+	return r == 0 ? "R1 192M" : r == 1 ? "R2 1152M" : r == 2 ? "R3 160M" : "R4 6080M";
 }
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
@@ -63,7 +68,7 @@ static void step(const char *s)
 /* Value this address must hold: unique per address, both halves mixed in. */
 static uint32_t pattern(uint64_t a)
 {
-	return (uint32_t)a ^ (uint32_t)(a >> 32) ^ 0x53395252u;	/* "S9RR" */
+	return (uint32_t)a ^ (uint32_t)(a >> 32) ^ 0x4f503652u;	/* "OP6R" */
 }
 
 void shim_main(uint64_t dtb)
@@ -76,7 +81,7 @@ void shim_main(uint64_t dtb)
 	/* M1.1: 0x9d400000, 1440x2960, stride 5760, B G R A, autorefresh on */
 	fb_default();
 	con_clear(GREY);
-	con_title("SHIM M8: RAM LIVRE (3.2G?)");
+	con_title("OP6 SHIM M8: RAM LIVRE");
 	stage = "watchdog";
 	wdog_arm();
 	step_row = con_row();
@@ -132,7 +137,7 @@ void shim_main(uint64_t dtb)
 	put_dec(put(p, " falha="), bad);
 	con_str("TOTAL", b);
 	if (bad == 0) {
-		con_str("", "As duas regioes sao RAM livre: 3.2G viavel.");
+		con_str("", "Todas as regioes sao RAM livre.");
 	} else {
 		con_str("", "Alguma regiao nao e RAM livre (ver 1a falha).");
 	}
