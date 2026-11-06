@@ -14,7 +14,7 @@ OBJCOPY=llvm-objcopy
 READELF=llvm-readelf
 NM=llvm-nm
 DTS=${DTS:-dtb/op6-live.dts}
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-pie -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-builtin -Wall -Wextra -Wno-unused-command-line-argument"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -fno-pie -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-builtin -fno-jump-tables -Wall -Wextra -Wno-unused-command-line-argument"
 
 STAGE=${1:-m1}
 case $STAGE in
