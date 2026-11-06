@@ -1,0 +1,14 @@
+name: runner-probe
+on:
+  push:
+    branches: [enchilada]
+    paths: [".github/workflows/runner-probe.yml"]
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: sw_vers; ls -d /Applications/Xcode*.app
