@@ -76,7 +76,7 @@ void screen_draw(const struct m1_info *in)
 
 	bg = GREY;
 	fb_rect(0, 0, fb.width, fb.height, GREY);
-	fb_text(X0, 32, 6, "SHIM M1.1 RODOU!", YELLOW, GREY);
+	fb_text(X0, 32, 6, "OP6 SHIM M1 OK!", YELLOW, GREY);
 	fb_text(X0, 160, S, "OnePlus 6 -> iOS, milestone 1", WHITE, GREY);
 
 	/* If a label does not match its colour, red and blue are swapped. */

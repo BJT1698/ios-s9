@@ -413,12 +413,12 @@ void shim_main(uint64_t dtb)
 
 	(void)dtb;
 	ramlog_open();
-	ramlog_str("\n=== S9 shim M2 ===\n");
+	ramlog_str("\n=== OP6 shim M2 ===\n");
 
 	/* M1.1: 0x9d400000, 1440x2960, stride 5760, B G R A, autorefresh on */
 	fb_default();
 	con_clear(GREY);
-	con_title("SHIM M2: CPU");
+	con_title("OP6 SHIM M2: CPU");
 	stage = "watchdog";
 	wdog_arm();
 
