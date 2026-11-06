@@ -12,6 +12,9 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      runner:
+        description: GitHub runner (macos-14 is unavailable on this account; macos-26 needs patch 0000 for Xcode 26 iig)
+        default: macos-26
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -36,7 +39,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner || 'macos-26' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
