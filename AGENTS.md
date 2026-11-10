@@ -1,3 +1,7 @@
+# OnePlus 6 (enchilada) work: start here
+
+For the OnePlus 6 port on branch `enchilada`, read `op6/HANDOFF.md` first (state, procedures, files kept outside git, rules), then `op6/STATUS.md`.
+
 # Working on ios-sweet
 
 - Read `NOTES.md` before starting; it contains the project goal, hardware facts,
