@@ -1,74 +1,85 @@
 /*
- * Galaxy S9 milestone 5: the touchscreen before XNU, polled, MMU off.
- *   1. Power: the S6SY761's rails are S2DOS05 LDO2 (dvdd 1.8 V) and LDO3
- *      (avdd 3.0 V). Their DT nodes say regulator-boot-on, which makes Linux's
- *      regulator core enable them when the S2DOS05 driver probes; ABL leaves
- *      them off (EN 0x19, vsel already 0x8c). The PMIC sits at 0x60 on a
- *      bit-banged bus (i2c-gpio: SDA GPIO127, SCL GPIO128).
- *   2. Bus: SE11 runs its I2C firmware GSI-only, and GSI DMA needs the apps
- *      SMMU (stream 0x6d6), whose registers do not even answer without the
- *      bus votes Linux makes (M5.3 hung reading them). So the touch's own two
- *      wires, GPIO31/32, are bit-banged here too, the same way.
- *   3. sec_ts at 0x48: boot status, id, sense on, then events whenever the IRQ
- *      line (GPIO120, active low) is down, a square under each finger.
- * Sources: the Samsung kernel's regulator/s2dos05.c, i2c-gpio, input/
- * touchscreen/sec_ts, and the starqltechn device tree.
+ * OnePlus 6 milestone M5: the touchscreen before XNU, polled, MMU off.
+ * Synaptics S3706B, RMI4 at 0x20 on i2c12's pins (DT i2c@a90000,
+ * qup-i2c12-default-state: GPIO49 SDA, GPIO50 SCL), attention on GPIO125
+ * (falling edge, active low), DT ts-int-state = GPIO99 + GPIO125 as GPIO
+ * inputs with pull-up, 16 mA. Supplies: vdd = PM8998 LDO28 (RPMh, DT range
+ * 2.856-3.008 V, HPM), vio = ts_1p8_supply, a fixed regulator on GPIO88
+ * (enable-active-high). The OnePlus kernel (LineageOS
+ * android_kernel_oneplus_sdm845, enchilada.dtsi + synaptics_driver_s3320.c)
+ * names GPIO99 the reset line (active low) and powers up as: L28 3.008 V,
+ * 10 ms, GPIO88 high, 10 ms, reset 1/0/1 10 ms apart, 100 ms.
+ * The S9 found the GENI engines need SMMU and bus votes, so the two wires
+ * are bit-banged here (i2c_bb.c), ~60-80 kHz.
+ *   1. Report every pin as ABL left it, then probe 0x20 without touching
+ *      power. Only if nobody answers: (a) the DT's ts-int-state on 99/125
+ *      (releases a reset held low), (b) GPIO88 high + reset pulse, (c) an
+ *      RPMh vote for ldoa28 + reset pulse, probing after each.
+ *   2. RMI4: scan the PDT, F01 identity/status, F01 ctrl0 = no sleep |
+ *      configured, enable the F12 interrupt bit, F12 register descriptors
+ *      -> data1 records and max X/Y (control 8). F11 if there is no F12.
+ *   3. 60 s: read whenever GPIO125 is low (or every 10 ms), a square under
+ *      each finger, live coordinates.
+ * Every step is on screen (PASSO) and in the ramoops console (ramlog) before
+ * it runs; the APSS watchdog turns a hang into a reset.
  */
 #include <stdint.h>
 #include "hw.h"
 #include "fb.h"
 #include "con.h"
 #include "plat.h"
+#include "ramlog.h"
+#include "i2c_bb.h"
+#include "rmi4.h"
+#include "rpmh.h"
 
 #define TOUCH_SECONDS	60
 #define END_SECONDS	30
 
-#define TLMM_NORTH	0x03900000UL	/* GPIO31/32/120/127/128 */
+#define TS_SDA		49
+#define TS_SCL		50
+#define TS_IRQ		125
+#define TS_GPIO99	99
+#define TS_VIO_EN	88
+#define TS_ADDR		0x20
+#define HALF_US		5
 
-#define TS_SDA		31
-#define TS_SCL		32
-#define TS_IRQ		120		/* active low while events are pending */
-#define TS_ADDR		0x48
-#define TS_SENSE_ON	0x10
-#define TS_DEVICE_ID	0x22
-#define TS_SETFUNC	0x30
-#define TS_BOOT_STATUS	0x55
-#define TS_ONE_EVENT	0x60
-#define TS_ALL_EVENT	0x61
-#define TS_CLEAR_STACK	0x62
+#define TS_INT_CTL	(TLMM_PULL_UP | 7u << 6)	/* gpio, pull-up, 16 mA, input */
+#define STARTUP_MS	200				/* syna,startup-delay-ms */
+#define LDO28_MV	3008		/* OEM avdd-voltage; mainline DT max */
+#define VRM_MODE_HPM	7				/* PMIC4_LDO_MODE_HPM */
 
-#define PM_SDA		127
-#define PM_SCL		128
-#define PM_ADDR		0x60
-#define PM_EN		0x03		/* bit 1 LDO2, bit 2 LDO3 */
-#define PM_LDO2		0x05		/* vsel 0-6 + 25 mV from 1.5 V, bit 7 discharge */
-#define PM_LDO3		0x06		/* vsel 0-6 + 25 mV from 2.7 V */
-#define PM_VSEL		12		/* 1.8 V and 3.0 V, the DT's min = max */
+#define F01_NOSLEEP	(1u << 2)
+#define F01_CONFIGURED	(1u << 7)
+#define PKT_MAX		168
 
-#define E_ADDR		1		/* address not acknowledged */
-#define E_DATA		2		/* data byte not acknowledged */
-#define E_SCL		3		/* clock held low */
-
-struct bus {
-	unsigned sda, scl;
-};
-
-static const struct bus pm_bus = { PM_SDA, PM_SCL };
-static const struct bus ts_bus = { TS_SDA, TS_SCL };
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 static int step_row;
+static struct rmi rmi;
+static struct rmi_desc desc;
+static int pinctrl_done;
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
+	ramlog_str("EXCECAO em ");
+	ramlog_str(stage ? stage : "?");
+	ramlog_str(" ESR=");
+	ramlog_hex(rsr("esr_el1"), 8);
+	ramlog_str(" ELR=");
+	ramlog_hex(rsr("elr_el1"), 9);
+	ramlog_str(" FAR=");
+	ramlog_hex(rsr("far_el1"), 9);
+	ramlog_str("\n");
 	panic_screen(stage, slot, regs);
 }
 
-static void us(unsigned n)
+static void say(const char *label, const char *s)
 {
-	uint64_t end = now() + ticks_per_s() / 1000000 * n + 1;
-
-	while (now() < end)
-		;
+	con_str(label, s);
+	ramlog_str(label);
+	ramlog_str(": ");
+	ramlog_str(s);
+	ramlog_str("\n");
 }
 
 /* Overwrites one line: if the shim hangs, the photo shows the last step. */
@@ -77,396 +88,557 @@ static void step(const char *s)
 	char b[52], *p = put(b, s);
 	int row = con_row();
 
-	while (p < b + 50)
+	stage = s;
+	ramlog_str("PASSO ");
+	ramlog_str(s);
+	ramlog_str("\n");
+	while (p < b + 36)
 		*p++ = ' ';
 	*p = 0;
 	con_set_row(step_row);
 	con_str("PASSO", b);
 	con_set_row(row);
+	wdog_pet();
 }
 
-static uintptr_t gpio(unsigned pin)
+static char *pin_state(char *p, unsigned pin)
 {
-	return TLMM_NORTH + 0x1000UL * pin;
+	uintptr_t c = tlmm_ctl(pin);
+
+	p = put_dec(p, pin);
+	p = put_hex(put(p, " c="), rd32(c) & 0xffff, 4);
+	return put_hex(put(p, " io="), rd32(c + TLMM_IO) & 3, 1);
 }
 
-static unsigned level(unsigned pin)
+static void report_pins(void)
 {
-	return rd32(gpio(pin) + 4) & 1;
+	uintptr_t irq = tlmm_ctl(TS_IRQ);
+	char b[64], *p;
+
+	p = pin_state(b, TS_SDA);
+	pin_state(put(p, "  "), TS_SCL);
+	say("GPIO", b);
+	p = pin_state(b, TS_GPIO99);
+	pin_state(put(p, "  "), TS_VIO_EN);
+	say("GPIO", b);
+	p = pin_state(b, TS_IRQ);
+	p = put_hex(put(p, " cfg="), rd32(irq + TLMM_INTR_CFG) & 0xffff, 4);
+	put_hex(put(p, " st="), rd32(irq + TLMM_INTR_ST) & 1, 1);
+	say("GPIO", b);
 }
 
-static void lines(const char *label)
+static void lines(char *b)
 {
-	char b[48], *p;
+	char *p = put_dec(put(b, "sda="), bb_sda(&rmi.bus));
 
-	p = put_dec(put(b, "sda="), level(TS_SDA));
-	p = put_dec(put(p, " scl="), level(TS_SCL));
-	put_dec(put(p, " irq="), level(TS_IRQ));
-	con_str(label, b);
+	p = put_dec(put(p, " scl="), bb_scl(&rmi.bus));
+	put_dec(put(p, " irq="), tlmm_in(TS_IRQ));
+}
+
+/* Address-only write to 0x20, up to three tries. Logs one SONDA line. */
+static int probe(const char *what)
+{
+	char b[64], *p;
+	int err = E_SCL;
+
+	p = put(put(b, what), ": ");
+	if (!bb_sda(&rmi.bus) && bb_scl(&rmi.bus)) {
+		int r = bb_recover(&rmi.bus);
+		p = put_dec(put(p, "rec="), (uint32_t)r);
+		p = put(p, " ");
+	}
+	if (!bb_sda(&rmi.bus) || !bb_scl(&rmi.bus)) {
+		p = put(p, "linha em 0 ");
+		lines(p);
+		say("SONDA", b);
+		return E_SCL;
+	}
+	for (int i = 0; i < 3 && err; i++) {
+		err = bb_probe(&rmi.bus, TS_ADDR);
+		if (err)
+			delay_ms(2);
+	}
+	p = put(p, err == 0 ? "ACK " : err == E_ADDR ? "NACK " : "SCL? ");
+	lines(p);
+	say("SONDA", b);
+	return err;
+}
+
+/* The DT's ts-int-state, as Linux's pinctrl applies it before probe. */
+static void ts_pinctrl(void)
+{
+	wr32(tlmm_ctl(TS_GPIO99), TS_INT_CTL);
+	wr32(tlmm_ctl(TS_IRQ), TS_INT_CTL);
+	pinctrl_done = 1;
+}
+
+/* GPIO88 as a GPIO output driving 1 (regulator-fixed, enable-active-high). */
+static void vio_on(void)
+{
+	uintptr_t c = tlmm_ctl(TS_VIO_EN);
+
+	wr32(c + TLMM_IO, 2);
+	wr32(c, (rd32(c) & ~TLMM_FUNC_MASK) | TLMM_OE);
 }
 
 /*
- * i2c-gpio as Linux runs it: open drain by output enable (the output latch
- * stays 0), released lines float up on the board's pull-ups, ~100 kHz.
+ * GPIO99 as the OEM driver drives it (tpd_hw_pwron): output 1, 0, 1 with
+ * 10 ms between, left driving 1; pull-up and 16 mA as ts_active.
  */
-static void bb_init(const struct bus *b)
+static void reset_pulse(void)
 {
-	wr32(gpio(b->sda) + 4, 0);	/* output latch 0: OE alone pulls low */
-	wr32(gpio(b->scl) + 4, 0);
-	wr32(gpio(b->sda), 0);		/* GPIO function, input, no pull, 2 mA */
-	wr32(gpio(b->scl), 0);
-	us(20);
+	uintptr_t c = tlmm_ctl(TS_GPIO99);
+
+	wr32(c + TLMM_IO, 2);
+	wr32(c, TS_INT_CTL | TLMM_OE);
+	delay_ms(10);
+	wr32(c + TLMM_IO, 0);
+	delay_ms(10);
+	wr32(c + TLMM_IO, 2);
 }
 
-static void bb_line(unsigned pin, int high)
+static int ldo28_on(void)
 {
-	wr32(gpio(pin), high ? 0 : 1u << 9);
-	us(5);
+	char b[80], *p;
+	uint32_t addr = 0;
+	int rc;
+
+	step("rpmh: rsc + cmd-db");
+	rc = rh_init(b);
+	say("RPMH", b);
+	if (rc)
+		return rc;
+	step("rpmh: lookup ldoa28");
+	rc = rh_lookup("ldoa28", RH_VRM, &addr);
+	p = put_hex(put(b, "ldoa28 addr="), addr, 5);
+	p = put_dec(put(p, " rc="), (uint32_t)-rc);
+	p = put_hex(put(p, " db="), rh_db_base(), 8);
+	say("RPMH", b);
+	if (rc)
+		return rc;
+	step("rpmh: voto ldoa28 3008mV HPM on");
+	rc = rh_vrm_on(addr, LDO28_MV, VRM_MODE_HPM);
+	p = put_dec(put(b, "3008 mV modo 7 on: "), (uint32_t)-rc);
+	put(p, rc ? " FALHOU" : " ok");
+	say("RPMH", b);
+	return rc;
 }
 
-static int bb_scl_high(const struct bus *b)
+/* Probe; if silent, add what Linux would have set up, one thing at a time. */
+static int power_up(void)
 {
-	uint64_t end = now() + ticks_per_s() / 100;
+	char b[48];
 
-	wr32(gpio(b->scl), 0);
-	while (!level(b->scl))		/* clock stretching */
-		if (now() > end)
-			return 0;
-	us(5);
-	return 1;
-}
-
-static int bb_start(const struct bus *b)
-{
-	bb_line(b->sda, 1);
-	if (!bb_scl_high(b))
+	step("sonda 0x20 sem mexer em energia");
+	if (probe("inicial") == 0)
 		return 0;
-	bb_line(b->sda, 0);
-	bb_line(b->scl, 0);
-	return 1;
-}
 
-static void bb_stop(const struct bus *b)
-{
-	bb_line(b->sda, 0);
-	bb_scl_high(b);
-	bb_line(b->sda, 1);
-}
+	step("pinctrl ts-int-state 99/125");
+	ts_pinctrl();
+	delay_ms(STARTUP_MS);
+	if (probe("pinctrl") == 0)
+		return 1;
 
-/* 0 acknowledged, E_DATA not, E_SCL clock stuck */
-static int bb_write(const struct bus *b, uint8_t v)
-{
-	int nack;
+	step("gpio88=1 (vio 1.8V) + reset 99");
+	vio_on();
+	delay_ms(10);
+	reset_pulse();
+	delay_ms(STARTUP_MS);
+	pin_state(b, TS_VIO_EN);
+	say("VIO", b);
+	if (probe("gpio88=1") == 0)
+		return 2;
 
-	for (int i = 7; i >= 0; i--) {
-		bb_line(b->sda, v >> i & 1);
-		if (!bb_scl_high(b))
-			return E_SCL;
-		bb_line(b->scl, 0);
-	}
-	bb_line(b->sda, 1);
-	if (!bb_scl_high(b))
-		return E_SCL;
-	nack = level(b->sda);
-	bb_line(b->scl, 0);
-	return nack ? E_DATA : 0;
-}
-
-/* one byte, then ACK (more to come) or NACK (last); -1 if the clock stuck */
-static int bb_read(const struct bus *b, int ack)
-{
-	unsigned v = 0;
-
-	bb_line(b->sda, 1);
-	for (int i = 0; i < 8; i++) {
-		if (!bb_scl_high(b))
-			return -1;
-		v = v << 1 | level(b->sda);
-		bb_line(b->scl, 0);
-	}
-	bb_line(b->sda, !ack);
-	if (!bb_scl_high(b))
+	if (ldo28_on())
 		return -1;
-	bb_line(b->scl, 0);
-	bb_line(b->sda, 1);
-	return v;
+	step("ldo28: 10ms, reset 99, 200ms");
+	delay_ms(10);
+	reset_pulse();
+	delay_ms(STARTUP_MS);
+	pin_state(b, TS_GPIO99);
+	say("RESET", b);
+	if (probe("ldo28") == 0)
+		return 3;
+	delay_ms(300);
+	if (probe("ldo28 +300ms") == 0)
+		return 3;
+	return -1;
 }
 
-/* Register read with a repeated START, like i2c_transfer of a write + a read. */
-static int i2c_rd(const struct bus *b, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n)
+static char *fn_line(char *p, const struct rmi_fn *f)
 {
-	int err = E_SCL;
-
-	if (!bb_start(b))
-		goto out;
-	err = bb_write(b, addr << 1);
-	if (err) {
-		err = err == E_DATA ? E_ADDR : err;
-		goto out;
-	}
-	err = bb_write(b, reg);
-	if (err)
-		goto out;
-	err = E_SCL;
-	if (!bb_start(b))
-		goto out;
-	err = bb_write(b, addr << 1 | 1);
-	if (err) {
-		err = err == E_DATA ? E_ADDR : err;
-		goto out;
-	}
-	for (unsigned i = 0; i < n; i++) {
-		int v = bb_read(b, i + 1 < n);
-		if (v < 0) {
-			err = E_SCL;
-			goto out;
-		}
-		buf[i] = (uint8_t)v;
-	}
-out:
-	bb_stop(b);
-	return err;
+	p = put_hex(put(p, "F"), f->num, 2);
+	p = put_dec(put(p, " p"), f->page);
+	p = put_hex(put(p, " q"), f->query, 2);
+	p = put_hex(put(p, " k"), f->cmd, 2);
+	p = put_hex(put(p, " c"), f->ctrl, 2);
+	p = put_hex(put(p, " d"), f->data, 2);
+	p = put_dec(put(p, " i"), f->irqs);
+	p = put_dec(put(p, "@"), f->irq_pos);
+	return put_dec(put(p, " v"), f->version);
 }
 
-static int i2c_wr(const struct bus *b, uint8_t addr, const uint8_t *buf, unsigned n)
+static int f01_setup(const struct rmi_fn *f01, const struct rmi_fn *f2d)
 {
-	int err = E_SCL;
-
-	if (!bb_start(b))
-		goto out;
-	err = bb_write(b, addr << 1);
-	if (err) {
-		err = err == E_DATA ? E_ADDR : err;
-		goto out;
-	}
-	for (unsigned i = 0; i < n && !err; i++)
-		err = bb_write(b, buf[i]);
-out:
-	bb_stop(b);
-	return err;
-}
-
-static int pm_rd(uint8_t reg)
-{
-	uint8_t v;
-
-	return i2c_rd(&pm_bus, PM_ADDR, reg, &v, 1) ? -1 : v;
-}
-
-static int pm_wr(uint8_t reg, uint8_t val)
-{
-	uint8_t out[2];
-
-	out[0] = reg;
-	out[1] = val;
-	return i2c_wr(&pm_bus, PM_ADDR, out, 2) == 0;
-}
-
-/* -1: could not tell; 0: rails off and left off; 1: rails on */
-static int touch_power(void)
-{
-	uint32_t ctl_sda = rd32(gpio(PM_SDA)), ctl_scl = rd32(gpio(PM_SCL));
-	uint32_t io_sda = rd32(gpio(PM_SDA) + 4), io_scl = rd32(gpio(PM_SCL) + 4);
+	uint8_t q[21], st = 0, c0 = 0, c0b = 0, en[4] = { 0, 0, 0, 0 }, en2[4] = { 0, 0, 0, 0 };
+	unsigned nen = (rmi.irq_count + 7) / 8;
 	char b[64], *p;
-	int ret = -1;
+	int err;
 
-	stage = "s2dos05";
-	bb_init(&pm_bus);
-	if (!level(PM_SDA) || !level(PM_SCL)) {
-		con_str("S2DOS05", "barramento preso em 0: nao mexi");
-		goto out;
+	step("f01: query 0-20");
+	err = rmi_read(&rmi, rmi_addr(f01, f01->query), q, sizeof(q));
+	if (err) {
+		put_dec(put(b, "query erro="), (uint32_t)err);
+		say("F01", b);
+		return err;
 	}
-	int id = pm_rd(0), en = pm_rd(PM_EN), l2 = pm_rd(PM_LDO2), l3 = pm_rd(PM_LDO3);
-	p = put_hex(put(b, "id="), (uint32_t)id, 2);
-	p = put_hex(put(p, " en="), (uint32_t)en, 2);
-	p = put_hex(put(p, " ldo2="), (uint32_t)l2, 2);
-	put_hex(put(p, " ldo3="), (uint32_t)l3, 2);
-	con_str("S2DOS05", b);
-	if (id < 0 || en < 0 || l2 < 0 || l3 < 0 || pm_rd(PM_EN) != en ||
-	    pm_rd(PM_LDO2) != l2 || pm_rd(PM_LDO3) != l3) {
-		con_str("S2DOS05", "leitura falhou ou instavel: nao mexi");
-		goto out;
+	p = put_hex(put(b, "fab="), q[0], 2);
+	p = put_hex(put(p, " prop="), q[1], 2);
+	p = put(p, " id=");
+	for (int i = 11; i < 21 && q[i]; i++)
+		*p++ = q[i] >= 0x20 && q[i] < 0x7f ? (char)q[i] : '.';
+	*p = 0;
+	say("F01", b);
+	p = put_dec(put(b, "data 20"), q[4] & 0x1f);
+	p = put_dec(put(p, "/"), q[5] & 0x0f);
+	p = put_dec(put(p, "/"), q[6] & 0x1f);
+	p = put_hex(put(p, " info="), (uint32_t)(q[2] & 0x7f) << 7 | (q[3] & 0x7f), 4);
+	say("F01", b);
+
+	step("f01: status e ctrl0");
+	err = rmi_read(&rmi, rmi_addr(f01, f01->data), &st, 1);
+	if (!err)
+		err = rmi_read(&rmi, rmi_addr(f01, f01->ctrl), &c0, 1);
+	if (err) {
+		put_dec(put(b, "status/ctrl0 erro="), (uint32_t)err);
+		say("F01", b);
+		return err;
 	}
-	if ((en & 6) == 6) {
-		con_str("ENERGIA", "LDO2/LDO3 ja estavam ligadas");
-		ret = 1;
-		goto out;
+	p = put_hex(put(b, "status="), st, 2);
+	p = put_hex(put(p, " (cod "), st & 0xf, 1);
+	p = put(p, st & 0x40 ? " BOOTLOADER" : "");
+	p = put(p, st & 0x80 ? " desconfig" : "");
+	p = put_hex(put(p, ") ctrl0="), c0, 2);
+	say("F01", b);
+
+	step("f01: ctrl0 nosleep|configured");
+	uint8_t v = (uint8_t)((c0 & ~3u) | F01_NOSLEEP | F01_CONFIGURED);
+	err = rmi_write(&rmi, rmi_addr(f01, f01->ctrl), &v, 1);
+	if (!err)
+		err = rmi_read(&rmi, rmi_addr(f01, f01->ctrl), &c0b, 1);
+	p = put_hex(put(b, "ctrl0 "), c0, 2);
+	p = put_hex(put(p, " -> "), v, 2);
+	p = put_hex(put(p, " lido "), c0b, 2);
+	put_dec(put(p, " erro="), (uint32_t)err);
+	say("F01", b);
+
+	if (!f2d || nen == 0 || nen > 4)
+		return 0;
+	step("f01: habilita irq do 2D");
+	err = rmi_read(&rmi, (uint16_t)(rmi_addr(f01, f01->ctrl) + 1), en, nen);
+	if (!err) {
+		for (unsigned i = 0; i < nen; i++)
+			en2[i] = en[i];
+		en2[f2d->irq_pos / 8] |= (uint8_t)(1u << (f2d->irq_pos % 8));
+		err = rmi_write(&rmi, (uint16_t)(rmi_addr(f01, f01->ctrl) + 1), en2, nen);
 	}
-	/* What the regulator core does for these nodes: apply min_uV, then enable
-	 * (dvdd, 1 ms, avdd, as sec_ts_power orders them). Other bits untouched. */
-	if ((l2 & 0x7f) != PM_VSEL)
-		pm_wr(PM_LDO2, (uint8_t)((l2 & 0x80) | PM_VSEL));
-	if ((l3 & 0x7f) != PM_VSEL)
-		pm_wr(PM_LDO3, (uint8_t)((l3 & 0x80) | PM_VSEL));
-	l2 = pm_rd(PM_LDO2);
-	l3 = pm_rd(PM_LDO3);
-	if (l2 < 0 || l3 < 0 || (l2 & 0x7f) != PM_VSEL || (l3 & 0x7f) != PM_VSEL) {
-		con_str("ENERGIA", "tensao nao confirmou 1,8/3,0 V: nao liguei");
-		ret = 0;
-		goto out;
-	}
-	pm_wr(PM_EN, (uint8_t)(en | 2));
-	delay_ms(1);
-	pm_wr(PM_EN, (uint8_t)(en | 6));
-	delay_ms(5);
-	int now_en = pm_rd(PM_EN);
-	p = put_hex(put(b, "en="), (uint32_t)now_en, 2);
-	p = put_hex(put(p, " ldo2="), (uint32_t)l2, 2);
-	put(put_hex(put(p, " ldo3="), (uint32_t)l3, 2), (now_en & 6) == 6 ? " LIGOU" : " FALHOU");
-	con_str("ENERGIA", b);
-	ret = now_en >= 0 && (now_en & 6) == 6;
-out:
-	wr32(gpio(PM_SDA) + 4, io_sda);
-	wr32(gpio(PM_SCL) + 4, io_scl);
-	wr32(gpio(PM_SDA), ctl_sda);
-	wr32(gpio(PM_SCL), ctl_scl);
-	return ret;
+	if (!err)
+		err = rmi_read(&rmi, (uint16_t)(rmi_addr(f01, f01->ctrl) + 1), en2, nen);
+	p = put(b, "irq en ");
+	for (unsigned i = 0; i < nen; i++)
+		p = put_hex(p, en[nen - 1 - i], 2);
+	p = put(p, " -> ");
+	for (unsigned i = 0; i < nen; i++)
+		p = put_hex(p, en2[nen - 1 - i], 2);
+	put_dec(put(p, " erro="), (uint32_t)err);
+	say("F01", b);
+	return 0;
 }
 
-static int ts_read(uint8_t reg, uint8_t *buf, unsigned n)
+/* Spaces to 35 columns from start (end = the string's NUL), so a shorter
+ * value overwrites a longer one on the same row. */
+static void pad(char *start, char *end)
 {
-	return i2c_rd(&ts_bus, TS_ADDR, reg, buf, n);
+	while (end < start + 35)
+		*end++ = ' ';
+	*end = 0;
 }
 
-static int ts_cmd(uint8_t c, uint8_t a, uint8_t b, unsigned n)
+static uint32_t finger_color(unsigned i)
 {
-	uint8_t out[3];
-
-	out[0] = c;
-	out[1] = a;
-	out[2] = b;
-	return i2c_wr(&ts_bus, TS_ADDR, out, 1 + n);
+	switch (i & 3) {
+	case 0: return GREEN;
+	case 1: return RED;
+	case 2: return YELLOW;
+	default: return BLUE;
+	}
 }
 
-/* One sec_ts event: a square under the finger, 12-bit coordinates over the panel. */
-static int finger(const uint8_t *e, char *b)
-{
-	static const uint32_t color[4] = { GREEN, RED, YELLOW, BLUE };
-	unsigned tid = e[0] >> 2 & 0xf, action = e[0] >> 6 & 3;
-	int x = e[1] << 4 | e[3] >> 4, y = e[2] << 4 | (e[3] & 0xf);
-	int px = x * PANEL_W / 4096, py = y * PANEL_H / 4096;
-	char *p;
+struct sensor {
+	int is_f12;
+	uint16_t data_addr, rec_off, max_x, max_y;
+	uint8_t fingers, rec_size, state_bytes;
+	unsigned read_len;
+};
 
-	if ((e[0] & 3) != 0 || tid == 0 || tid > 10)
-		return 0;	/* status or gesture events, no finger */
-	if (action != 3)
-		fb_rect(px - 20, py - 20, 40, 40, color[tid & 3]);
-	p = put_dec(put(b, "id="), tid);
-	p = put_dec(put(p, " x="), x);
-	p = put_dec(put(p, " y="), y);
-	p = put_dec(put(p, " -> "), px);
-	p = put_dec(put(p, ","), py);
-	put(put_dec(put(p, " acao="), action), "    ");
-	return 1;
+static int scale(unsigned v, unsigned max, unsigned panel)
+{
+	unsigned p = max ? v * (panel - 1) / max : v;
+
+	return (int)(p >= panel ? panel - 1 : p);
 }
 
-static void touch_loop(void)
+/* Decodes object i of a packet: 1 if a finger (or other object) is down. */
+static int object(const struct sensor *s, const uint8_t *pkt, unsigned i,
+		  unsigned *x, unsigned *y, unsigned *z, unsigned *type)
 {
-	uint64_t f = ticks_per_s(), t0 = now();
-	unsigned reads = 0, touches = 0, errors = 0, polls = 0;
-	uint8_t buf[8 * 8];
-	char b[64], last[64], *p;
+	if (s->is_f12) {
+		const uint8_t *r = pkt + s->rec_off + 8 * i;
+		*type = r[0];
+		*x = r[1] | (unsigned)r[2] << 8;
+		*y = r[3] | (unsigned)r[4] << 8;
+		*z = r[5];
+		return r[0] != 0;
+	}
+	unsigned state = pkt[i / 4] >> (2 * (i % 4)) & 3;
+	const uint8_t *r = pkt + s->state_bytes + 5 * i;
+	*type = state;
+	*x = (unsigned)r[0] << 4 | (r[2] & 0xf);
+	*y = (unsigned)r[1] << 4 | r[2] >> 4;
+	*z = r[4];
+	return state != 0;
+}
+
+static void touch_loop(const struct sensor *s, const struct rmi_fn *f01, const struct rmi_fn *f2d)
+{
+	uint64_t f = ticks_per_s(), t0 = now(), last = 0, shown_at = 0;
+	unsigned reads = 0, irq_low = 0, irq_hits = 0, objs = 0, errors = 0;
+	unsigned nst = (rmi.irq_count + 7) / 8, logged = 0;
+	uint8_t pkt[PKT_MAX], st[4];
+	char b[64], d0[64], d1[64], *p;
 	int row = con_row();
 
-	put(last, "(encoste o dedo na tela)");
-	con_skip();
-	con_skip();
+	pad(d0, put(d0, "(encoste o dedo na tela)"));
+	pad(d1, d1);
+	if (nst > 4)
+		nst = 4;
 	while (now() - t0 < f * TOUCH_SECONDS) {
-		polls++;
-		if (!level(TS_IRQ)) {
-			int err = ts_read(TS_ONE_EVENT, buf, 8);
+		int low = !tlmm_in(TS_IRQ);
 
-			reads++;
-			if (err) {
-				errors++;
-			} else {
-				unsigned left = buf[7] & 0x3f;
-				touches += finger(buf, last);
-				while (left && !err) {
-					/* sec,i2c-burstmax = 64: 8 events per read */
-					unsigned n = left > 8 ? 8 : left;
-					err = ts_read(TS_ALL_EVENT, buf, n * 8);
-					for (unsigned i = 0; !err && i < n; i++)
-						touches += finger(buf + 8 * i, last);
-					left -= n;
-				}
+		if (!low && now() - last < f / 100) {
+			us_delay(200);
+			goto status;
+		}
+		last = now();
+		irq_low += low;
+		int err = rmi_read(&rmi, (uint16_t)(rmi_addr(f01, f01->data) + 1), st, nst);
+		int hit = !err && f2d->irq_pos / 8 < nst &&
+			  (st[f2d->irq_pos / 8] >> (f2d->irq_pos % 8) & 1);
+		irq_hits += hit;
+		if (!err)
+			err = rmi_read(&rmi, s->data_addr, pkt, s->read_len);
+		reads++;
+		if (err) {
+			errors++;
+			goto status;
+		}
+		unsigned shown = 0;
+		for (unsigned i = 0; i < s->fingers; i++) {
+			unsigned x, y, z, type;
+			if (!object(s, pkt, i, &x, &y, &z, &type))
+				continue;
+			int px = scale(x, s->max_x, PANEL_W), py = scale(y, s->max_y, PANEL_H);
+			uint32_t c = finger_color(i);
+			fb_rect(px - 12, py - 12, 24, 24, c);
+			fb_rect(px - 40, py - 1, 80, 3, c);
+			fb_rect(px - 1, py - 40, 3, 80, c);
+			objs++;
+			if (shown < 2) {
+				char *q0 = shown ? d1 : d0, *q = q0;
+				q = put_dec(q, i);
+				q = put_dec(put(q, " t"), type);
+				q = put_dec(put(q, " x"), x);
+				q = put_dec(put(q, " y"), y);
+				q = put_dec(put(q, " z"), z);
+				q = put_dec(put(q, " >"), (uint32_t)px);
+				pad(q0, put_dec(put(q, ","), (uint32_t)py));
+				shown++;
+			}
+			if (logged < 40) {
+				logged++;
+				ramlog_str("dedo ");
+				ramlog_dec(i);
+				ramlog_str(" x=");
+				ramlog_dec(x);
+				ramlog_str(" y=");
+				ramlog_dec(y);
+				ramlog_str(" z=");
+				ramlog_dec(z);
+				ramlog_str("\n");
 			}
 		}
-		if (polls % 50 == 0) {
-			con_set_row(row);
-			p = put_dec(put(b, "leituras="), reads);
-			p = put_dec(put(p, " toques="), touches);
-			p = put_dec(put(p, " erros="), errors);
-			put(put_dec(put(p, " t="), (uint32_t)((now() - t0) / f)), "s ");
-			con_str("TOUCH", b);
-			con_str("DEDO", last);
-		}
+status:
 		wdog_pet();
-		delay_ms(5);
+		if (now() - shown_at >= f / 4) {
+			shown_at = now();
+			con_set_row(row);
+			p = put_dec(put(b, "lei="), reads);
+			p = put_dec(put(p, " bit="), irq_hits);
+			pad(b, put_dec(put(p, " err="), errors));
+			con_str("TOUCH", b);
+			p = put_dec(put(b, "irq0="), irq_low);
+			p = put_dec(put(p, " obj="), objs);
+			pad(b, put(put_dec(put(p, " t="), (uint32_t)((now() - t0) / f)), "s"));
+			con_str("TOUCH", b);
+			con_str("DEDO", d0);
+			con_str("DEDO", d1);
+		}
 	}
+	p = put_dec(put(b, "fim: lei="), reads);
+	p = put_dec(put(p, " irq0="), irq_low);
+	p = put_dec(put(p, " bit="), irq_hits);
+	p = put_dec(put(p, " obj="), objs);
+	put_dec(put(p, " err="), errors);
+	ramlog_str(b);
+	ramlog_str("\n");
+}
+
+static int sensor_setup(struct sensor *s, const struct rmi_fn *f12, const struct rmi_fn *f11)
+{
+	char b[64], *p;
+
+	if (f12) {
+		struct f12 t;
+		step("f12: descritores");
+		int err = f12_setup(&rmi, f12, &t, &desc);
+		p = put_hex(put(b, "q0="), t.q0, 2);
+		p = put_dec(put(p, " regs q/c/d="), t.nq);
+		p = put_dec(put(p, "/"), t.nc);
+		p = put_dec(put(p, "/"), t.nd);
+		put_dec(put(p, " erro="), (uint32_t)t.err);
+		say("F12", b);
+		if (err || t.err)
+			return -1;
+		p = put_dec(put(b, "data1 off="), t.data1_off);
+		p = put_dec(put(p, " tam="), t.data1_size);
+		p = put_dec(put(p, " dedos="), t.fingers);
+		say("F12", b);
+		p = put_dec(put(b, "max x="), t.max_x);
+		put_dec(put(p, " y="), t.max_y);
+		say("F12", b);
+		s->is_f12 = 1;
+		s->data_addr = t.data_addr;
+		s->rec_off = t.data1_off;
+		s->fingers = t.fingers;
+		s->max_x = t.max_x;
+		s->max_y = t.max_y;
+		s->rec_size = 8;
+	} else {
+		struct f11 t;
+		step("f11: query/ctrl (sem F12)");
+		f11_setup(&rmi, f11, &t);
+		p = put_dec(put(b, "dedos="), t.fingers);
+		p = put_dec(put(p, " max x="), t.max_x);
+		p = put_dec(put(p, " y="), t.max_y);
+		put_dec(put(p, " erro="), (uint32_t)t.err);
+		say("F11", b);
+		if (t.err)
+			return -1;
+		s->is_f12 = 0;
+		s->data_addr = t.data_addr;
+		s->state_bytes = t.state_bytes;
+		s->rec_off = t.state_bytes;
+		s->fingers = t.fingers;
+		s->max_x = t.max_x;
+		s->max_y = t.max_y;
+		s->rec_size = 5;
+	}
+	while (s->fingers && s->rec_off + s->rec_size * s->fingers > PKT_MAX)
+		s->fingers--;
+	s->read_len = s->rec_off + s->rec_size * s->fingers;
+	if (!s->fingers) {
+		say("ERRO", "nenhum registro de dedo cabe");
+		return -1;
+	}
+	return 0;
 }
 
 void shim_main(uint64_t dtb)
 {
-	uint8_t boot = 0, id[3] = { 0, 0, 0 };
-	char b[96], *p;
-	int ok = 0;
+	const struct rmi_fn *f01, *f12, *f11, *f2d;
+	struct sensor s;
+	char b[64], *p;
+	int ok = 0, pw, err;
 
 	(void)dtb;
-	/* M1.1: 0x9d400000, 1440x2960, stride 5760, B G R A, autorefresh on */
+	ramlog_open();
+	ramlog_str("\n=== OP6 shim M5 touch ===\n");
 	fb_default();
 	con_clear(GREY);
-	con_title("SHIM M5.4: TOUCH BIT-BANG");
+	con_title("OP6 SHIM M5: TOUCH RMI4");
 	stage = "watchdog";
 	wdog_arm();
 	step_row = con_row();
 	con_skip();
 
-	lines("LINHAS");
-	step("s2dos05");
-	int pwr = touch_power();
-	wdog_pet();
-	if (pwr <= 0)
-		goto out;
-	delay_ms(200);		/* sec_ts boot after power on */
-	step("i2c do touch");
-	stage = "i2c touch";
-	bb_init(&ts_bus);
-	lines("LINHAS GPIO");
-	if (!level(TS_SDA) || !level(TS_SCL)) {
-		con_str("ERRO", "linhas do touch em 0");
+	step("estado dos pinos (so leitura)");
+	report_pins();
+
+	step("i2c bit-bang gpio49/50");
+	rmi.addr = TS_ADDR;
+	rmi.page = -1;
+	if (bb_init(&rmi.bus, TS_SDA, TS_SCL, HALF_US)) {
+		say("ERRO", "pino fora da tabela");
 		goto out;
 	}
-	step("le boot 0x55 e id 0x22");
-	int e1 = ts_read(TS_BOOT_STATUS, &boot, 1);
-	int e2 = ts_read(TS_DEVICE_ID, id, 3);
-	p = put_hex(put(b, "boot="), boot, 2);
-	p = put_dec(put(p, " erro="), e1);
-	p = put_hex(put(p, "  id="), (uint32_t)id[0] << 16 | id[1] << 8 | id[2], 6);
-	put_dec(put(p, " erro="), e2);
-	con_str("SEC_TS", b);
-	wdog_pet();
-	if (e1 || e2)
+	lines(b);
+	say("LINHAS", b);
+
+	pw = power_up();
+	p = put(b, pw < 0 ? "sem resposta em 0x20" : "0x20 responde apos ");
+	if (pw >= 0)
+		put(p, pw == 0 ? "nada (ABL)" : pw == 1 ? "pinctrl" : pw == 2 ? "gpio88" : "ldo28");
+	say("ENERGIA", b);
+	if (pw < 0)
 		goto out;
-	step("sense on");
-	stage = "sec_ts sense on";
-	int e = ts_cmd(TS_CLEAR_STACK, 0, 0, 0);
-	if (!e)
-		e = ts_cmd(TS_SETFUNC, 0x61, 0x00, 2);
-	if (!e)
-		e = ts_cmd(TS_SENSE_ON, 0, 0, 0);
-	put_dec(put(b, "erro="), e);
-	con_str("SENSE ON", b);
-	if (e)
+	if (!pinctrl_done) {
+		/* It answered as ABL left it: leave GPIO99 (reset) alone. */
+		step("pinctrl gpio125 entrada pull-up");
+		wr32(tlmm_ctl(TS_IRQ), TS_INT_CTL);
+	}
+
+	step("rmi4: varre PDT");
+	err = rmi_scan(&rmi);
+	p = put_dec(put(b, "funcoes="), rmi.nfn);
+	p = put_dec(put(p, " irqs="), rmi.irq_count);
+	put_dec(put(p, " erro="), (uint32_t)err);
+	say("PDT", b);
+	for (unsigned i = 0; i < rmi.nfn; i++) {
+		fn_line(b, &rmi.fn[i]);
+		say("PDT", b);
+	}
+	if (err)
 		goto out;
+	f01 = rmi_find(&rmi, 0x01);
+	f12 = rmi_find(&rmi, 0x12);
+	f11 = rmi_find(&rmi, 0x11);
+	f2d = f12 ? f12 : f11;
+	if (!f01 || !f2d) {
+		say("ERRO", f01 ? "sem F12/F11" : "sem F01");
+		goto out;
+	}
+	if (f01_setup(f01, f2d))
+		goto out;
+	if (sensor_setup(&s, f12, f11))
+		goto out;
+
 	ok = 1;
-	stage = "touch";
-	step("toque na tela!");
-	touch_loop();
+	con_skip();
+	step("toque na tela! (60 s)");
+	touch_loop(&s, f01, f2d);
 out:
-	stage = "fim";
 	step("fim");
 	con_skip();
-	con_str("", ok ? "TOUCH OK! Tire uma foto." : "Tire uma foto desta tela!");
+	say("", ok ? "TOUCH LIDO. Tire uma foto." : "Tire uma foto desta tela!");
 	countdown_reboot(con_row(), END_SECONDS);
 }
