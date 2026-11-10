@@ -2,7 +2,9 @@
 # Build the OnePlus 6 (enchilada) shim and wrap it the way OnePlus ABL
 # expects a kernel: boot.img header v0, Image.gz with the DTB appended
 # (same layout pmOS uses, see /usr/share/deviceinfo/deviceinfo on the phone).
-#   ./build.sh [m1|m2|m8|m5|m7]             stage (default m1)
+#   ./build.sh [m1|m2|m8|m5|m7|m10|m11]     stage (default m1)
+#   m10/m11 embed shim/fw_a630_gmu.h if present (tools/gpu-fw-embed.py; git-ignored)
+#   SHIM_CFLAGS=-DGPU_RPMH=1 ./build.sh m11  GPU-RSC wake handshake as mainline (see GPU-NOTES.md)
 #   SHIM_CFLAGS=-DM7_SMMU=0 ./build.sh m7    extra compiler flags (M7: only report the SMMU)
 #   PAYLOAD=out/payload.bin ./build.sh m4   XNU payload as the ramdisk
 # Test with: fastboot boot out/boot.img   (nothing is flashed)
@@ -24,9 +26,11 @@ m2) main="m2.c con.c" ;;
 m8) main="m8.c con.c plat.c" ;;
 m5) main="m5.c con.c plat.c i2c_bb.c rmi4.c rpmh.c" ;;
 m7) main="m7.c con.c plat.c i2c_bb.c rpmh.c" ;;
+m10) main="m10.c gpu.c con.c plat.c rpmh.c i2c_bb.c" ;;
+m11) main="m11.c gpu.c con.c plat.c rpmh.c i2c_bb.c" ;;
 m4) main="m4.c con.c plat.c loader.c i2c_bb.c rpmh.c"
     [ -f "${PAYLOAD:-}" ] || { echo "m4 needs PAYLOAD=path/to/payload.bin" >&2; exit 2; } ;;
-*) echo "usage: build.sh [m1|m2|m8|m5|m7|m4]" >&2; exit 2 ;;
+*) echo "usage: build.sh [m1|m2|m8|m5|m7|m10|m11|m4]" >&2; exit 2 ;;
 esac
 
 mkdir -p out/obj

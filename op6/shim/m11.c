@@ -1,755 +1,671 @@
 /*
- * Galaxy S9 milestone 11 (GPU stage B): give the GMU its memory through the
- * GPU's own SMMU and get it talking to us over its message channel (HFI).
+ * OnePlus 6 milestone M11 (GPU stage B): give the GMU its memory through the
+ * GPU's own SMMU and talk to it over HFI, the message queues it reads from
+ * RAM. Port of the Galaxy S9 M11 (s9/shim/m11.c; never confirmed on the S9),
+ * corrected to what mainline Linux runs on this phone (a6xx_gmu.c /
+ * a6xx_hfi.c v6.6, a630 = "legacy" HFI v1): GMU SID 5 (DT iommus <&smmu 5>),
+ * dummy page at GMU VA 0x60000000 and debug/log/HFI after it, two queues
+ * 4 KiB apart, no 4-word padding (that is HFI v2), acks recognised by id 126
+ * + the echoed sequence number, unprivileged-accessible pages (AP[1]), and
+ * the v1 sequence INIT -> FW_VERSION -> PERF_TABLE -> BW_TABLE -> TEST.
+ * The perf table is computed here from the OP6 cmd-db ARC lists and the OP6
+ * DT OPP tables (a6xx_gmu_rpmh_arc_votes_init).
  *
- * M10 proved the GMU's firmware boots (0xBABEFACE) with no SMMU: the boot does
- * not reach RAM. HFI does: the GMU reads and writes a table of message queues
- * in memory of ours, which it reaches by the addresses 0x60000000.. through the
- * GPU's SMMU (a memory translator, like a CPU's MMU but for the GPU block). So
- * the SMMU must be programmed and the queue table told to the GMU (HFI_QTBL_ADDR)
- * BEFORE the processor is let go -- this stage therefore redoes M10's power +
- * firmware + boot, now with the SMMU in place, and then sends the GMU two
- * messages (INIT, FW_VER) and reads back its firmware version.
+ *   1. power (gpu.c) + cmd-db ARC lists (read only) -> GX / CX votes.
+ *   2. GPU SMMU read: ids, sCR0, every valid SMR/S2CR, which CBs are in use.
+ *   3. page tables (static, PA = VA, MMU off) for the four GMU buffers,
+ *      a free context bank (S1 translate, S2 bypass, VMID 0, VA64), S2CR
+ *      TRANSLATE + SMR for SID 5 and 4, every write read back; an ATS1PR
+ *      translation of the HFI VA must give the buffer's PA before the GMU
+ *      is allowed to touch memory (no rule => no GMU boot).
+ *   4. firmware + boot with HFI_QTBL_ADDR set -> 0xBABEFACE.
+ *   5. HFI_CTRL_INIT, then the five v1 messages, each one's ack on screen.
+ *   Then the CM3 goes back to reset and the screen counts down to a reboot.
  *
- * The one S9-specific unknown is the hypervisor. On the Poco F1 (no Samsung RKP)
- * both reference projects programmed this SMMU directly. The S9's hypervisor may
- * emulate or refuse its global registers (stream table, context base). So stage
- * 3 READS the SMMU first (layout, and what the boot loader/hyp left) and stage 4
- * WRITES it and reads every write back -- if the hyp blocks it, the photo shows
- * exactly which register did not take, and HFI then faults (logged), never a brick.
- *
- * The GX rail (the 3D core's power) and the CP are NOT here: those are stage C
- * (M12), isolated because powering GX is the step that can reset the SoC.
- *
- * MMU off: all memory is Device, so our page tables and the GMU's queue memory
- * are static buffers whose physical address equals their address. Register
- * numbers and sequences from the S9's Android kernel (drivers/gpu/msm) and the
- * live device tree; the SMMU programming follows the smmu-v2 order of Linux
- * arm-smmu.c / io-pgtable-arm.c (facts, no code copied).
+ * Not here: GX GDSC / GMU OOB, SPTPRAC, GMU RPMh votes, zap, CP.
  */
 #include <stdint.h>
 #include "hw.h"
 #include "fb.h"
 #include "con.h"
 #include "plat.h"
+#include "rpmh.h"
+#include "gpu.h"
 
-#if defined(__has_include)
-#if __has_include("fw_a630_gmu.h")
-#include "fw_a630_gmu.h"
-#endif
-#endif
+#define END_SECONDS	60
 
-#define END_SECONDS		60
+/* ---- GPU SMMU (ARM SMMUv2 layout, arm-smmu.h) ---- */
+#define S_CR0		0x000
+#define S_CR0_CLIENTPD	(1u << 0)
+#define S_IDR0		0x020
+#define S_IDR1		0x024
+#define S_IDR2		0x028
+#define S_GFSR		0x048
+#define S_GFSYNR1	0x054
+#define S_TLBIALLNSNH	0x068
+#define S_TLBGSYNC	0x070
+#define S_TLBGSTATUS	0x074
+#define S_SMR(n)	(0x800 + 4 * (n))
+#define S_S2CR(n)	(0xc00 + 4 * (n))
+#define S_CBAR(n)	(4 * (n))		/* GR1 */
+#define S_CBA2R(n)	(0x800 + 4 * (n))	/* GR1 */
+#define IDR0_SMS	(1u << 27)
+#define IDR0_ATOSNS	(1u << 26)
+#define IDR0_S1TS	(1u << 30)
+#define SMR_VALID	(1u << 31)
 
-/* ---- register blocks (absolute physical addresses; MMU off) ---------------------------------------- */
+#define CB_SCTLR	0x000
+#define CB_TCR2		0x010
+#define CB_TTBR0	0x020
+#define CB_TTBR1	0x028
+#define CB_TCR		0x030
+#define CB_MAIR0	0x038
+#define CB_MAIR1	0x03c
+#define CB_PAR		0x050
+#define CB_FSR		0x058
+#define CB_FAR		0x060
+#define CB_FSYNR0	0x068
+#define CB_TLBIALL	0x618
+#define CB_TLBSYNC	0x7f0
+#define CB_TLBSTATUS	0x7f4
+#define CB_ATS1PR	0x800
+#define CB_ATSR		0x8f0
 
-#define GPUCC			0x05090000UL
-#define GCC			0x00100000UL
-#define GMU_BASE		0x0506a000UL
-#define PDC_BASE		0x0b200000UL
-#define SMMU_BASE		0x05040000UL
-#define SMMU_SIZE		0x10000UL
+#define CBAR_S1		((1u << 16) | (3u << 8) | (0xfu << 12))	/* S1 trans/S2 bypass, BPSHCFG NSH, MEMATTR WB, VMID 0 */
+#define SCTLR_ON	((1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 12))	/* M TRE AFE CFRE ASIDPNE; no IRQ */
+#define TCR_VAL		(25u | (2u << 12) | (1u << 23))	/* T0SZ 25 (39 bit), walks NC/NC outer-shareable, TG0 4K, EPD1 */
+#define TCR2_VAL	(1u | (1u << 4) | (7u << 15))	/* PASize 36 bit, AS (16-bit ASID), SEP upstream */
+#define MAIR0_VAL	0xf404ff44u			/* 0 NC, 1 WBRWA, 2 device, 3 outer-WB (io-pgtable-arm) */
+#define FSR_ALL		0xc00001feu
 
-#define GMU(n)			(GMU_BASE + (((uint32_t)(n) - 0x1A800u) << 2))
-#define PDC(w)			(PDC_BASE + ((uint32_t)(w) << 2))
+/* io-pgtable-arm, stage 1, 4K granule */
+#define PTE_TABLE	3ull
+#define PTE_PAGE	3ull
+#define PTE_AP_UNPRIV	(1ull << 6)
+#define PTE_SH_OS	(2ull << 8)
+#define PTE_AF		(1ull << 10)
+#define PTE_NG		(1ull << 11)
+#define PTE_GMU		(PTE_PAGE | PTE_AP_UNPRIV | PTE_SH_OS | PTE_AF | PTE_NG)	/* AttrIndx 0 = NC */
+#define PTE_ADDR	0x0000fffffffff000ull
 
-/* gpucc / GCC (as M10) */
-#define GPUCC_CX_GDSCR		0x106c
-#define GPUCC_CX_HWCTRL		0x1540
-#define GPUCC_GX_GDSCR		0x100c
-#define GPUCC_GMU_RCG_CMD	0x1120
-#define GPUCC_GMU_RCG_CFG	0x1124
-#define GPUCC_CBCR_AHB		0x1078
-#define GPUCC_CBCR_CX_GMU	0x1098
-#define GPUCC_CBCR_CXO		0x109c
-#define GCC_GPLL0_VOTE		0x52004
-#define GCC_CFG_AHB		0x71004
-#define GCC_MEMNOC_GFX		0x7100c
-#define GCC_SNOC_DVM_GFX	0x71018
-#define GCC_DDRSS_GPU_AXI	0x44038
+/* GMU address map (a6xx_gmu_memory_probe, a630): dummy fixed at 0x60000000,
+ * then debug / log / hfi from the uncached range 0x60000000 + 4K up. */
+#define VA_DUMMY	0x60000000u
+#define VA_DEBUG	0x60001000u
+#define VA_LOG		0x60005000u
+#define VA_HFI		0x60009000u
+#define SID_GMU		5u	/* gmu@506a000 iommus = <0x108 0x05> */
+#define SID_GMU_USER	4u	/* kgsl gmu_user (S9 DT); mapped too, harmless */
 
-#define SW_COLLAPSE		(1u << 0)
-#define PWR_ON			(1u << 31)
-#define CBCR_ENABLE		(1u << 0)
-#define CBCR_OFF		(1u << 31)
-#define CMD_UPDATE		(1u << 0)
+/* HFI v1 (a6xx_hfi.h) */
+#define Q_WORDS		1024u
+#define QH_STATUS	0
+#define QH_IOVA		1
+#define QH_TYPE		2
+#define QH_SIZE		3
+#define QH_RXWM		6
+#define QH_TXWM		7
+#define QH_RXREQ	8
+#define QH_READ		10
+#define QH_WRITE	11
+#define MSG_INIT	0
+#define MSG_FW_VERSION	1
+#define MSG_BW_TABLE	3
+#define MSG_PERF_TABLE	4
+#define MSG_TEST	5
+#define F2H_ERROR	100
+#define F2H_ACK		126
+#define INTR_MSGQ	1u
 
-/* GMU registers (as M10, plus HFI) */
-#define GMU_CM3_SYSRESET	0x1F800
-#define GMU_CM3_BOOT_CONFIG	0x1F801
-#define GMU_CX_GMU_WFI_CONFIG	0x1F802
-#define GMU_CM3_FW_INIT_RESULT	0x1F81C
-#define GMU_CM3_ITCM_START	0x1B400
-#define GMU_SYS_BUS_CONFIG	0x1F40F
-#define GMU_PWR_COL_FRAME_CTRL	0x1F8C0
-#define GMU_RPMH_CTRL		0x1F8E8
-#define GMU_RPMH_POWER_STATE	0x1F8EC
-#define GMU_HFI_SFR_ADDR	0x1F982
-#define GMU_HFI_MMAP_ADDR	0x1F983
-#define GMU_HFI_QTBL_INFO	0x1F984
-#define GMU_HFI_QTBL_ADDR	0x1F985
-#define GMU_HFI_CTRL_INIT	0x1F986
-#define GMU_HFI_CTRL_STATUS	0x1F980
-#define GMU_HFI_VERSION_INFO	0x1F981
-#define GMU_GMU2HOST_INTR_INFO	0x1F992
-#define GMU_GMU2HOST_INTR_CLR	0x1F991
-#define GMU_GMU2HOST_INTR_MASK	0x1F993
-#define GMU_HOST2GMU_INTR_SET	0x1F994
-#define GMU_GENERAL_7		0x1F9CC
-#define GMU_AHB_FENCE_RANGE_0	0x23B11
-#define GMU_AO_AHB_FENCE_CTRL	0x23B10
-#define GMU_AO_HOST_INTR_STATUS	0x23B05
+static uint8_t pt_pool[3][4096] __attribute__((aligned(4096)));
+static uint8_t mem_dummy[0x1000] __attribute__((aligned(4096)));
+static uint8_t mem_debug[0x4000] __attribute__((aligned(4096)));
+static uint8_t mem_log[0x4000] __attribute__((aligned(4096)));
+static uint8_t mem_hfi[0x4000] __attribute__((aligned(4096)));
+static unsigned pt_used;
+static uint64_t *pt_root;
 
-/* RSC/PDC sequencer (as M10) */
-#define GPU_RSCC_RSC_STATUS0	0x23404
-#define RSCC_PDC_SEQ_START_ADDR	0x23408
-#define RSCC_PDC_MATCH_VALUE_LO	0x23409
-#define RSCC_PDC_MATCH_VALUE_HI	0x2340A
-#define RSCC_PDC_SLAVE_ID_DRV0	0x2340B
-#define RSCC_HIDDEN_TCS_CMD0_ADDR 0x2340D
-#define RSCC_HIDDEN_TCS_CMD0_DATA 0x2340E
-#define RSCC_OVERRIDE_START_ADDR 0x23500
-#define RSCC_SEQ_MEM_0_DRV0	0x23580
-#define RSC_CMD_OFFSET		2
-#define PDC_GPU_ENABLE_PDC	0x21140
-#define PDC_GPU_SEQ_START_ADDR	0x21148
-#define PDC_GPU_SEQ_MEM_0	0xA0000
-#define PDC_GPU_TCS1_CONTROL	0x21572
-#define PDC_GPU_TCS1_CMD_ENABLE_BANK 0x21573
-#define PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK 0x21574
-#define PDC_GPU_TCS1_CMD0_MSGID	0x21575
-#define PDC_GPU_TCS1_CMD0_ADDR	0x21576
-#define PDC_GPU_TCS1_CMD0_DATA	0x21577
-#define PDC_GPU_TCS3_CONTROL	0x215D6
-#define PDC_GPU_TCS3_CMD_ENABLE_BANK 0x215D7
-#define PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK 0x215D8
-#define PDC_GPU_TCS3_CMD0_MSGID	0x215D9
-#define PDC_GPU_TCS3_CMD0_ADDR	0x215DA
-#define PDC_GPU_TCS3_CMD0_DATA	0x215DB
-#define PDC_CMD_OFFSET		4
-
-#define GMU_RCG_CFG_200MHZ	0x602
-#define GMU_CHIPID		0x06030100
-#define GMU_BOOT_CONFIG_TCM	2
-#define FENCE_RANGE_MASK	((1u << 31) | ((0xAu << 2) << 18) | 0x8A0u)
-#define GMU_BABEFACE		0xBABEFACEu
-
-/* ---- GPU SMMU (arm,smmu-kgsl@5040000, qcom,smmu-v2) ------------------------------------------------- */
-
-#define SMMU_SCR0		0x000
-#define SMMU_IDR0		0x020		/* [7:0] stream match registers */
-#define SMMU_IDR1		0x024		/* bit31 64K pages, [30:28] log2(pages)-1, [7:0] contexts */
-#define SMMU_IDR2		0x028
-#define SMMU_SGFSR		0x048
-#define SMMU_SMR(n)		(0x800 + 4 * (n))	/* bit31 valid, [30:16] mask, [14:0] stream */
-#define SMMU_S2CR(n)		(0xc00 + 4 * (n))	/* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define SMMU_CBAR(n)		(4 * (n))		/* second page */
-#define SMMU_CBA2R(n)		(0x800 + 4 * (n))	/* second page */
-#define SMMU_CB_SCTLR		0x00
-#define SMMU_CB_TCR2		0x10
-#define SMMU_CB_TTBR0		0x20
-#define SMMU_CB_TTBR1		0x28
-#define SMMU_CB_TCR		0x30
-#define SMMU_CB_MAIR0		0x38
-#define SMMU_CB_MAIR1		0x3c
-#define SMMU_CB_FSR		0x58
-#define SMMU_CB_FAR		0x60
-#define SMMU_CB_FSYNR0		0x68
-#define SMMU_CB_TLBIALL		0x618
-#define SMMU_CB_TLBSYNC		0x7f0
-#define SMMU_CB_TLBSTATUS	0x7f4
-
-#define SMMU_SMR_VALID		(1u << 31)
-#define SMMU_S2CR_FAULT		(2u << 16)
-#define SMMU_CBAR_STAGE_1	((1u << 16) | (3u << 8) | (0xfu << 12))	/* type S1, weakest defaults */
-#define SMMU_CBA2R_64BIT	1u
-#define SMMU_CB_SCTLR_ON	((1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 12)) /* on, faults recorded, no irq */
-#define SMMU_TCR_39BITS		(25u | (1u << 8) | (1u << 10) | (3u << 12) | (1u << 23))
-#define SMMU_TCR2_VAL		(1u | (1u << 4) | (7u << 15))	/* 36-bit PA, 16-bit ASID */
-#define SMMU_MAIR0_VAL		0xf404ff44u	/* 0 uncached, 1 cached, 2 device */
-#define SMMU_FSR_ALL		0xc00001feu
-
-/* Page tables for the GMU's SMMU context (3-level, 4K pages, MMU off so PA = address). */
-#define PTE_TABLE		3ull
-#define PTE_PAGE		3ull
-#define PTE_ACCESSED		(1ull << 10)
-#define PTE_SHARED		(2ull << 8)
-#define PTE_NOT_GLOBAL		(1ull << 11)
-#define PTE_GMU			(PTE_SHARED | PTE_ACCESSED | PTE_NOT_GLOBAL)
-#define PTE_ADDR		0x0000fffffffff000ull
-
-/* GMU memory layout (Samsung a630: HFI at 0x60000000, dump at +1 MiB). */
-#define GMU_HFI_ADDR		0x60000000u
-#define GMU_DUMP_ADDR		0x60100000u
-#define GMU_MEM_SIZE		0x4000u		/* 16 KiB each */
-#define GMU_STREAM_USER		4
-#define GMU_STREAM_KERNEL	5
-#define GMU_CB			0		/* context bank the GMU gets */
-
-/* HFI message protocol (kgsl_hfi.h) */
-#define HFI_QUEUES		3		/* CMD(0), MSG(1), DBG(2) */
-#define HFI_QUEUE_WORDS		1024
-#define HFI_MSG_CMD		0
-#define H2F_MSG_INIT		0
-#define H2F_MSG_FW_VER		1
-#define F2H_MSG_ACK		126
-#define HFI_IRQ_MSGQ		(1u << 0)
-
-static const char *stage;
-static int step_row;
-
-/* Static memory, 4K-aligned; with MMU off, physical address == address. */
-static uint8_t smmu_pool[8][4096] __attribute__((aligned(4096)));
-static unsigned smmu_pool_used;
-static uint8_t gmu_hfi_mem[GMU_MEM_SIZE] __attribute__((aligned(4096)));
-static uint8_t gmu_dump_mem[GMU_MEM_SIZE] __attribute__((aligned(4096)));
-
-static uint32_t smmu_page = 0x1000, smmu_pages = 8, smmu_contexts, smmu_smrs;
-
-void exc_handler(uint64_t slot, uint64_t *regs)
-{
-	panic_screen(stage, slot, regs);
-}
-
-static void step(const char *s)
-{
-	char b[52], *p = put(b, s);
-	int row = con_row();
-
-	while (p < b + 50)
-		*p++ = ' ';
-	*p = 0;
-	con_set_row(step_row);
-	con_str("PASSO", b);
-	con_set_row(row);
-	wdog_pet();
-}
-
-static void showhex(const char *label, uint64_t v)
-{
-	con_hex(label, v);
-	wdog_pet();
-}
-
-static void zero(void *p, uint32_t n)
-{
-	for (uint32_t i = 0; i < n; i++)
-		((volatile uint8_t *)p)[i] = 0;
-}
+static uint32_t pgsz = 0x1000, npage = 8, ncb, nsmr, idr0;
+static int cb = -1;
+static uint32_t cbbase;		/* byte offset of the chosen CB's page */
 
 static uint64_t pa(const void *p)
 {
 	return (uint64_t)(uintptr_t)p;
 }
 
-/* ---- power (M10 stages 1-2, condensed) ------------------------------------------------------------- */
-
-static int clk_branch_on(uintptr_t cbcr)
+static void zero(void *p, uint32_t n)
 {
-	wr32(cbcr, rd32(cbcr) | CBCR_ENABLE);
-	dsb();
-	for (int i = 0; i < 2000 && (rd32(cbcr) & CBCR_OFF); i++)
-		delay_ms(1);
-	return !(rd32(cbcr) & CBCR_OFF);
+	for (uint32_t i = 0; i < n; i += 4)
+		*(volatile uint32_t *)((uint8_t *)p + i) = 0;
 }
 
-static int cx_power_on(void)
+static void wr(uintptr_t a, uint32_t v)
 {
-	uint32_t v = rd32(GPUCC + GPUCC_CX_GDSCR);
-
-	if (v & SW_COLLAPSE) {
-		wr32(GPUCC + GPUCC_CX_GDSCR, v & ~SW_COLLAPSE);
-		dsb();
-	}
-	for (int i = 0; i < 2000; i++) {
-		if ((rd32(GPUCC + GPUCC_CX_GDSCR) & PWR_ON) || (rd32(GPUCC + GPUCC_CX_HWCTRL) & PWR_ON))
-			break;
-		delay_ms(1);
-	}
-	return (rd32(GPUCC + GPUCC_CX_GDSCR) & PWR_ON) || (rd32(GPUCC + GPUCC_CX_HWCTRL) & PWR_ON);
+	wr32(a, v);
+	dsb();
 }
 
-static int power_on(void)
+static void wr64(uintptr_t a, uint64_t v)
 {
-	stage = "1 energia";
-	step("1 GPLL0 + CX GDSC + relogios");
-	wr32(GCC + GCC_GPLL0_VOTE, rd32(GCC + GCC_GPLL0_VOTE) | (1u << 15) | (1u << 16));
+	*(volatile uint64_t *)a = v;
 	dsb();
-	if (!clk_branch_on(GCC + GCC_CFG_AHB))
-		return 0;
-	if (!cx_power_on()) {
-		con_str("1", "CX GDSC nao liga: parando");
-		return 0;
-	}
-	showhex("gpucc cx gdscr", rd32(GPUCC + GPUCC_CX_GDSCR));
-	/* GMU RCG 200 MHz */
-	wr32(GPUCC + GPUCC_GMU_RCG_CFG, GMU_RCG_CFG_200MHZ);
-	dsb();
-	wr32(GPUCC + GPUCC_GMU_RCG_CMD, rd32(GPUCC + GPUCC_GMU_RCG_CMD) | CMD_UPDATE);
-	dsb();
-	for (int i = 0; i < 2000 && (rd32(GPUCC + GPUCC_GMU_RCG_CMD) & CMD_UPDATE); i++)
-		delay_ms(1);
-	clk_branch_on(GPUCC + GPUCC_CBCR_CXO);
-	clk_branch_on(GPUCC + GPUCC_CBCR_AHB);
-	if (!clk_branch_on(GPUCC + GPUCC_CBCR_CX_GMU))
-		return 0;
-	clk_branch_on(GCC + GCC_MEMNOC_GFX);
-	clk_branch_on(GCC + GCC_DDRSS_GPU_AXI);
-	clk_branch_on(GCC + GCC_SNOC_DVM_GFX);
-	con_str("1", "GPU com energia e relogios");
-	return 1;
 }
 
-/* ---- stage 2: read the SMMU as the boot loader / hypervisor left it --------------------------------- */
-
-static void smmu_probe(void)
+static uint64_t rd64(uintptr_t a)
 {
-	uint32_t idr0, idr1;
-
-	stage = "2 smmu leitura";
-	step("2 le a SMMU da GPU (0x5040000)");
-	idr0 = rd32(SMMU_BASE + SMMU_IDR0);
-	idr1 = rd32(SMMU_BASE + SMMU_IDR1);
-	smmu_smrs = idr0 & 0xff;
-	smmu_page = (idr1 >> 31) ? 0x10000 : 0x1000;
-	smmu_pages = 2u << ((idr1 >> 28) & 7);
-	smmu_contexts = idr1 & 0xff;
-	showhex("smmu idr0", idr0);
-	showhex("smmu idr1", idr1);
-	showhex("smmu scr0", rd32(SMMU_BASE + SMMU_SCR0));
-	showhex("smmu sgfsr", rd32(SMMU_BASE + SMMU_SGFSR));
-	{
-		char b[80], *p = put(put_dec(put(b, "smr="), smmu_smrs), " cb=");
-		p = put_dec(p, smmu_contexts);
-		p = put(put_dec(put(p, " pages="), smmu_pages), " pg=");
-		put_hex(p, smmu_page, 4);
-		con_str("smmu", b);
-	}
-	if (2 * smmu_pages * smmu_page != SMMU_SIZE) {
-		con_str("2", "layout nao bate com 0x10000: uso 4K/8 mesmo assim");
-		smmu_page = 0x1000;
-		smmu_pages = 8;
-	}
-	/* The stream table and context 0, as left (bypass/fault expected on the GPU's own, off, SMMU). */
-	showhex("smr0", rd32(SMMU_BASE + SMMU_SMR(0)));
-	showhex("s2cr0", rd32(SMMU_BASE + SMMU_S2CR(0)));
-	showhex("cb0 sctlr", rd32(SMMU_BASE + smmu_pages * smmu_page + SMMU_CB_SCTLR));
+	return *(volatile uint64_t *)a;
 }
 
-/* ---- stage 3: page tables + the GMU's SMMU context -------------------------------------------------- */
+/* ---- 1. perf table from the OP6 OPPs + cmd-db (a6xx_gmu_rpmh_votes_init) ---- */
 
-static uint64_t *smmu_new_table(void)
+/* OP6 DT gpu opp-table (no speed-bin / opp-supported-hw) and gmu opp-table,
+ * ascending, with the "off" entry first as a6xx_gmu_build_freq_table does. */
+static const uint32_t gpu_khz[8] = { 0, 257000, 342000, 414000, 520000, 596000, 675000, 710000 };
+static const uint16_t gpu_lvl[8] = { 0, 0x40, 0x80, 0xc0, 0x100, 0x140, 0x180, 0x1a0 };
+static const uint32_t gmu_khz[3] = { 0, 200000, 400000 };
+static const uint16_t gmu_lvl[3] = { 0, 0x30, 0x80 };
+static uint32_t gx_vote[8], cx_vote[3];
+
+static int votes(void)
 {
-	if (smmu_pool_used >= sizeof(smmu_pool) / sizeof(smmu_pool[0]))
+	char b[200], *p;
+	int ok = 1;
+
+	for (unsigned i = 0; i < 8; i++)
+		gx_vote[i] = gpu_arc_vote(&arc_gfx, gpu_lvl[i], &ok);
+	for (unsigned i = 0; i < 3; i++)
+		cx_vote[i] = gpu_arc_vote(&arc_cx, gmu_lvl[i], &ok);
+	p = put(b, "gx");
+	for (unsigned i = 0; i < 8; i++)
+		p = put_hex(put(p, " "), gx_vote[i], 6);
+	say("VOTOS", b);
+	p = put(b, "cx");
+	for (unsigned i = 0; i < 3; i++)
+		p = put_hex(put(p, " "), cx_vote[i], 6);
+	say("VOTOS", b);
+	if (!ok)
+		say("VOTOS", "nivel de OPP sem ARC no cmd-db: parando");
+	return ok;
+}
+
+/* ---- 2. GPU SMMU as left (read only) ---- */
+
+static int smmu_probe(void)
+{
+	char b[160], *p;
+	uint32_t idr1, used = 0, cbmask = 0;
+
+	step("2 SMMU GPU: le ids/SMR/S2CR");
+	idr0 = rd32(GPU_SMMU + S_IDR0);
+	idr1 = rd32(GPU_SMMU + S_IDR1);
+	nsmr = idr0 & 0xff;
+	ncb = idr1 & 0xff;
+	pgsz = (idr1 >> 31) ? 0x10000 : 0x1000;
+	npage = 2u << ((idr1 >> 28) & 7);
+	gpu_smmu_ids();
+	p = put_dec(put(b, "smr="), nsmr);
+	p = put_dec(put(p, " cb="), ncb);
+	p = put_dec(put(p, " pg="), pgsz >> 10);
+	p = put_dec(put(p, "K n="), npage);
+	p = put(p, (idr0 & IDR0_SMS) ? " SMS" : " indexado");
+	put(p, (idr0 & IDR0_S1TS) && !(idr0 & IDR0_ATOSNS) ? " ATOS" : " sem-ATOS");
+	say("SMMU", b);
+	if (2 * npage * pgsz != GPU_SMMU_SIZE || ncb == 0 || ncb > 32 || nsmr > 128) {
+		say("SMMU", "layout nao bate com 0x10000 / ids estranhos: parando");
 		return 0;
-	uint64_t *t = (uint64_t *)smmu_pool[smmu_pool_used++];
+	}
+	if (idr0 & IDR0_SMS) {
+		for (uint32_t n = 0; n < nsmr; n++) {
+			uint32_t smr = rd32(GPU_SMMU + S_SMR(n)), s2cr = rd32(GPU_SMMU + S_S2CR(n));
+			if (!(smr & SMR_VALID))
+				continue;
+			used++;
+			if (((s2cr >> 16) & 3) == 0)
+				cbmask |= 1u << (s2cr & 0x1f);
+			p = put_hex(put(put_dec(put(b, "smr"), n), "="), smr, 8);
+			put_hex(put(p, " s2cr="), s2cr, 8);
+			saylog("SMMU", b);
+			if ((smr & 0x7fff) == SID_GMU || (smr & 0x7fff) == SID_GMU_USER)
+				say("SMMU", b);
+		}
+	}
+	for (uint32_t i = 0; i < ncb; i++)
+		if (rd32(GPU_SMMU + npage * pgsz + i * pgsz + CB_SCTLR) & 1)
+			cbmask |= 1u << i;
+	for (uint32_t i = 0; i < ncb && cb < 0; i++)
+		if (!(cbmask & (1u << i)))
+			cb = (int)i;
+	p = put_dec(put(b, "smr validos="), used);
+	p = put_hex(put(p, " cb em uso="), cbmask, 4);
+	p = put(p, " livre=");
+	p = cb < 0 ? put(p, "nenhum") : put_dec(p, (uint32_t)cb);
+	say("SMMU", b);
+	return cb >= 0;
+}
+
+/* ---- 3. tables + context bank + stream rules ---- */
+
+static uint64_t *pt_new(void)
+{
+	if (pt_used >= 3)
+		return 0;
+	uint64_t *t = (uint64_t *)pt_pool[pt_used++];
 	zero(t, 4096);
 	return t;
 }
 
-static uint64_t *smmu_root;
-
-/* Map one 4K page of GMU address `va` to physical `phys`. */
-static int smmu_map(uint64_t va, uint64_t phys)
+static int pt_map(uint64_t va, uint64_t phys)
 {
-	uint64_t *l1 = smmu_root, *l2, *l3;
-	uint64_t e;
+	uint64_t *t = pt_root;
 
-	e = l1[(va >> 30) & 0x1ff];
-	if (e & 1)
-		l2 = (uint64_t *)(uintptr_t)(e & PTE_ADDR);
-	else {
-		l2 = smmu_new_table();
-		if (!l2)
-			return 0;
-		l1[(va >> 30) & 0x1ff] = pa(l2) | PTE_TABLE;
+	for (int shift = 30; shift >= 21; shift -= 9) {
+		uint64_t *e = &t[(va >> shift) & 0x1ff];
+		if (!(*e & 1)) {
+			uint64_t *n = pt_new();
+			if (!n)
+				return 0;
+			*e = pa(n) | PTE_TABLE;
+		}
+		t = (uint64_t *)(uintptr_t)(*e & PTE_ADDR);
 	}
-	e = l2[(va >> 21) & 0x1ff];
-	if (e & 1)
-		l3 = (uint64_t *)(uintptr_t)(e & PTE_ADDR);
-	else {
-		l3 = smmu_new_table();
-		if (!l3)
-			return 0;
-		l2[(va >> 21) & 0x1ff] = pa(l3) | PTE_TABLE;
-	}
-	l3[(va >> 12) & 0x1ff] = phys | PTE_GMU | PTE_PAGE;
+	t[(va >> 12) & 0x1ff] = phys | PTE_GMU;
 	return 1;
 }
 
-static int smmu_context_on(void)
+static int map_range(uint32_t va, void *buf, uint32_t size)
 {
-	uint32_t cb = GMU_CB, ctx;
+	for (uint32_t off = 0; off < size; off += 4096)
+		if (!pt_map(va + off, pa(buf) + off))
+			return 0;
+	return 1;
+}
+
+static int smr_slot(uint32_t sid, int avoid)
+{
+	if (!(idr0 & IDR0_SMS))
+		return sid < 128 ? (int)sid : -1;	/* stream indexing: S2CR[sid] */
+	for (uint32_t n = 0; n < nsmr; n++)
+		if ((rd32(GPU_SMMU + S_SMR(n)) & (SMR_VALID | 0x7fff)) == (SMR_VALID | sid))
+			return (int)n;			/* reuse an existing rule for this SID */
+	for (uint32_t n = 0; n < nsmr; n++)
+		if (!(rd32(GPU_SMMU + S_SMR(n)) & SMR_VALID) && (int)n != avoid)
+			return (int)n;
+	return -1;
+}
+
+static int smmu_route(uint32_t sid, int avoid)
+{
+	char b[96], *p;
+	int n = smr_slot(sid, avoid);
+
+	if (n < 0) {
+		say("SMMU", "sem SMR livre");
+		return -1;
+	}
+	wr(GPU_SMMU + S_S2CR(n), (uint32_t)cb);		/* type TRANSLATE, CBNDX */
+	if (idr0 & IDR0_SMS)
+		wr(GPU_SMMU + S_SMR(n), SMR_VALID | sid);	/* mask 0 */
+	p = put_dec(put(b, "sid "), sid);
+	p = put_dec(put(p, " smr"), (uint32_t)n);
+	p = put_hex(put(p, "="), rd32(GPU_SMMU + S_SMR(n)), 8);
+	put_hex(put(p, " s2cr="), rd32(GPU_SMMU + S_S2CR(n)), 8);
+	say("SMMU", b);
+	return (rd32(GPU_SMMU + S_S2CR(n)) & 0x300ff) == (uint32_t)cb &&
+	    (!(idr0 & IDR0_SMS) || rd32(GPU_SMMU + S_SMR(n)) == (SMR_VALID | sid)) ? n : -1;
+}
+
+static int smmu_faulted(const char *when)
+{
+	uintptr_t c = GPU_SMMU + cbbase;
+	uint32_t fsr = rd32(c + CB_FSR), gfsr = rd32(GPU_SMMU + S_GFSR);
+	char b[120], *p;
+
+	if (!(fsr & FSR_ALL) && !gfsr)
+		return 0;
+	p = put(put(b, when), " fsr=");
+	p = put_hex(p, fsr, 8);
+	p = put_hex(put(p, " far="), rd32(c + CB_FAR), 8);
+	p = put_hex(put(p, " syn="), rd32(c + CB_FSYNR0), 8);
+	p = put_hex(put(p, " gfsr="), gfsr, 8);
+	put_hex(put(p, " gsyn1="), rd32(GPU_SMMU + S_GFSYNR1), 8);
+	say("FALHA", b);
+	return 1;
+}
+
+static int smmu_program(void)
+{
+	char b[120], *p;
+	uintptr_t c;
 	uint64_t ttbr;
 
-	stage = "3 smmu contexto";
-	step("3a tabelas p/ HFI 0x60000000 + dump");
-	smmu_root = smmu_new_table();
-	if (!smmu_root)
+	step("3 tabelas da SMMU (4 buffers)");
+	if ((pa(mem_hfi) | pa(mem_dummy) | pa(mem_log) | pa(mem_debug) | pa(pt_pool)) & 0xfff) {
+		say("SMMU", "buffers fora de 4K (carga do ABL?): parando");
 		return 0;
-	for (uint32_t off = 0; off < GMU_MEM_SIZE; off += 4096)
-		if (!smmu_map(GMU_HFI_ADDR + off, pa(gmu_hfi_mem) + off) ||
-		    !smmu_map(GMU_DUMP_ADDR + off, pa(gmu_dump_mem) + off)) {
-			con_str("3", "sem tabelas");
+	}
+	pt_root = pt_new();
+	if (!pt_root || !map_range(VA_DUMMY, mem_dummy, sizeof(mem_dummy)) ||
+	    !map_range(VA_DEBUG, mem_debug, sizeof(mem_debug)) ||
+	    !map_range(VA_LOG, mem_log, sizeof(mem_log)) || !map_range(VA_HFI, mem_hfi, sizeof(mem_hfi))) {
+		say("SMMU", "sem tabelas: parando");
+		return 0;
+	}
+	dsb();
+	p = put_hex(put(b, "hfi pa="), pa(mem_hfi), 8);
+	put_hex(put(p, " ttbr="), pa(pt_root), 8);
+	say("SMMU", b);
+
+	step("3 contexto (S1, VMID 0, VA64)");
+	cbbase = npage * pgsz + (uint32_t)cb * pgsz;
+	c = GPU_SMMU + cbbase;
+	ttbr = pa(pt_root) | ((uint64_t)(uint32_t)cb << 48);
+	wr(c + CB_SCTLR, 0);
+	wr(GPU_SMMU + pgsz + S_CBA2R(cb), 1);		/* VA64 */
+	wr(GPU_SMMU + pgsz + S_CBAR(cb), CBAR_S1);
+	wr(c + CB_TCR2, TCR2_VAL);
+	wr(c + CB_TCR, TCR_VAL);
+	wr(c + CB_TTBR0, (uint32_t)ttbr);
+	wr(c + CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
+	wr(c + CB_TTBR1, 0);
+	wr(c + CB_TTBR1 + 4, 0);
+	wr(c + CB_MAIR0, MAIR0_VAL);
+	wr(c + CB_MAIR1, 0);
+	wr(c + CB_FSR, FSR_ALL);
+	wr(c + CB_TLBIALL, 0);
+	wr(c + CB_TLBSYNC, 0);
+	for (int i = 0; i < 100 && (rd32(c + CB_TLBSTATUS) & 1); i++)
+		delay_ms(1);
+	wr(c + CB_SCTLR, SCTLR_ON);
+	p = put_hex(put(b, "cbar="), rd32(GPU_SMMU + pgsz + S_CBAR(cb)), 8);
+	p = put_hex(put(p, " sctlr="), rd32(c + CB_SCTLR), 4);
+	p = put_hex(put(p, " ttbr0="), rd32(c + CB_TTBR0), 8);
+	put_hex(put(p, " tcr="), rd32(c + CB_TCR), 8);
+	say("SMMU", b);
+	if (!(rd32(c + CB_SCTLR) & 1) || rd32(c + CB_TTBR0) != (uint32_t)ttbr ||
+	    ((rd32(GPU_SMMU + pgsz + S_CBAR(cb)) >> 16) & 3) != 1) {
+		say("SMMU", "o contexto NAO aceitou as escritas (hyp?): parando");
+		return 0;
+	}
+
+	step("3 regras SMR/S2CR p/ SID 5 e 4");
+	int s5 = smmu_route(SID_GMU, -1);
+	if (s5 < 0) {
+		say("SMMU", "regra do SID 5 NAO ficou: parando");
+		return 0;
+	}
+	if (smmu_route(SID_GMU_USER, s5) < 0)
+		say("SMMU", "regra do SID 4 nao ficou (segue: o DT so usa o 5)");
+	wr(GPU_SMMU + S_TLBIALLNSNH, 0);
+	wr(GPU_SMMU + S_TLBGSYNC, 0);
+	for (int i = 0; i < 100 && (rd32(GPU_SMMU + S_TLBGSTATUS) & 1); i++)
+		delay_ms(1);
+	uint32_t cr0 = rd32(GPU_SMMU + S_CR0);
+	if (cr0 & S_CR0_CLIENTPD) {
+		step("3 sCR0: liga a traducao");
+		wr(GPU_SMMU + S_CR0, cr0 & ~S_CR0_CLIENTPD);
+	}
+	sayhex("sCR0", rd32(GPU_SMMU + S_CR0));
+	if (rd32(GPU_SMMU + S_CR0) & S_CR0_CLIENTPD) {
+		say("SMMU", "SMMU continua em bypass (CLIENTPD): parando");
+		return 0;
+	}
+
+	if ((idr0 & IDR0_S1TS) && !(idr0 & IDR0_ATOSNS)) {
+		step("3 ATS1PR: traduz 0x60009000");
+		wr64(c + CB_ATS1PR, VA_HFI);
+		for (int i = 0; i < 100 && (rd32(c + CB_ATSR) & 1); i++)
+			delay_ms(1);
+		uint64_t par = rd64(c + CB_PAR);
+		p = put_hex(put(b, "par="), par, 16);
+		say("ATS", b);
+		if ((par & 1) || (par & 0xfffffff000ull) != pa(mem_hfi)) {
+			say("ATS", "a SMMU nao traduz para o buffer: parando");
+			smmu_faulted("ats");
 			return 0;
 		}
-	dsb();	/* the SMMU reads the tables from memory (Device: no cache to flush) */
-
-	step("3b programa o contexto da SMMU (SID 4/5 -> CB0)");
-	ctx = smmu_pages * smmu_page + cb * smmu_page;		/* CB0 register page */
-	ttbr = pa(smmu_root) | ((uint64_t)cb << 48);		/* tagged with the ASID */
-	/* global enable: translation on (not client-pd bypass), fault handling */
-	wr32(SMMU_BASE + SMMU_SCR0, rd32(SMMU_BASE + SMMU_SCR0) & ~(1u << 0));	/* CLIENTPD=0 */
-	dsb();
-	wr32(SMMU_BASE + SMMU_CB_SCTLR + ctx, 0);
-	wr32(SMMU_BASE + smmu_page + SMMU_CBA2R(cb), SMMU_CBA2R_64BIT);
-	wr32(SMMU_BASE + smmu_page + SMMU_CBAR(cb), SMMU_CBAR_STAGE_1);
-	wr32(SMMU_BASE + SMMU_CB_TCR2 + ctx, SMMU_TCR2_VAL);
-	wr32(SMMU_BASE + SMMU_CB_TCR + ctx, SMMU_TCR_39BITS);
-	wr32(SMMU_BASE + SMMU_CB_TTBR0 + ctx, (uint32_t)ttbr);
-	wr32(SMMU_BASE + SMMU_CB_TTBR0 + 4 + ctx, (uint32_t)(ttbr >> 32));
-	wr32(SMMU_BASE + SMMU_CB_TTBR1 + ctx, 0);
-	wr32(SMMU_BASE + SMMU_CB_TTBR1 + 4 + ctx, 0);
-	wr32(SMMU_BASE + SMMU_CB_MAIR0 + ctx, SMMU_MAIR0_VAL);
-	wr32(SMMU_BASE + SMMU_CB_MAIR1 + ctx, 0);
-	wr32(SMMU_BASE + SMMU_CB_FSR + ctx, SMMU_FSR_ALL);
-	wr32(SMMU_BASE + SMMU_CB_TLBIALL + ctx, 0);
-	wr32(SMMU_BASE + SMMU_CB_TLBSYNC + ctx, 0);
-	for (int i = 0; i < 100 && (rd32(SMMU_BASE + SMMU_CB_TLBSTATUS + ctx) & 1); i++)
-		delay_ms(1);
-	wr32(SMMU_BASE + SMMU_CB_SCTLR + ctx, SMMU_CB_SCTLR_ON);
-	/* route the GMU's two streams to this context */
-	wr32(SMMU_BASE + SMMU_S2CR(0), cb);
-	wr32(SMMU_BASE + SMMU_SMR(0), SMMU_SMR_VALID | GMU_STREAM_KERNEL);
-	wr32(SMMU_BASE + SMMU_S2CR(1), cb);
-	wr32(SMMU_BASE + SMMU_SMR(1), SMMU_SMR_VALID | GMU_STREAM_USER);
-	dsb();
-
-	/* read every write back: if the hypervisor refused one, the photo shows it */
-	showhex("cb0 sctlr<-", rd32(SMMU_BASE + SMMU_CB_SCTLR + ctx));
-	showhex("cb0 ttbr0 lo", rd32(SMMU_BASE + SMMU_CB_TTBR0 + ctx));
-	showhex("cbar0<-", rd32(SMMU_BASE + smmu_page + SMMU_CBAR(cb)));
-	showhex("smr0<-", rd32(SMMU_BASE + SMMU_SMR(0)));
-	showhex("s2cr0<-", rd32(SMMU_BASE + SMMU_S2CR(0)));
-	if (!(rd32(SMMU_BASE + SMMU_CB_SCTLR + ctx) & 1) ||
-	    (rd32(SMMU_BASE + SMMU_SMR(0)) != (SMMU_SMR_VALID | GMU_STREAM_KERNEL))) {
-		con_str("3", "o hypervisor NAO deixou programar a SMMU (ver <- acima)");
-		return 0;
+		say("ATS", "VA 0x60009000 -> buffer HFI: OK");
+	} else {
+		say("ATS", "sem operacao de traducao: confio nas leituras acima");
 	}
-	con_str("3", "SMMU programada e confirmada (o hyp deixou)");
-	return 1;
+	return !smmu_faulted("antes do boot");
 }
 
-static int smmu_faulted(void)
-{
-	uint32_t ctx = smmu_pages * smmu_page + GMU_CB * smmu_page;
-	uint32_t fsr = rd32(SMMU_BASE + SMMU_CB_FSR + ctx);
+/* ---- 5. HFI v1 ---- */
 
-	if ((fsr & SMMU_FSR_ALL) == 0)
-		return 0;
-	showhex("SMMU RECUSOU fsr", fsr);
-	showhex("  far lo", rd32(SMMU_BASE + SMMU_CB_FAR + ctx));
-	return 1;
+static volatile uint32_t *const_hfi(void)
+{
+	return (volatile uint32_t *)mem_hfi;
 }
 
-/* ---- the HFI queue table + polled send/receive ----------------------------------------------------- */
-
-/* kgsl_hfi.h: 6-word table header, then one 12-word header per queue. */
-#define HFI_TBL_HDR_WORDS	6
-#define HFI_QHDR_WORDS		12
-#define HFI_TABLE_WORDS		(HFI_TBL_HDR_WORDS + HFI_QUEUES * HFI_QHDR_WORDS)
-#define HFI_QUEUE_OFFSET(i)	((HFI_TABLE_WORDS * 4u) + (i) * (4096u + 16u))	/* bytes */
-/* queue header word indices */
-#define QH_STATUS		0
-#define QH_START		1
-#define QH_TYPE			2
-#define QH_SIZE			3
-#define QH_MSG_SIZE		4
-#define QH_RX_REQ		8
-#define QH_READ			10
-#define QH_WRITE		11
-
-static volatile uint32_t *hfi;	/* = gmu_hfi_mem as words */
-
-static uint32_t hfi_number;
-static uint32_t hfi_payload0;	/* first payload word of the last answer (e.g. the firmware version) */
-
-static volatile uint32_t *hfi_qhdr(unsigned q)
+static volatile uint32_t *qhdr(unsigned q)
 {
-	return hfi + HFI_TBL_HDR_WORDS + q * HFI_QHDR_WORDS;
+	return const_hfi() + 6 + 12 * q;
 }
 
-static void hfi_table_init(void)
+static volatile uint32_t *qdata(unsigned q)
 {
-	zero(gmu_hfi_mem, GMU_MEM_SIZE);
-	hfi = (volatile uint32_t *)gmu_hfi_mem;
-	hfi[0] = 0;				/* version */
-	hfi[1] = HFI_TABLE_WORDS;		/* size (dwords) */
-	hfi[2] = HFI_TBL_HDR_WORDS;		/* qhdr0 offset */
-	hfi[3] = HFI_QHDR_WORDS;		/* qhdr size */
-	hfi[4] = HFI_QUEUES;			/* num_q */
-	hfi[5] = HFI_QUEUES;			/* num_active_q */
-	{
-		static const uint8_t qid[HFI_QUEUES] = { 0, 4, 5 };
-		static const uint8_t qprio[HFI_QUEUES] = { 10, 10, 40 };
-		for (unsigned i = 0; i < HFI_QUEUES; i++) {
-			volatile uint32_t *h = hfi_qhdr(i);
-			h[QH_STATUS] = 1;
-			h[QH_START] = GMU_HFI_ADDR + HFI_QUEUE_OFFSET(i);
-			h[QH_TYPE] = qid[i] | ((uint32_t)qprio[i] << 8);
-			h[QH_SIZE] = HFI_QUEUE_WORDS;
-			h[QH_MSG_SIZE] = 0;
-			h[QH_RX_REQ] = 1;
-			h[QH_READ] = 0;
-			h[QH_WRITE] = 0;
+	return (volatile uint32_t *)(mem_hfi + 0x1000 * (q + 1));
+}
+
+static void hfi_table(void)
+{
+	volatile uint32_t *t = const_hfi();
+
+	zero(mem_hfi, sizeof(mem_hfi));
+	zero(mem_debug, sizeof(mem_debug));
+	zero(mem_log, sizeof(mem_log));
+	zero(mem_dummy, sizeof(mem_dummy));
+	t[0] = 0;			/* version */
+	t[1] = 24 + 2 * 48;		/* size: a6xx_hfi_init stores bytes (table + 2 headers) */
+	t[2] = 6;			/* qhdr0 offset, dwords */
+	t[3] = 12;			/* qhdr size, dwords */
+	t[4] = 2;			/* queues */
+	t[5] = 2;			/* active */
+	for (unsigned q = 0; q < 2; q++) {
+		volatile uint32_t *h = qhdr(q);
+		h[QH_IOVA] = VA_HFI + 0x1000 * (q + 1);
+		h[QH_TYPE] = (10u << 8) | (q ? 4u : 0u);	/* cmd id 0; legacy response id 4 */
+		h[QH_STATUS] = 1;
+		h[QH_SIZE] = Q_WORDS;
+		h[QH_RXWM] = 1;
+		h[QH_TXWM] = 1;
+		h[QH_RXREQ] = 1;
+	}
+	dsb();
+}
+
+static uint32_t seqnum, ack_payload0;
+
+/* Send msg (header filled here), wait for its ack. 0 = accepted. */
+static int hfi_send(const char *what, uint32_t id, uint32_t *msg, uint32_t words)
+{
+	volatile uint32_t *h = qhdr(0), *q = qdata(0);
+	volatile uint32_t *rh = qhdr(1), *rq = qdata(1);
+	uint32_t seq = ++seqnum % 0xfff, w = h[QH_WRITE], r = h[QH_READ];
+	uint32_t space = (r + Q_WORDS - w - 1) % Q_WORDS;
+	char b[120], *p;
+	int verdict = -1;
+
+	step(what);
+	if (space < words) {
+		say(what, "fila de comandos cheia");
+		return -1;
+	}
+	msg[0] = (seq << 20) | (words << 8) | id;		/* HFI_MSG_CMD = 0 */
+	for (uint32_t i = 0; i < words; i++) {
+		q[w] = msg[i];
+		w = (w + 1) % Q_WORDS;
+	}
+	h[QH_WRITE] = w;					/* legacy: no 0xfafafafa padding */
+	dsb();
+	wr(GMU(GMU_HOST2GMU_INTR_SET), 1);
+
+	for (int t = 0; t < 1000 && verdict < 0; t++) {
+		if (!(rd32(GMU(GMU_GMU2HOST_INTR_INFO)) & INTR_MSGQ)) {
+			if (smmu_faulted(what))
+				break;
+			delay_ms(1);
+			if ((t & 255) == 255)
+				wdog_pet();
+			continue;
+		}
+		wr(GMU(GMU_GMU2HOST_INTR_CLR), INTR_MSGQ);
+		while (rh[QH_READ] != rh[QH_WRITE]) {
+			uint32_t at = rh[QH_READ] % Q_WORDS, m[20], n = (rq[at] >> 8) & 0xff;
+			if (n == 0 || n > 19) {
+				p = put_hex(put(b, "resposta corrompida hdr="), rq[at], 8);
+				say(what, b);
+				rh[QH_READ] = rh[QH_WRITE];
+				break;
+			}
+			for (uint32_t i = 0; i < n; i++) {
+				m[i] = rq[at];
+				at = (at + 1) % Q_WORDS;
+			}
+			rh[QH_READ] = at;
+			dsb();
+			if ((m[0] & 0xff) == F2H_ERROR) {
+				p = put_dec(put(b, "F2H_MSG_ERROR code="), m[1]);
+				say(what, b);
+				continue;
+			}
+			if ((m[0] & 0xff) == F2H_ACK && n >= 3 && ((m[1] >> 20) & 0xfff) == seq) {
+				verdict = (int)m[2];
+				ack_payload0 = n >= 4 ? m[3] : 0;
+			}
 		}
 	}
-	dsb();
+	p = put(b, verdict < 0 ? "SEM RESPOSTA" : verdict ? "RECUSOU err=" : "ACK ok");
+	if (verdict > 0)
+		p = put_dec(p, (uint32_t)verdict);
+	put_dec(put(p, " seq="), seq);
+	say(what, b);
+	return verdict < 0 ? -1 : verdict;
 }
 
-/* Receive from queue `which`; true if the answer to `number` was seen. */
-static int hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
+static int hfi_talk(void)
 {
-	volatile uint32_t *h = hfi_qhdr(which);
-	volatile uint32_t *q = (volatile uint32_t *)(gmu_hfi_mem + HFI_QUEUE_OFFSET(which));
-	int answered = 0;
+	static uint32_t msg[160];
+	char b[96], *p;
 
-	while (h[QH_READ] != h[QH_WRITE]) {
-		uint32_t at = h[QH_READ] % HFI_QUEUE_WORDS, msg0 = q[at], words = (msg0 >> 8) & 0xff;
-		uint32_t m[8] = { 0 };
-
-		for (uint32_t i = 0; i < words; i++) {
-			if (i < 8)
-				m[i] = q[at];
-			at = (at + 1) % HFI_QUEUE_WORDS;
-		}
-		h[QH_READ] = (at + 3) / 4 * 4 % HFI_QUEUE_WORDS;
-		if (((m[0] >> 16) & 0xf) == 1 /* ACK */ && (m[1] >> 20) == number) {
-			*verdict = m[2];	/* error (0 = ok) */
-			hfi_payload0 = m[3];	/* payload[0], e.g. the firmware version */
-			answered = 1;
-		}
-		if (words == 0)
-			break;
+	step("5 HFI_CTRL_INIT");
+	wr(GMU(GMU_HFI_CTRL_INIT), 1);
+	int up = 0;
+	for (int i = 0; i < 100 && !up; i++) {
+		up = rd32(GMU(GMU_HFI_CTRL_STATUS)) & 1;
+		if (!up)
+			delay_ms(1);
 	}
-	return answered;
-}
-
-/* Send `words` to the CMD queue and wait for the GMU's verdict. */
-static int hfi_send(const char *what, uint32_t id, uint32_t *msg, uint32_t words, uint32_t *verdict)
-{
-	volatile uint32_t *h = hfi_qhdr(0);
-	volatile uint32_t *q = (volatile uint32_t *)(gmu_hfi_mem + HFI_QUEUE_OFFSET(0));
-	uint32_t at = h[QH_WRITE] % HFI_QUEUE_WORDS, number = ++hfi_number & 0xfff;
-	int answered = 0;
-
-	msg[0] = id | (words << 8) | (number << 20);
-	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
-		q[at] = i < words ? msg[i] : 0xfafafafau;
-		at = (at + 1) % HFI_QUEUE_WORDS;
-	}
-	h[QH_WRITE] = at;
-	dsb();
-	wr32(GMU(GMU_HOST2GMU_INTR_SET), 1);
-	for (int i = 0; i < 5000 && !answered; i++) {
-		if (rd32(GMU(GMU_GMU2HOST_INTR_INFO)) & HFI_IRQ_MSGQ) {
-			wr32(GMU(GMU_GMU2HOST_INTR_CLR), HFI_IRQ_MSGQ);
-			answered = hfi_receive(1, number, verdict);
-		}
-		if (smmu_faulted())
-			break;
-		wdog_pet();
-		delay_ms(1);
-	}
-	con_str(what, answered ? (*verdict ? "GMU respondeu NAO" : "GMU aceitou") : "GMU nao respondeu");
-	return answered && *verdict == 0;
-}
-
-/* ---- the RSC/PDC micro-code (M10) ------------------------------------------------------------------- */
-
-#ifdef HAVE_GMU_FW
-static void load_rpmh_ucode(void)
-{
-	static const uint32_t rsc_seq[5] = { 0xA7A506A0u, 0xA1E6A6E7u, 0xA2E081E1u, 0xE9A982E2u, 0x0020E8A8u };
-	static const uint32_t pdc_seq[5] = { 0xFEBEA1E1u, 0xA5A4A3A2u, 0x8382A6E0u, 0xBCE3E284u, 0x002081FCu };
-
-	wr32(GMU(GPU_RSCC_RSC_STATUS0), 1u << 24);
-	wr32(GMU(RSCC_PDC_SLAVE_ID_DRV0), 1);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_DATA), 0);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_ADDR), 0);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_DATA + RSC_CMD_OFFSET), 0);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_ADDR + RSC_CMD_OFFSET), 0);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_DATA + RSC_CMD_OFFSET * 2), 0x80000000u);
-	wr32(GMU(RSCC_HIDDEN_TCS_CMD0_ADDR + RSC_CMD_OFFSET * 2), 0);
-	wr32(GMU(RSCC_OVERRIDE_START_ADDR), 0);
-	wr32(GMU(RSCC_PDC_SEQ_START_ADDR), 0x4520);
-	wr32(GMU(RSCC_PDC_MATCH_VALUE_LO), 0x4510);
-	wr32(GMU(RSCC_PDC_MATCH_VALUE_HI), 0x4514);
-	for (unsigned i = 0; i < 5; i++)
-		wr32(GMU(RSCC_SEQ_MEM_0_DRV0) + 4 * i, rsc_seq[i]);
-	for (unsigned i = 0; i < 5; i++)
-		wr32(PDC(PDC_GPU_SEQ_MEM_0) + 4 * i, pdc_seq[i]);
-	wr32(PDC(PDC_GPU_TCS1_CMD_ENABLE_BANK), 7);
-	wr32(PDC(PDC_GPU_TCS1_CMD_WAIT_FOR_CMPL_BANK), 0);
-	wr32(PDC(PDC_GPU_TCS1_CONTROL), 0);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_MSGID), 0x10108);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_ADDR), 0x30010);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_DATA), 1);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_MSGID + PDC_CMD_OFFSET), 0x10108);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_ADDR + PDC_CMD_OFFSET), 0x30000);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_DATA + PDC_CMD_OFFSET), 0x0);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_MSGID + PDC_CMD_OFFSET * 2), 0x10108);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_ADDR + PDC_CMD_OFFSET * 2), 0x30080);
-	wr32(PDC(PDC_GPU_TCS1_CMD0_DATA + PDC_CMD_OFFSET * 2), 0x0);
-	wr32(PDC(PDC_GPU_TCS3_CMD_ENABLE_BANK), 7);
-	wr32(PDC(PDC_GPU_TCS3_CMD_WAIT_FOR_CMPL_BANK), 0);
-	wr32(PDC(PDC_GPU_TCS3_CONTROL), 0);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_MSGID), 0x10108);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_ADDR), 0x30010);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_DATA), 2);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_MSGID + PDC_CMD_OFFSET), 0x10108);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_ADDR + PDC_CMD_OFFSET), 0x30000);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_DATA + PDC_CMD_OFFSET), 0x3);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_MSGID + PDC_CMD_OFFSET * 2), 0x10108);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_ADDR + PDC_CMD_OFFSET * 2), 0x30080);
-	wr32(PDC(PDC_GPU_TCS3_CMD0_DATA + PDC_CMD_OFFSET * 2), 0x3);
-	wr32(PDC(PDC_GPU_SEQ_START_ADDR), 0);
-	wr32(PDC(PDC_GPU_ENABLE_PDC), 0x80000001u);
-	dsb();
-}
-
-/* ---- stage 4: firmware + boot (with HFI_QTBL set) --------------------------------------------------- */
-
-static int gmu_boot_with_hfi(void)
-{
-	uint32_t result = 0, wrong = 0;
-	unsigned words = sizeof(a630_gmu_fw) / sizeof(a630_gmu_fw[0]);
-
-	stage = "4 firmware+boot";
-	step("4a RSC/PDC + firmware no ITCM");
-	load_rpmh_ucode();
-	wr32(GMU(GMU_CM3_SYSRESET), 1);
-	dsb();
-	wr32(GMU(GMU_GENERAL_7), 1);
-	for (unsigned i = 0; i < words; i++)
-		wr32(GMU(GMU_CM3_ITCM_START) + 4 * i, a630_gmu_fw[i]);
-	dsb();
-	for (unsigned i = 0; i < words; i++)
-		if (rd32(GMU(GMU_CM3_ITCM_START) + 4 * i) != a630_gmu_fw[i])
-			wrong++;
-	if (wrong) {
-		showhex("itcm errados", wrong);
-		con_str("4", "ITCM nao guarda o firmware");
+	p = put_hex(put(b, "status="), rd32(GMU(GMU_HFI_CTRL_STATUS)), 8);
+	put_hex(put(p, " ver="), rd32(GMU(GMU_HFI_VERSION_INFO)), 8);
+	say("HFI", b);
+	if (!up) {
+		say("HFI", "as filas nao sobem");
+		smmu_faulted("ctrl_init");
 		return 0;
 	}
 
-	step("4b config (HFI_QTBL=0x60000000) e solta o GMU");
-	hfi_table_init();
-	wr32(GMU(GMU_CM3_FW_INIT_RESULT), 0);
-	wr32(GMU(GMU_CM3_BOOT_CONFIG), GMU_BOOT_CONFIG_TCM);
-	wr32(GMU(GMU_HFI_QTBL_ADDR), GMU_HFI_ADDR);
-	wr32(GMU(GMU_HFI_QTBL_INFO), 1);
-	wr32(GMU(GMU_AHB_FENCE_RANGE_0), FENCE_RANGE_MASK);
-	wr32(GMU(GMU_HFI_SFR_ADDR), GMU_CHIPID);
-	wr32(GMU(GMU_SYS_BUS_CONFIG), 1);
-	wr32(GMU(GMU_PWR_COL_FRAME_CTRL), 0x9C40400u);
-	wr32(GMU(GMU_RPMH_CTRL), 0);
-	wr32(GMU(GMU_GMU2HOST_INTR_CLR), 0xFFFFFFFFu);
-	wr32(GMU(GMU_GMU2HOST_INTR_MASK), (uint32_t)~HFI_IRQ_MSGQ);	/* let the message-queue interrupt through */
-	wr32(GMU(GMU_CX_GMU_WFI_CONFIG), 0);
-	dsb();
-	wr32(GMU(GMU_CM3_SYSRESET), 0);
-	dsb();
-	for (int i = 0; i < 1000 && result != GMU_BABEFACE; i++) {
-		result = rd32(GMU(GMU_CM3_FW_INIT_RESULT));
-		wdog_pet();
-		delay_ms(1);
-	}
-	showhex("gmu fw_init_result", result);
-	if (result != GMU_BABEFACE) {
-		con_str("4", "o GMU nao subiu");
-		return 0;
-	}
-	con_str("4", "GMU rodando (0xBABEFACE), agora com a SMMU");
-	return 1;
-}
-
-/* ---- stage 5: HFI up + INIT + FW_VER ---------------------------------------------------------------- */
-
-static void hfi_talk(void)
-{
-	uint32_t msg[16], verdict = 0;
-
-	stage = "5 HFI";
-	step("5a liga as filas de mensagem (HFI_CTRL_INIT)");
-	wr32(GMU(GMU_HFI_CTRL_INIT), 1);
-	dsb();
-	{
-		int up = 0;
-		for (int i = 0; i < 500 && !up; i++) {
-			if (rd32(GMU(GMU_HFI_CTRL_STATUS)) & 1)
-				up = 1;
-			else
-				delay_ms(1);
-		}
-		showhex("hfi_ctrl_status", rd32(GMU(GMU_HFI_CTRL_STATUS)));
-		showhex("hfi version_info", rd32(GMU(GMU_HFI_VERSION_INFO)));
-		if (!up) {
-			con_str("5", "as filas HFI nao sobem");
-			smmu_faulted();
-			return;
-		}
-	}
-
-	step("5b manda H2F_MSG_INIT");
 	zero(msg, sizeof(msg));
-	/* hfi_gmu_init_cmd: seg_id, dbg_buffer_addr, dbg_buffer_size, boot_state (cold=1) */
-	msg[1] = 0;
-	msg[2] = GMU_DUMP_ADDR;
-	msg[3] = GMU_MEM_SIZE;
-	msg[4] = 1;
-	if (!hfi_send("5b INIT", H2F_MSG_INIT, msg, 5, &verdict))
-		return;
+	msg[1] = 0;			/* seg_id */
+	msg[2] = VA_DEBUG;		/* dbg_buffer_addr */
+	msg[3] = sizeof(mem_debug);	/* dbg_buffer_size */
+	msg[4] = 1;			/* boot_state GMU_COLD_BOOT */
+	if (hfi_send("5a H2F INIT", MSG_INIT, msg, 5))
+		return 0;
 
-	step("5c pede a versao do firmware (FW_VER)");
 	zero(msg, sizeof(msg));
-	msg[1] = (1u << 28) | (3u << 16) | 0;	/* expected FW_VERSION(major=1,minor=3) */
-	if (hfi_send("5c FW_VER", H2F_MSG_FW_VER, msg, 2, &verdict))
-		showhex("GMU fw version", hfi_payload0);
-	con_str("5", "O GMU CONVERSA POR HFI: canal de mensagens de pe");
+	msg[1] = (1u << 28) | (1u << 19) | (1u << 17);	/* a6xx_hfi_get_fw_version: supported 1.10 */
+	if (hfi_send("5b FW_VERSION", MSG_FW_VERSION, msg, 2))
+		return 0;
+	sayhex("GMU fw versao", ack_payload0);
+
+	/* a6xx_hfi_msg_perf_table_v1: header, nr gpu, nr gmu, gx[16]{vote,khz}, cx[4]{vote,khz} */
+	zero(msg, sizeof(msg));
+	msg[1] = 8;
+	msg[2] = 3;
+	for (unsigned i = 0; i < 8; i++) {
+		msg[3 + 2 * i] = gx_vote[i];
+		msg[4 + 2 * i] = gpu_khz[i];
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		msg[35 + 2 * i] = cx_vote[i];
+		msg[36 + 2 * i] = gmu_khz[i];
+	}
+	if (hfi_send("5c PERF_TABLE", MSG_PERF_TABLE, msg, 43))
+		return 0;
+
+	/* a6xx_hfi_msg_bw_table, a6xx_build_bw_table (sdm845/a630): one "off" level */
+	zero(msg, sizeof(msg));
+	msg[1] = 1;			/* bw_level_num */
+	msg[2] = 3;			/* cnoc_cmds_num */
+	msg[3] = 3;			/* ddr_cmds_num */
+	msg[4] = 0x05;			/* cnoc_wait_bitmask */
+	msg[5] = 0x07;			/* ddr_wait_bitmask */
+	msg[6] = 0x50034;		/* cnoc_cmds_addrs[0..2] (words 6..11) */
+	msg[7] = 0x5007c;
+	msg[8] = 0x5004c;
+	msg[12] = 0x40000000;		/* cnoc_cmds_data[0][0..2] (words 12..17) */
+	msg[13] = 0x00000000;
+	msg[14] = 0x40000000;
+	msg[18] = 0x60000001;		/* cnoc_cmds_data[1][0..2] (words 18..23) */
+	msg[19] = 0x20000001;
+	msg[20] = 0x60000001;
+	msg[24] = 0x50000;		/* ddr_cmds_addrs[0..2] (words 24..31) */
+	msg[25] = 0x5005c;
+	msg[26] = 0x5000c;
+	msg[32] = 0x40000000;		/* ddr_cmds_data[0][0..2] (words 32..) */
+	msg[33] = 0x40000000;
+	msg[34] = 0x40000000;
+	if (hfi_send("5d BW_TABLE", MSG_BW_TABLE, msg, 160))
+		return 0;
+
+	zero(msg, sizeof(msg));
+	hfi_send("5e TEST", MSG_TEST, msg, 1);
+	return 1;
 }
-#endif /* HAVE_GMU_FW */
 
 void shim_main(uint64_t dtb)
 {
 	(void)dtb;
-	fb_default();
-	con_clear(GREY);
-	con_title("SHIM M11: SMMU + HFI DA ADRENO 630");
-	stage = "watchdog";
-	wdog_arm();
-	step_row = con_row();
-	con_skip();
+	gpu_screen("OP6 SHIM M11: SMMU + HFI DO GMU", "\n=== OP6 shim M11 gmu hfi ===\n");
 
-	if (power_on()) {
-		con_skip();
-		smmu_probe();
-		con_skip();
-#ifdef HAVE_GMU_FW
-		if (smmu_context_on() && gmu_boot_with_hfi()) {
-			con_skip();
-			hfi_talk();
-		}
-#else
-		stage = "firmware";
-		step("firmware do GMU");
-		con_str("", "sem fw/a630_gmu.bin: rode tools/gpu-fw-embed.py e recompile");
-#endif
+	step("1 estado do ABL (so leitura)");
+	gpu_state(0);
+	if (gpu_cmddb(0) || !votes()) {
+		say("1", "sem tabela de votos: parando antes de ligar algo");
+		goto out;
 	}
-
-	stage = "fim";
+	if (!gpu_power_on(0))
+		goto out;
+	con_skip();
+	if (!smmu_probe())
+		goto out;
+	if (!gpu_have_fw()) {
+		step("firmware do GMU");
+		say("FW", "SEM FIRMWARE: a630_gmu.bin nao embutido; SMMU nao programada");
+		say("FW", "op6/tools/gpu-fw-embed.py <a630_gmu.bin>, build.sh m11");
+		goto out;
+	}
+	if (!smmu_program())
+		goto out;
+	con_skip();
+	hfi_table();
+	if (!gpu_gmu_boot(VA_HFI, VA_LOG | (sizeof(mem_log) / 4096 - 1), ~INTR_MSGQ)) {
+		smmu_faulted("boot");
+		gpu_gmu_halt();
+		goto out;
+	}
+	say("4", "GMU rodando (0xBABEFACE) com a SMMU");
+	con_skip();
+	if (hfi_talk())
+		say("5", "O GMU CONVERSA POR HFI (INIT/VER/PERF/BW)");
+	smmu_faulted("fim");
+	step("CM3 de volta ao reset");
+	gpu_gmu_halt();
+out:
 	step("fim");
 	con_skip();
-	con_str("", "Tire uma foto desta tela!");
+	say("", "Tire uma foto desta tela!");
 	countdown_reboot(con_row(), END_SECONDS);
 }

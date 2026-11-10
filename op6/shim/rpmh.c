@@ -240,3 +240,73 @@ int rh_bcm_on(uint32_t addr, uint32_t vote)
 
 	return amc(1, &addr, &v);
 }
+
+/*
+ * cmd-db entry by name (any slave 3..5): its address and its aux data, which
+ * for an ARC resource ("cx.lvl", "mx.lvl", "gfx.lvl") is the list of 16-bit
+ * hardware levels (cmd-db.c cmd_db_read_aux_data: data at header + the
+ * slave's data_offset + the entry's offset, len bytes). out may be 0.
+ * Returns the number of 16-bit words copied (<= max), or < 0.
+ */
+int rh_aux(const char *res, uint32_t *addr, uint16_t *out, unsigned max)
+{
+	uint32_t key[2] = { 0, 0 };
+
+	if (!db)
+		return -4;
+	for (unsigned i = 0; i < 8 && res[i]; i++)
+		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8 * (i % 4));
+	for (unsigned i = 0; i < 8; i++) {
+		uint32_t h = 8 + 16 * i;
+		unsigned slave = db16(h);
+		if (!slave)
+			break;
+		uint32_t entries = RH_DB_HEADER + db16(h + 2), data = RH_DB_HEADER + db16(h + 4);
+		unsigned count = db16(h + 6);
+		if (slave < 3 || slave > 5 || (entries & 3) || !db_range(entries, count * RH_DB_ENTRY))
+			return -1;
+		for (unsigned j = 0; j < count; j++) {
+			uint32_t e = entries + RH_DB_ENTRY * j;
+			if (rd32(db + e) != key[0] || rd32(db + e + 4) != key[1])
+				continue;
+			unsigned len = db16(e + 20), off = db16(e + 22), n = len / 2;
+			*addr = rd32(db + e + 16);
+			if (!db_range(data + off, len))
+				return -2;
+			if (n > max)
+				n = max;
+			for (unsigned k = 0; out && k < n; k++)
+				out[k] = db16(data + off + 2 * k);
+			return (int)n;
+		}
+	}
+	return -3;
+}
+
+/* Reverse lookup: the cmd-db name (up to 8 chars + NUL) of an RPMh address. */
+int rh_name(uint32_t addr, char *name)
+{
+	name[0] = 0;
+	if (!db)
+		return -4;
+	for (unsigned i = 0; i < 8; i++) {
+		uint32_t h = 8 + 16 * i;
+		unsigned slave = db16(h);
+		if (!slave)
+			break;
+		uint32_t entries = RH_DB_HEADER + db16(h + 2);
+		unsigned count = db16(h + 6);
+		if (slave < 3 || slave > 5 || (entries & 3) || !db_range(entries, count * RH_DB_ENTRY))
+			return -1;
+		for (unsigned j = 0; j < count; j++) {
+			uint32_t e = entries + RH_DB_ENTRY * j;
+			if (rd32(db + e + 16) != addr)
+				continue;
+			for (unsigned k = 0; k < 8; k++)
+				name[k] = (char)(rd32(db + e + (k & ~3u)) >> (8 * (k & 3)));
+			name[8] = 0;
+			return 0;
+		}
+	}
+	return -3;
+}
