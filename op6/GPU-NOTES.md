@@ -269,3 +269,4 @@ write went elsewhere.
 - Design facts taken from the survey (GPU-XNU-PLAN.md sec. 1): ADT firmware node (guacamole), msm uAPI over
   IOUserClient + fake libdrm (HackiOS, guacamole), Mesa gallium freedreno has no KGSL backend (Mesa main
   `src/freedreno/drm/` = msm + virtio, checked 2026-11-10).
+- 2026-11-10 **G1 in XNU (boot-G1.img, kernel run 42831415559, patch 0107, `sweetgpu=1 sweetgpudelay=30`): PASS.** iOS boots normally (USB net after ~30 s); `ioreg -c SweetGPU`: SweetGPUStage = 7, SweetGPUMagic = 0xC0FFEE01 (shown sign-extended as 18446744072652582401: store it as an unsigned 32-bit number), SweetGPUState = "off". The SWEET GPU dmesg lines had already rotated out of the 1225-line buffer (backboardd IOAcceleratorES/AGXAccelerator matching spam) — use the persistent log ring for the full trace. backboardd probes IOAcceleratorES / IOAcceleratorESLegacy / AGXAccelerator: the hooks for G4.

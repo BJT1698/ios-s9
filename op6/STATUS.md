@@ -22,4 +22,6 @@ Labels: device-verified unless noted.
 
 | 2026-11-10 | GPU M13 | zap shader accepted by TrustZone (PAS 13); SQE microcode loaded; CP ran ME_INIT, SET_SECURE_MODE 0, NOP + CP_MEM_WRITE: 0xC0FFEE01 in RAM through the GPU SMMU |
 
-Next: XNU GPU driver, Mesa freedreno + EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+| 2026-11-10 | GPU G1 (XNU) | kernel driver (0107) powers the A630 during iOS boot, zap + CP_MEM_WRITE 0xC0FFEE01, GPU back off; iOS unaffected |
+
+Next: GPU G2 (user client, msm uAPI subset), G3 Mesa freedreno, G4 EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
