@@ -123,10 +123,12 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
 
 ## 5. Status of the work in progress (G2)
 
-- An agent was writing **G2** when this file was written: `xnu/patches/0108-op6-gpu-userclient.patch`, a SweetGPU user client implementing the msm DRM uAPI subset Mesa freedreno needs (GET_PARAM, GEM_NEW/INFO/CLOSE, CPU_PREP/FINI, SUBMIT, WAIT_FENCE, SUBMITQUEUE), with `sweetgpu=2` keeping the GPU on, plus an iOS test tool `sweetgpu-test` built in CI.
-- **Check `git status`**: the files may be in the working tree and not yet committed or built. If they exist and look complete, check them with `git apply --check` on a tree of xnu-8796.141.3 with all patches up to 0107 applied, then commit/push, run the CI and test on the device.
-- Planned G2 test: boot-args as above with `sweetgpu=2`; over SSH, run `sweetgpu-test` (expected PASS with 0xC0FFEE02) and `ioreg -l -c SweetGPU`.
-- Known small bug from G1: `SweetGPUMagic` is published sign-extended to 64 bits (18446744072652582401 = 0xC0FFEE01). It should be fixed in 0108.
+- **G2 has not started**: the agent that was going to write it was stopped before producing any file, and the working tree is clean. Start from scratch according to `op6/GPU-XNU-PLAN.md`:
+  - **Patch `xnu/patches/0108-op6-gpu-userclient.patch`:** a SweetGPU user client implementing the msm DRM uAPI subset that Mesa freedreno needs: GET_PARAM, GEM_NEW/INFO/CLOSE, CPU_PREP/FINI, SUBMIT, WAIT_FENCE, SUBMITQUEUE. With `sweetgpu=2` the GPU stays on after G1.
+  - **iOS test tool `sweetgpu-test`:** it submits CP_MEM_WRITE 0xC0FFEE02 and waits on the fence. It is built in the CI on macos-26, like s9/ios-tools (`.github/workflows/s9-ios-tools.yml`, which must be moved to macos-26).
+- Base the patch on a tree of xnu-8796.141.3 with all patches up to 0107 applied, and check it with `git apply --check`.
+- Test: boot-args as above with `sweetgpu=2`, then over SSH `sweetgpu-test` (expected PASS) and `ioreg -l -c SweetGPU`.
+- Known small bug from G1, to fix in 0108: `SweetGPUMagic` is published sign-extended to 64 bits (18446744072652582401 = 0xC0FFEE01).
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
