@@ -18,7 +18,7 @@ it); Linux v6.6 `drivers/gpu/drm/msm/adreno/a6xx_gmu.c`, `a6xx_hfi.c/.h`, `a6xx_
 | **M11** | M10 + GPU SMMU (tables, free CB, SID 5/4 rules, ATS1PR self-test) + boot with `HFI_QTBL_ADDR` + HFI v1: INIT, FW_VERSION, PERF_TABLE, BW_TABLE, TEST | written, builds; S9 M11 was flashed but never confirmed; the OP6 one follows mainline instead (sec. 2) |
 | **M12** | M11 + GX on through the GMU, Linux v6.6 legacy order: `GMU_RPMH_CTRL`=0xf11 at boot, `BOOT_SLUMBER_OPTION=0` + `GX_VOTE_IDX`/`MX_VOTE_IDX` (highest OPP), OOB `BOOT_SLUMBER` (bit 22 / ack 30), SPTPRAC on, then HFI, DCVS OOB, OOB `GPU_SET` (16/24); read-only core probes; Linux shutdown (VBIF halt, notify_slumber, POWER_STATE 0xf) and CM3 reset | written, builds (sec. 5); the first GX power-up on the OP6 [HW-F1 sweetgpu=5] |
 | **M13** | M12 (quiet) + zap shader via TZ (PAS 13: init_image / mem_setup / auth_and_reset), CP: `a630_sqe.fw`, own GPU SMMU context (SID 0, CB 0, 4K PTEs), a630 hw_init subset, ringbuffer, `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`, NOP + `CP_MEM_WRITE 0xC0FFEE01` (sec. 8) | written, builds; not run [HW-F1 etapa 8] |
-| D | XNU driver (msm-like ioctls, HackiOS kernel is APSL and reusable with notice), GPU kept on | todo |
+| D | XNU driver: `op6/GPU-XNU-PLAN.md` (ADT `/sweet-gpu` firmware, NC carve-out 0xa0000000, msm uAPI user client, milestones G1-G6). **G1** = `xnu/patches/0107-op6-gpu-bringup.patch` (M10-M13 in the kernel, `sweetgpu=1/2`) | G1 drafted (apply-check + stub syntax check), not built/run |
 | E/F | Mesa freedreno a630 + fake libdrm + our EAGL in backboardd (iOS 16 uses GLES natively when Metal is absent, `s9/ESTUDO` sec. 2), then Metal (Chlorophyll, MIT) | todo |
 
 ## 2. S9 -> OP6 differences for everything M10/M11 touch
@@ -259,3 +259,13 @@ write went elsewhere.
 - 2026-11-10 M13 zap-only (boot-m13-zap.img): **zap shader ACCEPTED by TrustZone (PAS 13).** ELF n=3 hash=1 load=1 rel, size 0x1000/0x2000; metadata 0x1A1C at PA 0x800A9000. SMC: convention probe a1=1 ok; is_call_available a1=1 ok; **pas_is_supported(13) returned a1=0 (informational "RECUSA" — yet init_image 31915 us, mem_setup 176 us and auth_and_reset 1277 us all returned 0/0)**, so do not gate on is_supported on this firmware. Segment copied 0x7B0 bytes, 0 mismatches. Post-zap GPU SMMU: 2 valid SMRs, CB on=02, sCR0=00200626. Clean slumber, no CrashDump.
 - 2026-11-10 M13 full (boot-m13-cp.img): **the CP executes our commands.** Zap accepted again (PAS 13). SQE ver=0x207, 8546 words, 0 errors (PA 0x800B6000, GPU VA 0x01000000); GPU CB0 for SID 0, GMU on CB1; ATS ring and SQE+0x8000 translate; INIT 41 writes (5 write-only, 2 differ, logged); CP_PROTECT 0, RBBM st=1. Ring: ME_INIT rptr 12 (17 us), SET_SECURE_MODE 0 rptr 17 (25 us), NOP + CP_MEM_WRITE rptr 26 (4 us), shadow == wptr each time; **memory at GPU VA 0x01020100 (PA 0x800C7100) = 0xC0FFEE01 after 8 us**. Clean VBIF halt + slumber, GX off. No CrashDump.
 - Shim GPU bring-up phase complete (M10-M13). Next phase: XNU kernel GPU driver (GMU/HFI/GX/zap/CP/ringbuffer + IOKit user client for submissions, GPU SMMU 4K pages under 16K XNU pages), then userland Mesa freedreno + EAGL bridge in backboardd (see s9/ESTUDO-2026-10-25-gpu.md; HackiOS APSL kernel + MIT userland as references).
+
+## XNU driver credits (code origin)
+
+- `xnu/patches/0107-op6-gpu-bringup.patch` (`bsd/dev/sweet_gpu.c`, `iokit/Kernel/arm/SweetGPU.cpp`) is a port of
+  this project's shim code `op6/shim/gpu.c`, `m10.c`, `m11.c`, `m12.c`, `m13.c`, `rpmh.c` (ios-op6, MIT). No code
+  from HackiOS (oosexgang/hackios-xnu-kernel @63fc2b4, `drivers/` APSL 2.0 - reusable with notice, not used),
+  guacamole (no licence: facts only), Linux (GPL: facts only) or Bergamota (no licence: facts only).
+- Design facts taken from the survey (GPU-XNU-PLAN.md sec. 1): ADT firmware node (guacamole), msm uAPI over
+  IOUserClient + fake libdrm (HackiOS, guacamole), Mesa gallium freedreno has no KGSL backend (Mesa main
+  `src/freedreno/drm/` = msm + virtio, checked 2026-11-10).

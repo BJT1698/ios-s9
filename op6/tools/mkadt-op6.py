@@ -17,8 +17,16 @@ Differences from the S9 tree (see op6/XNU-PLAN.md):
     ('xiaomi,sweet' must stay: SweetPlatformExpert matches it), and
     /chosen/sweet-board = "oneplus,enchilada" for board-specific drivers.
 
+  * --gpu-fw DIR (xnu patch 0107, GPU milestone G1): node /sweet-gpu with the
+    Adreno 630 firmware the kernel loads itself (a630_gmu.bin, a630_sqe.fw,
+    OnePlus-signed a630_zap.mbn, checked against op6/GPU-NOTES.md sec. 4
+    hashes) and dma-region = <u64 pa, u64 size>, the GPU carve-out outside
+    the XNU span (--gpu-dma, default 0xa0000000+16 MiB: free RAM per the OP6
+    scan, no DT reservation). The firmware is Qualcomm proprietary: the ADT
+    (op6/out/, git-ignored) carries it, git never does.
+
 Usage:  mkadt-op6.py OUT.adt [--scale2] [--mem-top 0xADDR] [--phys-base 0xADDR]
-                     [--d22ap PATH] [--dump] [--qemu]
+                     [--d22ap PATH] [--dump] [--qemu] [--gpu-fw DIR [--gpu-dma PA,SIZE]]
 """
 import hashlib, os, struct, sys
 
@@ -125,7 +133,36 @@ def ram_holes(phys_base, top):
     return holes
 
 
-def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22ap=D22AP_ADT):
+# GPU firmware for /sweet-gpu (op6/GPU-NOTES.md sec. 4; same hashes as tools/gpu-fw-embed*.py)
+GPU_FW = [
+    ('gmu-firmware', 'a630_gmu.bin', 'da8d9b1b1f5c1a0b311f32567093b4828f3c80031dd8435f91ac13c664e173a6'),
+    ('sqe-firmware', 'a630_sqe.fw', '1c21b527d9183487cc550dabbb3f43e555df5a977a461934fc61f0635a9aa90c'),
+    ('zap-firmware', 'a630_zap.mbn', '9780956733759d24740b3df5bd804e5dddc48bc0e956271b0288631890080df9'),
+]
+GPU_DMA = (0xa0000000, 0x1000000)   # below dram-base, in the scan's free [0xa0000000,0xac000000)
+
+
+def gpu_node(fw_dir, dma, phys_base, top, ph):
+    """/sweet-gpu: firmware blobs + carve-out (sweet_gpu.c setup())."""
+    pa, size = dma
+    if pa & 0xffff or not 0x100000 <= size <= 0x10000000:
+        raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: 64 KiB aligned, 1..256 MiB')
+    if pa < 0xa0000000 or pa + size > 0xac000000:
+        raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: must stay inside the free [0xa0000000,0xac000000)')
+    if pa < top and pa + size > phys_base:
+        raise SystemExit(f'gpu-dma {pa:#x},{size:#x} overlaps the XNU span {phys_base:#x}-{top:#x}')
+    props = [ph()]
+    for prop, name, sha in GPU_FW:
+        data = open(os.path.join(fw_dir, name), 'rb').read()
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise SystemExit(f'{name}: sha256 differs from op6/GPU-NOTES.md sec. 4 (wrong file / OEM zap?)')
+        props.append((prop, data + b'\0' * (-len(data) & 3)))
+    props.append(('dma-region', u64(pa, size)))
+    return node('sweet-gpu', props)
+
+
+def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22ap=D22AP_ADT,
+          gpu_fw=None, gpu_dma=GPU_DMA):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     mem_size = top - phys_base
     holes = ram_holes(phys_base, top)
@@ -308,7 +345,8 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]) +
+       ([gpu_node(gpu_fw, gpu_dma, phys_base, top, ph)] if gpu_fw else []))
 
 
 if __name__ == '__main__':
@@ -321,8 +359,12 @@ if __name__ == '__main__':
     ap.add_argument('--phys-base', type=lambda s: int(s, 0), default=PHYS_BASE)
     ap.add_argument('--mem-top', type=lambda s: int(s, 0), default=MEM_TOP)
     ap.add_argument('--d22ap', default=D22AP_ADT, help='D22AP device tree extracted from the iPhone X IPSW')
+    ap.add_argument('--gpu-fw', metavar='DIR', help='a630_gmu.bin/a630_sqe.fw/a630_zap.mbn -> /sweet-gpu (xnu 0107)')
+    ap.add_argument('--gpu-dma', default='%#x,%#x' % GPU_DMA, help='GPU carve-out PA,SIZE (outside the span)')
     a = ap.parse_args()
-    root = build(qemu=a.qemu, scale=2 if a.scale2 else 3, phys_base=a.phys_base, top=a.mem_top, d22ap=a.d22ap)
+    dma = tuple(int(x, 0) for x in a.gpu_dma.split(','))
+    root = build(qemu=a.qemu, scale=2 if a.scale2 else 3, phys_base=a.phys_base, top=a.mem_top, d22ap=a.d22ap,
+                 gpu_fw=a.gpu_fw, gpu_dma=dma)
     blob = adt.serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:
