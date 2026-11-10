@@ -229,3 +229,14 @@ int rh_vrm_on(uint32_t addr, unsigned mv, unsigned mode)
 	v[2] = 1;
 	return amc(3, a, v);
 }
+
+/*
+ * Bus clock manager vote (cmd-db slave 5), as m7.c's bcm() and the kernel's
+ * s9_bcm: BCM_TCS_CMD commit, valid, vote_x (ab) << 14, vote_y (ib).
+ */
+int rh_bcm_on(uint32_t addr, uint32_t vote)
+{
+	uint32_t v = (1u << 30) | (1u << 29) | ((vote & 0x3fffu) << 14) | (vote & 0x3fffu);
+
+	return amc(1, &addr, &v);
+}

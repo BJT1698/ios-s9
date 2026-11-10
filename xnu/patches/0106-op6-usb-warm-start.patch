@@ -1,0 +1,246 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 24c8f47..beef4fb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -96,6 +97,23 @@ usb_rd(vm_offset_t base, uint32_t off)
+  *      close it with USBC opcode CONTROL1_WRITE = COM_USB, bit-banged I2C.
+  * The controller is then set up by sweet_usb_gadget_start, high speed only
+  * (the UTMI clock feeds the absent SS PHY's pipe side, s9_dwc3_global).
++ *
++ * OnePlus 6 (/chosen/sweet-board = "oneplus,enchilada", same SDM845): it is
++ * always started with `fastboot boot`, so ABL's fastboot gadget ran on this
++ * controller. sweetusb=1 on the phone (op6-B2 log) showed what ABL leaves:
++ * GDSC and all seven clocks on, DWC3 3.00a in device mode, DCTL run/stop 0
++ * and DSTS halted (ABL already disconnected from the PC), last link
++ * SuperSpeed (DCFG/DSTS speed 4: ABL used the QMP SS PHY), and the QUSB2 PHY
++ * powered down (PWR_CTRL1 0x23 = Linux's disable_ctrl VREF_SUPPLY_TRIM |
++ * CLAMP_N_EN | POWER_DOWN, PLL not ready) with ABL's tuning still in place.
++ * op6_usb_start therefore: RPMh votes for the OP6 PHY rails (mainline
++ * sdm845-oneplus-common.dtsi usb_1_hsphy; live DT ldo1/ldo12/ldo24: L1A 0.88 V,
++ * L12A 1.8 V, L24A 3.088 V) and the same bus votes, TBU GDSC votes and SMMU stream 0x740 as
++ * the S9 (live DT usb@a600000 iommus = <&apps_smmu 0x740 0>), GCC only if ABL
++ * left it off, the PHY powered up as the last step of Linux's
++ * qusb2_phy_init (a full re-init only if its PLL does not lock), the UTMI
++ * clock for the pipe side (DT qcom,select-utmi-as-pipe-clk), then the same
++ * gadget. No MAX77705 (the OP6 has none: its GPIOs 33/34 are not that bus).
+  */
+ #define S9_RSC_PA               0x179e0000u
+ #define S9_TCS_PA               0x179e0d00u
+@@ -152,7 +170,27 @@ static const uint16_t s9_qusb2_init[] = {      /* qcom,qusb-phy-init-seq: value,
+ 
+ static vm_offset_t s9_tcs, s9_db, s9_qs;
+ static uint32_t s9_db_size;
+-static bool s9_cold;
++static bool s9_cold;            /* also set on the OP6: s9_dwc3_global after the soft reset */
++static bool op6;                /* /chosen/sweet-board = "oneplus,enchilada" */
++
++/* OP6 live DT: reserved-memory aop-cmd-db-mem@85fe0000, size 0x20000 (shim M5 read it there). */
++#define OP6_CMDDB_PA            0x85fe0000u
++#define OP6_CMDDB_SIZE          0x20000u
++
++static bool
++usb_board_is(const char *want)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	size_t n = strlen(want) + 1;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-board", &prop, &size) != kSuccess) {
++		return false;
++	}
++	return size >= n && memcmp(prop, want, n) == 0;
++}
+ 
+ /* One plain 32-bit load or store per access: the hypervisor emulates the SMMU from the trapped instruction. */
+ static inline uint32_t
+@@ -205,6 +243,22 @@ s9_rpmh_init(void)
+ 	uint32_t pa = s9_rd(loc), size = s9_rd(loc + 4);
+ 	printf("SWEET USB S9: RSC id 0x%x config 0x%x, %u TCS, %u cmds each, cmd-db 0x%x+0x%x\n",
+ 	    id, config, count, ncpt, pa, size);
++	if (op6) {
++		/* The DT's cmd-db, checked by its magic only, as the OP6 shim (rpmh.c) does. */
++		pa = OP6_CMDDB_PA;
++		size = OP6_CMDDB_SIZE;
++		if ((major != 1 && major != 2) || count < S9_NORMAL_TCS || count > S9_TCS_SIZE / S9_TCS_STRIDE ||
++		    ncpt < 3 || ncpt > 16) {
++			return ENODEV;
++		}
++		s9_db = ml_io_map(pa, size);
++		if (!s9_db) {
++			return ENOMEM;
++		}
++		s9_db_size = size;
++		printf("SWEET USB OP6: cmd-db at 0x%x, version %u, magic 0x%x\n", pa, s9_rd(s9_db), s9_rd(s9_db + 4));
++		return s9_rd(s9_db + 4) == S9_CMDDB_MAGIC ? 0 : ENODEV;
++	}
+ 	if ((major != 1 && major != 2) || count < S9_NORMAL_TCS || count > S9_TCS_SIZE / S9_TCS_STRIDE ||
+ 	    ncpt < 3 || ncpt > 16 || pa < 0x80000000u || (pa & 3) || size < S9_CMDDB_HEADER || size > 0x100000) {
+ 		return ENODEV;
+@@ -606,6 +660,105 @@ s9_usb_cold_start(vm_offset_t gcc)
+ 	return s9_cold;
+ }
+ 
++/*
++ * OP6 QUSB2: ABL leaves it configured but powered down. Clear POWER_DOWN as
++ * qusb2_phy_init's last step does and wait for the PLL; if it does not lock,
++ * the S9's full init (block reset + DT init sequence, the Qualcomm SDM845
++ * default) as a fallback. The registers are 8 bits wide (reads repeat the
++ * byte in all four lanes).
++ */
++static int
++op6_qusb2(vm_offset_t gcc)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++
++	if (!phy) {
++		return ENOMEM;
++	}
++	uint32_t pwr = s9_rd(phy + 0x210) & 0xff, pll = s9_rd(phy + 0x1a0) & 0xff;
++	printf("SWEET USB OP6: QUSB2 as ABL left it: PWR_CTRL1 0x%02x PLL_STATUS 0x%02x PORT_TUNE1 0x%02x\n",
++	    pwr, pll, s9_rd(phy + 0x240) & 0xff);
++	if (!(pwr & 1u) && (pll & 1u)) {
++		return 0;
++	}
++	s9_wr(phy + 0x210, pwr & ~1u);
++	delay(150);
++	if (s9_wait(phy + 0x1a0, 1u, 1u, 5000)) {
++		printf("SWEET USB OP6: QUSB2 powered up, PLL ready (PWR_CTRL1 0x%02x)\n", s9_rd(phy + 0x210) & 0xff);
++		return 0;
++	}
++	printf("SWEET USB OP6: QUSB2 PLL not ready (0x%02x): full init\n", s9_rd(phy + 0x1a0) & 0xff);
++	return s9_qusb2(gcc);
++}
++
++static bool
++op6_usb_start(vm_offset_t gcc)
++{
++	static const char *const bcms[] = { "SH3", "SN11", "SN0", "SN6", "CN0", "SN12" };
++	int smmu = 1;
++	int err = s9_rpmh_init();
++
++	/* sweetusbsmmu=0: leave the SMMU alone (if ABL's stream rule survives and the recipe hurts) */
++	PE_parse_boot_argn("sweetusbsmmu", &smmu, sizeof(smmu));
++	if (!err) {
++		/* Rail votes are logged, not fatal: ABL's own votes may still hold them. */
++		(void)s9_vreg("ldoa1", 880);
++		(void)s9_vreg("ldoa12", 1800);
++		(void)s9_vreg("ldoa24", 3088);
++		int bad = 0;
++		for (unsigned i = 0; i < sizeof(bcms) / sizeof(bcms[0]); i++) {
++			bad |= s9_bcm(bcms[i]);
++		}
++		if (bad) {
++			/* S9: without the config-port votes a read of the SMMU hangs the CPU */
++			printf("SWEET USB OP6: a bus vote failed: SMMU not touched, start abandoned\n");
++			err = EIO;
++		}
++	}
++	if (!err) {
++		/* SMMU TBU GDSC votes (Linux arm-smmu vdd-supply), as s9_gcc_usb */
++		const uint32_t tbu[2] = { S9_GCC_TBU1_VOTE, S9_GCC_TBU2_VOTE };
++		for (unsigned i = 0; i < 2; i++) {
++			s9_wr(gcc + tbu[i], s9_rd(gcc + tbu[i]) & ~1u);
++			(void)s9_wait(gcc + tbu[i], 1u << 31, 1u << 31, 20000);
++		}
++		if (smmu) {
++			err = s9_smmu_usb();
++		} else {
++			printf("SWEET USB OP6: SMMU left as ABL left it (sweetusbsmmu=0)\n");
++		}
++	}
++	if (!err) {
++		uint32_t gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		bool on = (gdscr & (1u << 31)) != 0;
++		for (unsigned i = 0; i < 6 && on; i++) {        /* master .. ahb2phy */
++			on = !(usb_rd(gcc, usb_cbcr[i].off) & CBCR_CLK_OFF);
++		}
++		if (on) {
++			printf("SWEET USB OP6: GDSC and clocks on as ABL left them (warm start)\n");
++		} else if (gdscr & (1u << 31)) {
++			/* The S9 cold sequence resets the block expecting its clocks off (a reset with them on hung the S9). */
++			printf("SWEET USB OP6: GDSC on but some clocks off (GDSC 0x%08x): not handled, start abandoned\n", gdscr);
++			err = EIO;
++		} else {
++			printf("SWEET USB OP6: ABL left the USB block off (GDSC 0x%08x): cold start\n", gdscr);
++			err = s9_gcc_usb(gcc);
++			if (!err) {
++				err = s9_qusb2(gcc);
++			}
++		}
++	}
++	if (!err) {
++		err = op6_qusb2(gcc);
++	}
++	if (!err) {
++		s9_utmi_for_pipe();
++	}
++	printf("SWEET USB OP6: start %s (%d)\n", err ? "FAILED" : "done", err);
++	s9_cold = (err == 0);
++	return s9_cold;
++}
++
+ /* After the controller's soft reset: device mode, high speed only, 19.2 MHz reference clock. */
+ static void
+ s9_dwc3_global(vm_offset_t dwc)
+@@ -635,7 +788,8 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	if (enabled >= 2 && !s9_usb_cold_start(gcc)) {
++	op6 = usb_board_is("oneplus,enchilada");
++	if (enabled >= 2 && !(op6 ? op6_usb_start(gcc) : s9_usb_cold_start(gcc))) {
+ 		return;
+ 	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+@@ -916,6 +1070,11 @@ ud_string(unsigned idx, uint8_t *out)
+ 		return 0;
+ 	}
+ 	const char *str = ud_strings[idx];
++	if (op6 && idx == 1) {
++		str = "ios-op6";
++	} else if (op6 && idx == 2) {
++		str = "OnePlus 6 iOS (USB Ethernet)";
++	}
+ 	uint32_t n = 2;
+ 	for (; *str && n < 126; str++) {
+ 		out[n++] = (uint8_t)*str;
+@@ -1496,9 +1655,28 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ static bool
+ ud_controller_start(void)
+ {
++	int i;
++	/*
++	 * OP6: should the controller still be running (ABL's fastboot gadget
++	 * connected), drop the pull-up first and give the host time to see the
++	 * disconnect, so it enumerates us afresh. ABL was seen to halt it already.
++	 */
++	if (op6 && (dwc_rd(DCTL) & DCTL_RUN_STOP)) {
++		/* No more events into ABL's buffer (RAM XNU may own now): ours first, then stop. */
++		dwc_wr(DEVTEN, 0);
++		dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++		dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++		dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);
++		dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		for (i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++			delay(1000);
++		}
++		printf("SWEET USB OP6: controller was running: stopped (DSTS 0x%08x after %d ms)\n", dwc_rd(DSTS), i);
++		delay(200000);
++	}
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+ 		delay(1000);
+ 	}
