@@ -22,7 +22,7 @@ Read these first, in this order: this file, `op6/STATUS.md` (what has been verif
 ### GPU (Adreno 630)
 
 - **Bare-metal shim:** M10 GMU boot, M11 GPU SMMU + HFI, M12 GX on, M13 zap via TZ + CP `CP_MEM_WRITE` 0xC0FFEE01.
-- **Inside XNU:** G1, patch 0107.
+- **Inside XNU:** G1 (patch 0107, bring-up + power-off) and **G2** (patch 0108, `SweetGPUUserClient` msm DRM uAPI subset, BO carve-out allocator, `CP_INDIRECT_BUFFER` + fence completion, verified from iOS userland with `sweetgpu-test`).
 
 ### Not working
 
@@ -78,7 +78,8 @@ debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata uf
 | Image | What it boots |
 |---|---|
 | `boot-D.img` | iOS + USB + SSH, no GPU |
-| `boot-G1.img` | as boot-D, plus the GPU test at boot |
+| `boot-G1.img` | as boot-D, plus the GPU test at boot (`sweetgpu=1`, shuts GPU down after test) |
+| `boot-G2.img` | as boot-D, plus `SweetGPUUserClient` (`sweetgpu=2`, leaves GPU on for userland msm uAPI) |
 | `pmos-debugshell.img` | pmOS kernel with a debug shell |
 | `boot-m5/m7-smmu/m10-gmu/m11-hfi/m12-gx/m13-zap/m13-cp.img` | bare-metal shim stages |
 
@@ -121,17 +122,17 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - The CP always-on counter does count on the OP6.
 - **First iOS boot** on a new root takes about 30 minutes on the Apple logo (data migration). Later boots take a few minutes.
 
-## 5. Status of the work in progress (G2)
+## 5. Status of GPU G2 (verified on device 2026-11-10)
 
-- **G2 code written and locally verified** (2026-11-10):
+- **G2 verified on device (`boot-G2.img`, CI run `42847871854`, `sweetgpu=2 sweetgpudelay=30`)**:
   - **Patch `xnu/patches/0108-op6-gpu-userclient.patch`** (and copy in `op6/xnu-patches/0108-op6-gpu-userclient.patch`):
     - `bsd/dev/sweet_gpu.c`: 4K-page bitmap allocator over the remaining GPU carve-out (16K-aligned for XNU's 16K VM device pager, mapped with 4K PTEs into the GPU SMMU at `0x10000000 + p*4K`), 64-page GPU page-table pool, `pt_unmap` + `CB_TLBIALL`/`CB_TLBSYNC`, circular ring wrap-around, `CP_INDIRECT_BUFFER` + `CP_WAIT_FOR_IDLE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` fence submission, and `msm` uAPI parameter reporting when `sweetgpu=2`.
-    - `iokit/Kernel/arm/SweetGPU.cpp`: fixes `SweetGPUMagic` (and sibling numeric properties) `OSNumber` bit-width from 32 to 64 so `ioreg` does not sign-extend `0xC0FFEE01`; sets `IOUserClientClass = "SweetGPUUserClient"`; implements `SweetGPUUserClient` (selectors `0x09` `GEM_CLOSE`, `0x40` `GET_PARAM`, `0x41` `SET_PARAM`, `0x42` `GEM_NEW`, `0x43` `GEM_INFO`, `0x44` `GEM_CPU_PREP`, `0x45` `GEM_CPU_FINI`, `0x46` `GEM_SUBMIT`, `0x47` `WAIT_FENCE`, `0x48` `GEM_MADVISE`, `0x4a`..`0x4c` `SUBMITQUEUE_*`, plus `clientMemoryForType` with write-combine physical `IOMemoryDescriptor`).
-  - **iOS test tool `s9/ios-tools/sweetgpu-test.c`** and `.github/workflows/s9-ios-tools.yml` (updated from `macos-14` to `macos-26`): queries `GET_PARAM`, allocates command and destination BOs via `GEM_NEW` + `GEM_INFO(GET_IOVA)`, maps them via `IOConnectMapMemory64`, submits an IB with `CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`, waits via `WAIT_FENCE`, verifies readback, and runs a 100-submit stress loop (`-n COUNT`).
-  - Local checks passed: `git apply --check` on `xnu-8796.141.3` + `0000-0107`, `clang -fsyntax-only` under XNU's `-Weverything -Werror` flags, and `clang -Wall -Wextra -Werror` on `sweetgpu-test.c`.
-- **Next step to test G2 on device:**
-  1. Push and run CI workflows `xnu.yml` and `s9-ios-tools.yml` on `macos-26`.
-  2. Build `boot-G2.img` with `sweetgpu=2 sweetgpudelay=30`, boot via `fastboot boot`, copy `sweetgpu-test` over SSH, and run `sweetgpu-test` + `ioreg -l -c SweetGPU`.
+    - `iokit/Kernel/arm/SweetGPU.cpp`: fixes `SweetGPUMagic` (and sibling numeric properties) `OSNumber` bit-width from 32 to 64 so `ioreg` displays `3237998081` (`0xC0FFEE01`) without sign-extension; sets `IOUserClientClass = "SweetGPUUserClient"`; implements `SweetGPUUserClient` (selectors `0x09` `GEM_CLOSE`, `0x40` `GET_PARAM`, `0x41` `SET_PARAM`, `0x42` `GEM_NEW`, `0x43` `GEM_INFO`, `0x44` `GEM_CPU_PREP`, `0x45` `GEM_CPU_FINI`, `0x46` `GEM_SUBMIT`, `0x47` `WAIT_FENCE`, `0x48` `GEM_MADVISE`, `0x4a`..`0x4c` `SUBMITQUEUE_*`, plus `clientMemoryForType` with write-combine physical `IOMemoryDescriptor`).
+  - **iOS test tool `s9/ios-tools/sweetgpu-test.c`** (installed on device at `/var/root/sweetgpu-test`):
+    - Verified `GET_PARAM` (`GPU_ID=630`, `GMEM_SIZE=0x100000`, `CHIP_ID=0x6030002`, `MAX_FREQ=710000000`, `TIMESTAMP` advancing at 19.2 MHz, `FAULTS=0`, `HIGHEST_BANK_BIT=15`).
+    - Verified `GEM_NEW` + `GEM_INFO(GET_IOVA)` + `IOConnectMapMemory64` (`cmd BO` at `iova=0x10000000`, `dst BO` at `iova=0x10004000`, `map_size=0x4000`).
+    - Verified single IB submit (`CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`) + `WAIT_FENCE`: `fence=1`, `69 us`, `dst[0]=0xc0ffee02`.
+    - Verified 100-submit loop (`fences=2..101`, `53 us/submit`) and 1000-submit ring-wrap loop (`fences=103..1102`, `51 us/submit`, `FAULTS=0`), plus BO/PTE/TLB cleanup on `clientClose`.
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
 

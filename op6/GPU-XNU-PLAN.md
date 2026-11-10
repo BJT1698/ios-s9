@@ -1,12 +1,12 @@
 # OnePlus 6 GPU in XNU (Adreno 630): architecture and milestones
 
-Status 2026-11-10: **G1 verified on device** (`xnu/patches/0107-op6-gpu-bringup.patch`, `SweetGPUStage=7`,
-`SweetGPUMagic=0xC0FFEE01`, `SweetGPUState="off"`). **G2 patch and userland test tool written and locally
-verified** (`xnu/patches/0108-op6-gpu-userclient.patch`, copy in `op6/xnu-patches/`, and
-`s9/ios-tools/sweetgpu-test.c`). Patch `0108` passes `git apply --check` on xnu-8796.141.3 + 0000-0107 and
-`clang -fsyntax-only` under XNU's `-Weverything -Werror` flags; `sweetgpu-test.c` passes `clang -Wall
--Wextra -Werror`. Ready for CI build (`xnu.yml` + `s9-ios-tools.yml` on `macos-26`) and device test with
-`sweetgpu=2`.
+Status 2026-11-10: **G1 and G2 verified on device** (`xnu/patches/0107-op6-gpu-bringup.patch` +
+`xnu/patches/0108-op6-gpu-userclient.patch`, copies in `op6/xnu-patches/`, and `s9/ios-tools/sweetgpu-test.c`).
+With `boot-G2.img` (CI run `42847871854`, `sweetgpu=2 sweetgpudelay=30`), `SweetGPU` stays powered on
+(`SweetGPUStage=7`, `SweetGPUMagic=3237998081` = `0xC0FFEE01`, `SweetGPUState="on"`) and userland
+`/var/root/sweetgpu-test` passes `GET_PARAM`, BO alloc/map (`0x10000000`, `0x10004000`), single IB submit
+(`dst[0]=0xC0FFEE02` in 69 us), 100-submit stress loop (53 us/submit), and 1000-submit ring-wrap loop
+(51 us/submit, fences 1..1102, 0 SMMU faults). Next: G3 (Mesa freedreno + libdrm shim).
 
 Labels: **[V]** read in source/DT or verified on the device, **[I]** inferred, **[?]** open.
 

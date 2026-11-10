@@ -23,5 +23,6 @@ Labels: device-verified unless noted.
 | 2026-11-10 | GPU M13 | zap shader accepted by TrustZone (PAS 13); SQE microcode loaded; CP ran ME_INIT, SET_SECURE_MODE 0, NOP + CP_MEM_WRITE: 0xC0FFEE01 in RAM through the GPU SMMU |
 
 | 2026-11-10 | GPU G1 (XNU) | kernel driver (0107) powers the A630 during iOS boot, zap + CP_MEM_WRITE 0xC0FFEE01, GPU back off; iOS unaffected |
+| 2026-11-10 | GPU G2 (XNU) | `SweetGPUUserClient` (0108, `sweetgpu=2`): `SweetGPUMagic=3237998081` (`0xC0FFEE01`), `SweetGPUState="on"`; userland `sweetgpu-test` allocates/maps carve-out BOs (`0x10000000`, `0x10004000`), submits IB `CP_NOP` + `CP_MEM_WRITE` `0xC0FFEE02` (69 us), and passes 100-submit (53 us/submit) + 1000-submit ring-wrap (51 us/submit) loops with 0 faults |
 
-Next: GPU G2 (user client, msm uAPI subset), G3 Mesa freedreno, G4 EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+Next: G3 Mesa freedreno, G4 EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
