@@ -5,11 +5,6 @@ name: op6-mesa
 # Runs on macos-15 (standard GitHub Actions macOS pool) with Xcode's iPhoneOS SDK.
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'op6/mesa/**'
-      - 's9/ios-tools/sweet-gl-test.c'
-      - '.github/workflows/op6-mesa.yml'
 
 jobs:
   build:

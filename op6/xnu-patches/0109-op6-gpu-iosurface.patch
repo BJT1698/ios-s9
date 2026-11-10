@@ -1,0 +1,753 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index fd8c91b..a4fbb7f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -326,13 +326,15 @@ static struct {
+ #define VA_RING			0x01010000u
+ #define VA_SCRATCH		0x01020000u
+ #define VA_BO_BASE		0x10000000ull
++#define VA_SURF_BASE		0x20000000ull
++#define VA_SURF_SIZE		0x60000000ull
+ #define SCR_SHADOW		0
+ #define SCR_FENCE		16
+ #define SCR_MAGIC		64
+ #define MAGIC			0xC0FFEE01u
+ #define SID_GPU			0u
+ #define RING_DW			8192u
+-#define GPU_PT_PAGES		64u
++#define GPU_PT_PAGES		512u
+ #define RB_CNTL_VAL		(12u | (2u << 8) | (1u << 27))
+ 
+ /* zap / SCM */
+@@ -1924,12 +1926,22 @@ static uint32_t bo_total_pages, bo_used_pages;
+ static uint32_t gpu_fence, gpu_faults;
+ static int gpu_ready;
+ 
++#define SURF_MAX_FREE		128u
++struct surf_range {
++	uint64_t start, size;
++};
++static struct surf_range surf_free[SURF_MAX_FREE];
++static unsigned surf_free_count;
++
+ static void
+ bo_init(void)
+ {
+ 	uint32_t off = (g.dma_used + 0x3fffu) & ~0x3fffu;
+ 
+ 	bzero(bo_bmap, sizeof(bo_bmap));
++	surf_free[0].start = VA_SURF_BASE;
++	surf_free[0].size = VA_SURF_SIZE;
++	surf_free_count = 1;
+ 	if (off >= g.dma_size) {
+ 		bo_base_pa = 0;
+ 		bo_total_pages = 0;
+@@ -1949,6 +1961,82 @@ sweet_gpu_ready(void)
+ 	return gpu_ready;
+ }
+ 
++uint64_t
++sweet_gpu_surf_alloc_va(uint32_t size)
++{
++	uint64_t need = (size + 0xfffu) & ~0xfffull;
++	if (!gpu_ready || need == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < surf_free_count; i++) {
++		if (surf_free[i].size < need) {
++			continue;
++		}
++		uint64_t va = surf_free[i].start;
++		surf_free[i].start += need;
++		surf_free[i].size -= need;
++		if (surf_free[i].size == 0) {
++			surf_free_count--;
++			for (unsigned j = i; j < surf_free_count; j++) {
++				surf_free[j] = surf_free[j + 1];
++			}
++		}
++		return va;
++	}
++	return 0;
++}
++
++int
++sweet_gpu_surf_map_page(uint64_t iova, uint64_t pa)
++{
++	return pt_map(&gpu_pt, iova, pa, 4096u, PTE_RW);
++}
++
++void
++sweet_gpu_surf_tlb_inv(void)
++{
++	cb_tlb_inv(gcbbase);
++}
++
++void
++sweet_gpu_surf_unmap(uint64_t iova, uint32_t size)
++{
++	uint64_t span = (size + 0xfffu) & ~0xfffull;
++	if (!gpu_ready || iova < VA_SURF_BASE || span == 0) {
++		return;
++	}
++	pt_unmap(&gpu_pt, iova, (uint32_t)span);
++	cb_tlb_inv(gcbbase);
++	unsigned i = 0;
++	while (i < surf_free_count && surf_free[i].start < iova) {
++		i++;
++	}
++	if (i > 0 && surf_free[i - 1].start + surf_free[i - 1].size == iova) {
++		surf_free[i - 1].size += span;
++		if (i < surf_free_count && surf_free[i - 1].start + surf_free[i - 1].size == surf_free[i].start) {
++			surf_free[i - 1].size += surf_free[i].size;
++			surf_free_count--;
++			for (unsigned j = i; j < surf_free_count; j++) {
++				surf_free[j] = surf_free[j + 1];
++			}
++		}
++		return;
++	}
++	if (i < surf_free_count && iova + span == surf_free[i].start) {
++		surf_free[i].start = iova;
++		surf_free[i].size += span;
++		return;
++	}
++	if (surf_free_count < SURF_MAX_FREE) {
++		for (unsigned j = surf_free_count; j > i; j--) {
++			surf_free[j] = surf_free[j - 1];
++		}
++		surf_free[i].start = iova;
++		surf_free[i].size = span;
++		surf_free_count++;
++	}
++}
++
+ int
+ sweet_gpu_get_param(uint32_t param, uint64_t *val)
+ {
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..b556e0c 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7325,6 +7325,37 @@ proc_process_signature(proc_t p, os_reason_t *signature_failure_reason)
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Boot-arg sweetinject=/path/to/lib.dylib:procname: add
++ * DYLD_INSERT_LIBRARIES=/path/to/lib.dylib to that process's environment
++ * on exec (e.g. sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd).
++ */
++static void
++sweet_inject(struct image_params *imgp, const char *procname)
++{
++	char spec[192], env[224];
++	char *colon;
++
++	if (!PE_parse_boot_arg_str("sweetinject", spec, sizeof(spec))) {
++		return;
++	}
++	colon = strchr(spec, ':');
++	if (colon == NULL) {
++		return;
++	}
++	*colon++ = '\0';
++	if (strcmp(procname, colon) != 0) {
++		return;
++	}
++	snprintf(env, sizeof(env), "DYLD_INSERT_LIBRARIES=%s", spec);
++	if (exec_add_user_string(imgp, CAST_USER_ADDR_T(env), UIO_SYSSPACE, FALSE) == 0) {
++		imgp->ip_envc++;
++		printf("SWEET: injected %s into %s\n", env, procname);
++	}
++}
++#endif
++
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+ {
+@@ -7414,6 +7445,7 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			sweet_inject(imgp, p->p_name);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4cba4d5..2cc87e4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern "C" int sweet_bind_current_thread(int cpu);   /* osfmk/kern/sched_prim.c */
+ extern "C" void thread_set_thread_name(thread_t th, const char *name);  /* osfmk/kern/thread.c */
++extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);      /* iokit/Kernel/arm/SweetGPU.cpp */
+ 
+ /*
+  * Galaxy S9: the framebuffer's own threads (the present work loop: cache
+@@ -553,6 +554,7 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	setProperty("SweetWaitsForGPU", true);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s, vsync %u us%s, zero-copy %s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+@@ -934,7 +936,26 @@ AppleCLCD::present(const uint8_t *rec, int32_t y0, int32_t y1)
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
++		if (src != 0 && !sweet_gpu_surface_ready(s->id, (void *)src, s->allocSize)) {
++			s->release();
++			continue;
++		}
++		/*
++		 * CoreAnimation's GPU renderer creates a 2-plane 'b3a8' surface for
++		 * the screen and draws BGRA8 into plane 0 (0115). Take geometry from
++		 * plane 0 when present.
++		 */
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		uint32_t ew = s->elementWidth, eh = s->elementHeight;
++		uint32_t off = s->offset, bpr = s->bytesPerRow;
++		if (s->planeCount > 0) {
++			const struct sweet_surface_plane *p0 = &s->planes[0];
++			bpe = p0->bytesPerElement ? p0->bytesPerElement : 4;
++			ew = p0->elementWidth;
++			eh = p0->elementHeight;
++			off = p0->offset;
++			bpr = p0->bytesPerRow;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -979,9 +1000,9 @@ AppleCLCD::present(const uint8_t *rec, int32_t y0, int32_t y1)
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++		uint64_t last = (uint64_t)off + (uint64_t)(sy + h - 1) * bpr +
+ 		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		if (w <= 0 || h <= 0 || ew != 1 || eh != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+@@ -989,7 +1010,7 @@ AppleCLCD::present(const uint8_t *rec, int32_t y0, int32_t y1)
+ 			markRows(dy, (int64_t)dy + h);
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				    (const void *)(src + off + (uint64_t)(sy + y) * bpr + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+@@ -1006,6 +1027,15 @@ void
+ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+     int32_t dx, int32_t dy, int32_t w, int32_t h)
+ {
++	uint32_t ew = s->elementWidth, eh = s->elementHeight;
++	uint32_t off = s->offset, bpr = s->bytesPerRow;
++	if (s->planeCount > 0) {
++		const struct sweet_surface_plane *p0 = &s->planes[0];
++		ew = p0->elementWidth;
++		eh = p0->elementHeight;
++		off = p0->offset;
++		bpr = p0->bytesPerRow;
++	}
+ 	if (w > (int32_t)fLogicalW - dx) {
+ 		w = (int32_t)fLogicalW - dx;
+ 	}
+@@ -1018,11 +1048,11 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	if (h > (int32_t)s->height - sy) {
+ 		h = (int32_t)s->height - sy;
+ 	}
+-	if (src == 0 || bpe != 4 || w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	if (src == 0 || bpe != 4 || w <= 0 || h <= 0 || ew != 1 || eh != 1 ||
+ 	    s->memory == NULL) {
+ 		return;
+ 	}
+-	uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4;
++	uint64_t last = (uint64_t)off + (uint64_t)(sy + h - 1) * bpr + (uint64_t)(sx + w) * 4;
+ 	if (last > s->memory->getLength()) {
+ 		return;
+ 	}
+@@ -1037,7 +1067,7 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	if (px1 > fPanW) {
+ 		px1 = fPanW;
+ 	}
+-	const uintptr_t base = src + s->offset;
++	const uintptr_t base = src + off;
+ 	markRows((int64_t)fPanY + py0, (int64_t)fPanY + py1);
+ 	int32_t last_ly = -1;
+ 	for (int32_t py = py0; py < py1; py++) {
+@@ -1049,7 +1079,7 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 			continue;
+ 		}
+ 		last_ly = ly;
+-		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
++		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * bpr) + sx - dx;
+ 		int32_t px = px0;
+ 		for (; px + 4 <= px1; px += 4) {
+ 			drow[px] = srow[fXTab[px]];
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 6eec64f..9ab7e59 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -36,6 +36,7 @@
+ #include <mach/mach_time.h>
+ #include <libkern/libkern.h>
+ #include <sys/systm.h>
++#include "SweetSurface.h"
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+@@ -48,10 +49,15 @@ int sweet_gpu_ready(void);
+ int sweet_gpu_get_param(uint32_t param, uint64_t *val);
+ int sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out, uint32_t *actual_size_out);
+ void sweet_gpu_bo_free(uint64_t pa, uint64_t iova, uint32_t size);
++uint64_t sweet_gpu_surf_alloc_va(uint32_t size);
++int sweet_gpu_surf_map_page(uint64_t iova, uint64_t pa);
++void sweet_gpu_surf_tlb_inv(void);
++void sweet_gpu_surf_unmap(uint64_t iova, uint32_t size);
+ int sweet_gpu_submit(const uint64_t *ib_iovas, const uint32_t *ib_dwords, uint32_t nr_ibs, uint32_t *fence_out);
+ uint32_t sweet_gpu_last_fence(void);
+ int sweet_gpu_fence_done(uint32_t fence);
+ void sweet_gpu_report(const char *why);
++void flush_dcache(vm_offset_t addr, vm_size_t count, int phys); /* osfmk/arm64/caches_asm.s */
+ int sweet_bind_current_thread(int cpu);                         /* osfmk/kern/sched_prim.c */
+ void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ kern_return_t thread_terminate(thread_t);                       /* Mach MIG, not in kern/thread.h */
+@@ -59,6 +65,10 @@ kern_return_t thread_terminate(thread_t);                       /* Mach MIG, not
+ 
+ static IOLock *gSweetGPULock;
+ static bool gSweetGPUReported;
++static volatile int gSweetGPUState;     /* 0 = starting, 1 = on, -1 = off/failed */
++static volatile uint32_t gSurfaceFence[4096];
++static uint32_t gSurfaceFlushed[4096];
++static uint64_t gSurfaceWrites;
+ 
+ class SweetGPU : public IOService {
+ 	OSDeclareDefaultStructors(SweetGPU);
+@@ -102,6 +112,7 @@ SweetGPU::bringup(void *arg, wait_result_t wr)
+ 	self->setProperty("SweetGPUFirmwareGMU", (unsigned long long)r.gmu_fw_version, 64);
+ 	self->setProperty("SweetGPUFirmwareSQE", (unsigned long long)r.sqe_version, 64);
+ 	self->setProperty("SweetGPUState", rc ? "failed" : r.kept_on ? "on" : "off");
++	gSweetGPUState = (!rc && r.kept_on) ? 1 : -1;
+ 	self->registerService();
+ 	IOLog("SWEET GPU: service registered (stage %u, magic 0x%08x, %s)\n", r.stage, r.magic,
+ 	    rc ? "failed" : r.kept_on ? "GPU on" : "GPU off");
+@@ -139,6 +150,9 @@ SweetGPU::start(IOService *provider)
+ 	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+ 	setProperty("SweetGPUState", "starting");
++	if (fMode == 2) {
++		registerService();
++	}
+ 	retain();
+ 	if (kernel_thread_start(&SweetGPU::bringup, this, &th) != KERN_SUCCESS) {
+ 		IOLog("SWEET GPU: no thread\n");
+@@ -165,6 +179,20 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kSweetGpuSurface        = 0x7e,
++};
++
++struct sweet_surface_request {
++	uint32_t surface;
++	uint32_t handle;
++	uint64_t size;
++	uint64_t offset;
++	uint32_t rowBytes;
++	uint32_t width;
++	uint32_t height;
++	uint32_t pixelFormat;
++	uint32_t planes;
++	uint32_t pad;
+ };
+ 
+ struct msm_timespec {
+@@ -270,6 +298,7 @@ struct drm_gem_close {
+ #define MSM_INFO_SET_NAME       2u
+ #define MSM_INFO_GET_FLAGS      5u
+ #define MSM_PREP_NOSYNC         0x04u
++#define MSM_SUBMIT_BO_WRITE     0x0002u
+ #define MSM_SUBMIT_CMD_BUF      1u
+ #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000u
+ 
+@@ -279,13 +308,32 @@ struct drm_gem_close {
+ 
+ struct sweet_gpu_bo {
+ 	IOMemoryDescriptor *mem;
++	SweetSurface *surface;
+ 	uint64_t pa;
+ 	uint64_t iova;
+ 	uint32_t size;
+ 	uint32_t flags;
+ 	uint32_t fence;
++	uint32_t seed;
+ };
+ 
++static void
++sweet_gpu_to_memory(SweetSurface *surface)
++{
++	uintptr_t va = surface->kernelAddress();
++	if (va != 0) {
++		flush_dcache((vm_offset_t)va, (vm_size_t)surface->allocSize, FALSE);
++		return;
++	}
++	for (IOByteCount off = 0, len = 0; off < surface->allocSize; off += len) {
++		addr64_t phys = surface->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++		if (phys == 0 || len == 0) {
++			break;
++		}
++		flush_dcache((vm_offset_t)phys, (vm_size_t)len, TRUE);
++	}
++}
++
+ static uint64_t
+ sweet_gpu_timeout_ms(const struct msm_timespec *ts)
+ {
+@@ -356,6 +404,7 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOReturn gemNew(struct drm_msm_gem_new *req);
+ 	IOReturn gemInfo(struct drm_msm_gem_info *req);
+ 	IOReturn gemSubmit(struct drm_msm_gem_submit *req);
++	IOReturn surfaceBuffer(struct sweet_surface_request *req);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -384,10 +433,13 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ bool
+ SweetGPUUserClient::start(IOService *provider)
+ {
+-	if (!IOUserClient::start(provider) || !sweet_gpu_ready() || gSweetGPULock == NULL) {
++	if (!IOUserClient::start(provider) || gSweetGPULock == NULL) {
+ 		return false;
+ 	}
+-	return true;
++	for (unsigned waited = 0; gSweetGPUState == 0 && waited < 1200; waited++) {
++		IOSleep(50);
++	}
++	return sweet_gpu_ready() != 0;
+ }
+ 
+ struct sweet_gpu_bo *
+@@ -409,7 +461,12 @@ SweetGPUUserClient::releaseBOLocked(struct sweet_gpu_bo *b)
+ 	if (b->fence != 0 && !sweet_gpu_fence_done(b->fence)) {
+ 		(void)sweet_gpu_wait_locked(b->fence, 200);
+ 	}
+-	sweet_gpu_bo_free(b->pa, b->iova, b->size);
++	if (b->surface != NULL) {
++		sweet_gpu_surf_unmap(b->iova, b->size);
++		b->surface->release();
++	} else {
++		sweet_gpu_bo_free(b->pa, b->iova, b->size);
++	}
+ 	b->mem->release();
+ 	bzero(b, sizeof(*b));
+ }
+@@ -582,10 +639,18 @@ SweetGPUUserClient::gemSubmit(struct drm_msm_gem_submit *req)
+ 
+ 	IOLockLock(gSweetGPULock);
+ 	for (uint32_t i = 0; i < req->nr_bos; i++) {
+-		if (lookupBO(bos[i].handle) == NULL) {
++		struct sweet_gpu_bo *b = lookupBO(bos[i].handle);
++		if (b == NULL) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
++		if (b->surface != NULL) {
++			uint32_t seed = b->surface->seed();
++			if (seed != b->seed) {
++				sweet_gpu_to_memory(b->surface);
++				b->seed = seed;
++			}
++		}
+ 	}
+ 	for (uint32_t i = 0; ret == kIOReturnSuccess && i < req->nr_cmds; i++) {
+ 		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
+@@ -618,6 +683,11 @@ SweetGPUUserClient::gemSubmit(struct drm_msm_gem_submit *req)
+ 				struct sweet_gpu_bo *b = lookupBO(bos[i].handle);
+ 				if (b != NULL) {
+ 					b->fence = fence;
++					if (b->surface != NULL && (bos[i].flags & MSM_SUBMIT_BO_WRITE) != 0 &&
++					    b->surface->id < 4096) {
++						gSurfaceFence[b->surface->id] = fence;
++						gSurfaceWrites++;
++					}
+ 				}
+ 			}
+ 		}
+@@ -631,6 +701,111 @@ SweetGPUUserClient::gemSubmit(struct drm_msm_gem_submit *req)
+ 	return ret;
+ }
+ 
++IOReturn
++SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
++{
++	SweetSurface *surface = sweet_surface_copy(req->surface);
++	if (surface == NULL || surface->memory == NULL || surface->allocSize == 0) {
++		OSSafeReleaseNULL(surface);
++		return kIOReturnNotFound;
++	}
++	req->size = surface->allocSize;
++	req->offset = surface->offset;
++	req->rowBytes = surface->bytesPerRow;
++	req->width = surface->width;
++	req->height = surface->height;
++	req->pixelFormat = surface->pixelFormat;
++	req->planes = surface->planeCount;
++	if (req->handle == 0xffffffffu) {
++		surface->release();
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gSweetGPULock);
++	for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
++		if (fBOs[i].mem != NULL && fBOs[i].surface == surface) {
++			req->handle = i + 1;
++			IOLockUnlock(gSweetGPULock);
++			surface->release();
++			return kIOReturnSuccess;
++		}
++	}
++	uint32_t slot = SWEET_GPU_MAX_BOS;
++	for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
++		uint32_t idx = (fNextBO + i) % SWEET_GPU_MAX_BOS;
++		if (fBOs[idx].mem == NULL) {
++			slot = idx;
++			fNextBO = (idx + 1) % SWEET_GPU_MAX_BOS;
++			break;
++		}
++	}
++	if (slot >= SWEET_GPU_MAX_BOS) {
++		IOLockUnlock(gSweetGPULock);
++		surface->release();
++		return kIOReturnNoResources;
++	}
++	uint32_t size = (surface->allocSize + 0xfffu) & ~0xfffu;
++	uint64_t iova = sweet_gpu_surf_alloc_va(size);
++	if (iova == 0) {
++		IOLockUnlock(gSweetGPULock);
++		surface->release();
++		return kIOReturnNoMemory;
++	}
++	for (uint32_t off = 0; off < size; off += 4096u) {
++		IOByteCount segLen = 0;
++		addr64_t phys = surface->memory->getPhysicalSegment(off, &segLen, kIOMemoryMapperNone);
++		if (phys == 0 || !sweet_gpu_surf_map_page(iova + off, phys)) {
++			sweet_gpu_surf_unmap(iova, size);
++			IOLockUnlock(gSweetGPULock);
++			surface->release();
++			return kIOReturnNoMemory;
++		}
++	}
++	sweet_gpu_surf_tlb_inv();
++	sweet_gpu_to_memory(surface);
++	surface->memory->retain();
++	struct sweet_gpu_bo *b = &fBOs[slot];
++	b->mem = surface->memory;
++	b->surface = surface;   /* takes our retain */
++	b->pa = 0;
++	b->iova = iova;
++	b->size = size;
++	b->flags = 0;
++	b->fence = 0;
++	b->seed = surface->seed();
++	req->handle = slot + 1;
++	IOLockUnlock(gSweetGPULock);
++	return kIOReturnSuccess;
++}
++
++extern "C" bool
++sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
++{
++	if (id == 0 || id >= 4096 || !sweet_gpu_ready()) {
++		return true;
++	}
++	uint32_t fence = gSurfaceFence[id];
++	if (fence == 0) {
++		return true;
++	}
++	if (!sweet_gpu_fence_done(fence)) {
++		if (gSweetGPULock == NULL) {
++			return false;
++		}
++		IOLockLock(gSweetGPULock);
++		bool ok = sweet_gpu_wait_locked(fence, 50);
++		IOLockUnlock(gSweetGPULock);
++		if (!ok) {
++			return false;
++		}
++	}
++	if (gSurfaceFlushed[id] != fence && kernel != NULL && size != 0) {
++		flush_dcache((vm_offset_t)kernel, (vm_size_t)size, FALSE);
++		gSurfaceFlushed[id] = fence;
++	}
++	return true;
++}
++
+ IOReturn
+ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+ {
+@@ -642,7 +817,7 @@ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMe
+ 	if (b != NULL) {
+ 		b->mem->retain();
+ 		*memory = b->mem;
+-		*options = kIOMapWriteCombineCache;
++		*options = b->surface != NULL ? b->surface->mapCache : kIOMapWriteCombineCache;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gSweetGPULock);
+@@ -664,6 +839,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		struct drm_msm_submitqueue queue;
+ 		struct drm_msm_submitqueue_query query;
+ 		struct drm_gem_close close;
++		struct sweet_surface_request surface;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	IOReturn ret = kIOReturnSuccess;
+@@ -744,6 +920,9 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		IOLockUnlock(gSweetGPULock);
+ 		break;
+ 	}
++	case kSweetGpuSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 232e771..3dee624 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -105,11 +105,20 @@ SweetSurface::free()
+ 		IOLockUnlock(sweet_surface_lock);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (prepared && memory != NULL) {
++		memory->complete(kIODirectionInOut);
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+ 
++uint32_t
++SweetSurface::seed() const
++{
++	return *(uint32_t *)((uint8_t *)state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
++}
++
+ uintptr_t
+ SweetSurface::kernelAddress()
+ {
+@@ -370,6 +379,13 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ 	return n != NULL ? n->unsigned32BitValue() : def;
+ }
+ 
++static uint64_t
++sweet_dict_u64(OSDictionary *dict, const char *key, uint64_t def)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, dict->getObject(key));
++	return n != NULL ? n->unsigned64BitValue() : def;
++}
++
+ static uint32_t
+ sweet_div_up(uint32_t a, uint32_t b)
+ {
+@@ -882,13 +898,32 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
++	uint64_t creatorAddr = sweet_dict_u64(props, "IOSurfaceAddress", 0);
+ 	int slot = -1;
+-	if (ret == kIOReturnSuccess && strcmp(name, "backboardd") == 0) {
++	if (ret == kIOReturnSuccess && creatorAddr == 0 && strcmp(name, "backboardd") == 0) {
+ 		IOLockLock(sweet_surface_lock);
+ 		slot = sweet_surface_slot_take_locked(s);
+ 		IOLockUnlock(sweet_surface_lock);
+ 	}
+-	if (ret == kIOReturnSuccess && slot >= 0) {
++	if (ret == kIOReturnSuccess && creatorAddr != 0) {
++		/*
++		 * CoreAnimation creates an IOSurface around memory already in the
++		 * caller's address space (IOSurfaceAddress) when uploading a CGImage
++		 * texture to OpenGL ES (0117).
++		 */
++		s->memory = IOMemoryDescriptor::withAddressRange(creatorAddr, s->allocSize,
++		    kIODirectionInOut, fTask);
++		if (s->memory == NULL || s->memory->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(s->memory);
++			ret = kIOReturnVMError;
++		} else {
++			s->prepared = true;
++			s->mapCache = kIOMapDefaultCache;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess && slot >= 0) {
+ 		/*
+ 		 * Galaxy S9: a framebuffer of backboardd's in a display slot, cached
+ 		 * for CoreAnimation's CPU renderer; SweetFramebuffer.cpp cleans the
+@@ -1001,6 +1036,16 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:
++	case 7:
++		/*
++		 * CoreAnimation's GPU renderer wraps a client's image in an IOSurface
++		 * (selectors 6 and 7) and attaches that to a texture. Refusing makes it
++		 * upload the image with glTexSubImage2D instead of handing over an empty
++		 * surface with no pixelFormat (0116).
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index caf30f6..2fa5835 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -49,12 +49,14 @@ public:
+ 	int32_t                   slot;
+ 	uint64_t                  phys;
+ 	uint32_t                  dirtyY0, dirtyY1;
++	bool                      prepared;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+ 	uintptr_t kernelAddress();
++	uint32_t seed() const;
+ };
+ 
+ /* Retained surface for an id, or NULL. */
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 21badee..5ed4a23 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6964,7 +6964,17 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * OnePlus 6 / SDM845 RAM reaches above 4 GiB (0x80000000..0x27d800000),
++	 * so pp >= 0x100000. pp is a 32-bit ppnum_t: (pp << PAGE_SHIFT) overflows
++	 * 32 bits and passes a truncated physical address to phystokv(), panicking
++	 * whenever kIOMapWriteCombineCache is used on a page at >= 4 GiB.
++	 */
++	flush_dcache(ptoa(pp), PAGE_SIZE, TRUE);
++#else
+ 	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++#endif
+ }
+ 
+ #if CONFIG_COREDUMP
