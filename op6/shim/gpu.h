@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 /*
- * Adreno 630 / GMU pieces shared by the OP6 GPU stages (m10, m11). All
+ * Adreno 630 / GMU pieces shared by the OP6 GPU stages (m10, m11, m12). All
  * addresses from the OP6 live DT (op6-live.dts, mainline sdm845.dtsi as pmOS
  * boots it); register numbers are the dword offsets of Linux
  * a6xx_gmu.xml.h / a6xx.xml.h (v6.6). The S9 port used the kgsl numbering of
@@ -100,5 +100,10 @@ void gpu_smmu_ids(void);
 
 void gpu_rpmh_ucode(void);
 int gpu_rpmh_start(void);
+int gpu_rpmh_stop(void);
+int gpu_rpmh_enabled(void);
+extern int gpu_quiet;		/* say() to ramlog only, last lines kept */
+void gpu_quiet_dump(void);
+extern uint32_t gpu_rpmh_ctrl;	/* GMU_RPMH_CTRL written at boot (default 0) */
 int gpu_gmu_boot(uint32_t qtbl, uint32_t log_msg, uint32_t msgq_mask);
 void gpu_gmu_halt(void);

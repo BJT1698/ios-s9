@@ -625,6 +625,7 @@ static int hfi_talk(void)
 	return 1;
 }
 
+#ifndef M11_LIB	/* m12.c includes this file for everything up to HFI */
 void shim_main(uint64_t dtb)
 {
 	(void)dtb;
@@ -669,3 +670,4 @@ out:
 	say("", "Tire uma foto desta tela!");
 	countdown_reboot(con_row(), END_SECONDS);
 }
+#endif

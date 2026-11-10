@@ -8,9 +8,10 @@
  * numbers, values) only; no code copied (Linux is GPL, Bergamota has no
  * licence). Differences S9 -> OP6 are listed in op6/GPU-NOTES.md.
  *
- * What these helpers never do: touch the GX GDSC (gpucc 0x100c), enable the
- * GMU's RPMh interface (GMU_RPMH_CTRL stays 0, so the GMU votes nothing),
- * send any RPMh vote from the CPU (cmd-db is only read), or touch a PMIC.
+ * What these helpers never do: touch the GX GDSC (gpucc 0x100c), send any
+ * RPMh vote from the CPU (cmd-db is only read), or touch a PMIC. The GMU's
+ * RPMh interface stays off (GMU_RPMH_CTRL = 0, the GMU votes nothing) unless
+ * a stage sets gpu_rpmh_ctrl (m12: the Linux bits, so the GMU can vote GX).
  * GPU_RPMH=1 at build time adds the mainline GPU-RSC wake handshake, which
  * makes the GPU's PDC send its wake TCS (mx/cx/0x30080 level votes).
  */
@@ -41,6 +42,12 @@
 #ifndef GPU_PDC_GFX
 #define GPU_PDC_GFX		0x30050u	/* OP6 cmd-db: gfx.lvl = 0x30050 (M10, 2026-11-10); 0x30080 is xo.lvl here, not mainline's gfx */
 #endif
+#ifndef GPU_PDC_CMD2
+/* Third command of the PDC sleep/wake TCS. m10/m11: GPU_PDC_GFX. m12 (build.sh)
+ * passes 0x30080, the a630 value of Linux a6xx_gmu_rpmh_init and of the S9's
+ * kgsl; on the OP6 cmd-db that is xo.lvl. Both lit GX on an SDM845 [HW-F1]. */
+#define GPU_PDC_CMD2		GPU_PDC_GFX
+#endif
 
 #define SW_COLLAPSE		(1u << 0)
 #define PWR_ON			(1u << 31)
@@ -53,6 +60,13 @@
 
 static const char *stage;
 static int step_row;
+
+/* gpu_quiet: say() goes to the ramlog only and the last lines are kept for
+ * gpu_quiet_dump() (m12 reruns all of m11 and needs the screen rows). */
+int gpu_quiet;
+static char quiet_ring[6][80];
+static unsigned quiet_n;
+uint32_t gpu_rpmh_ctrl;		/* GMU_RPMH_CTRL at boot: 0 = the GMU votes nothing */
 
 void exc_handler(uint64_t slot, uint64_t *regs)
 {
@@ -69,9 +83,31 @@ void saylog(const char *label, const char *s)
 
 void say(const char *label, const char *s)
 {
-	con_str(label, s);
+	if (gpu_quiet) {
+		char *p = quiet_ring[quiet_n++ % 6], *e = p + 79;
+
+		while (*label && p < e)
+			*p++ = *label++;
+		if (p < e)
+			*p++ = ' ';
+		while (*s && p < e)
+			*p++ = *s++;
+		*p = 0;
+	} else {
+		con_str(label, s);
+	}
 	saylog(label, s);
 	wdog_pet();
+}
+
+/* Shows the last lines said while quiet (oldest first), then speaks again. */
+void gpu_quiet_dump(void)
+{
+	unsigned n = quiet_n < 6 ? quiet_n : 6;
+
+	gpu_quiet = 0;
+	for (unsigned i = quiet_n - n; i < quiet_n; i++)
+		con_str("", quiet_ring[i % 6]);
 }
 
 void sayhex(const char *label, uint32_t v)
@@ -287,7 +323,7 @@ static void name_line(const char *label, const uint32_t *addrs, unsigned n, int 
 /* 0 = cmd-db readable and the three ARC lists found. */
 int gpu_cmddb(int verbose)
 {
-	static const uint32_t pdc[3] = { 0x30000, 0x30010, GPU_PDC_GFX };
+	static const uint32_t pdc[3] = { 0x30000, 0x30010, GPU_PDC_CMD2 };
 	static const uint32_t bwa[6] = { 0x50000, 0x5005c, 0x5000c, 0x50034, 0x5007c, 0x5004c };
 	char b[96];
 
@@ -355,8 +391,8 @@ void gpu_rpmh_ucode(void)
 {
 	static const uint32_t rsc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
 	static const uint32_t pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
-	/* TCS1 (sleep) and TCS3 (wake): mx 0x30010, cx 0x30000, GPU_PDC_GFX */
-	static const uint32_t tcs_addr[3] = { 0x30010, 0x30000, GPU_PDC_GFX };
+	/* TCS1 (sleep) and TCS3 (wake): mx 0x30010, cx 0x30000, GPU_PDC_CMD2 */
+	static const uint32_t tcs_addr[3] = { 0x30010, 0x30000, GPU_PDC_CMD2 };
 	static const uint32_t tcs1_data[3] = { 1, 0, 0 };
 	static const uint32_t tcs3_data[3] = { 2, 3, 3 };
 
@@ -420,6 +456,24 @@ int gpu_rpmh_start(void)
 	return a && idle;
 }
 
+int gpu_rpmh_enabled(void)
+{
+	return GPU_RPMH;
+}
+
+/* a6xx_rpmh_stop (only with GPU_RPMH=1): the PDC sends its sleep TCS. */
+int gpu_rpmh_stop(void)
+{
+	if (!GPU_RPMH)
+		return 1;
+	step("RSC GPU: stop (PDC vota sleep)");
+	wr(GMU(GMU_RSCC_CONTROL_REQ), 1);
+	int s = poll(RSCC(0x004), 1u << 16, 1u << 16, 10);
+	wr(GMU(GMU_RSCC_CONTROL_REQ), 0);
+	say("RSC GPU", s ? "stop ok (sleep)" : "stop SEM ACK");
+	return s;
+}
+
 /* ---- GMU firmware + boot (a6xx_gmu_fw_start, legacy a630) ---- */
 
 void gpu_gmu_halt(void)
@@ -479,16 +533,20 @@ int gpu_gmu_boot(uint32_t qtbl, uint32_t log_msg, uint32_t msgq_mask)
 	wr32(GMU(GMU_CM3_CFG), 0x4052);		/* no NMI entry instead of __main */
 	wr32(GMU(GMU_HFI_SFR_ADDR), GMU_CHIPID);
 	wr32(GMU(GMU_PWR_COL_CP_MSG), log_msg);
-	/* a6xx_gmu_power_config, minus the RPMh enable: the GMU votes nothing */
+	/* a6xx_gmu_power_config; RPMh enable only when the stage asks (m12) */
 	wr32(GMU(GMU_SYS_BUS_CONFIG), 1);
 	wr32(GMU(GMU_ICACHE_CONFIG), 1);
 	wr32(GMU(GMU_DCACHE_CONFIG), 1);
 	wr32(GMU(GMU_PWR_COL_INTER_FRAME_CTRL), 0x9c40400u);
-	wr32(GMU(GMU_RPMH_CTRL), 0);
+	wr32(GMU(GMU_RPMH_CTRL), gpu_rpmh_ctrl);
 	wr32(GMU(GMU_CX_GMU_WFI_CONFIG), 0);
 	wr32(GMU(GMU_GMU2HOST_INTR_CLR), 0xffffffffu);
 	wr32(GMU(GMU_GMU2HOST_INTR_MASK), msgq_mask);
 	dsb();
+	if (gpu_rpmh_ctrl && rd32(GMU(GMU_RPMH_CTRL)) != gpu_rpmh_ctrl) {
+		sayhex("RPMH_CTRL NAO aceitou", rd32(GMU(GMU_RPMH_CTRL)));
+		return 0;
+	}
 
 	/* a6xx_gmu_start: newer firmware answers 0x100 in the low 9 bits */
 	dtcm_ver = rd32(GMU(GMU_CM3_DTCM_START + 0xff8));

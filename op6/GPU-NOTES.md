@@ -2,7 +2,7 @@
 
 Labels: **[V]** verified by reading the source or DT named next to it, **[HW-S9]** proven on the Galaxy S9
 hardware (same SDM845 / A630 v2), **[HW-F1]** proven on a Poco F1 by Bergamota (facts only, no licence),
-**[I]** inferred, **[?]** unknown until the phone answers. Nothing here has run on the OP6 yet.
+**[I]** inferred, **[?]** unknown until the phone answers. M10 and M11 ran on the OP6 (see "Device results"); M12 has not run yet.
 
 Sources: OP6 live DT `../op6-live.dts` (mainline `sdm845.dtsi` + `sdm845-oneplus-common.dtsi` as pmOS boots
 it); Linux v6.6 `drivers/gpu/drm/msm/adreno/a6xx_gmu.c`, `a6xx_hfi.c/.h`, `a6xx_gmu.xml.h`, `a6xx.xml.h`,
@@ -16,7 +16,7 @@ it); Linux v6.6 `drivers/gpu/drm/msm/adreno/a6xx_gmu.c`, `a6xx_hfi.c/.h`, `a6xx_
 |---|---|---|
 | **M10** | CX GDSC + GMU clocks 200 MHz, DTCM test, RSC/PDC micro-code, `a630_gmu.bin` into ITCM, CM3 out of reset -> `0xBABEFACE` | written, builds; S9 same stage passed first time [HW-S9] |
 | **M11** | M10 + GPU SMMU (tables, free CB, SID 5/4 rules, ATS1PR self-test) + boot with `HFI_QTBL_ADDR` + HFI v1: INIT, FW_VERSION, PERF_TABLE, BW_TABLE, TEST | written, builds; S9 M11 was flashed but never confirmed; the OP6 one follows mainline instead (sec. 2) |
-| M12 | GX on through the GMU: `GMU_RPMH_CTRL` enable, `BOOT_SLUMBER_OPTION=0`, `GX_VOTE_IDX`/`MX_VOTE_IDX` from the highest perf vote, OOB `BOOT_SLUMBER` (set bit 22, ack bit 30), SPTPRAC enable; then the first GPU core reads (RBBM_STATUS, CP_ALWAYS_ON) and slumber back | todo; the SoC-reset risk step [HW-F1 sweetgpu=5] |
+| **M12** | M11 + GX on through the GMU, Linux v6.6 legacy order: `GMU_RPMH_CTRL`=0xf11 at boot, `BOOT_SLUMBER_OPTION=0` + `GX_VOTE_IDX`/`MX_VOTE_IDX` (highest OPP), OOB `BOOT_SLUMBER` (bit 22 / ack 30), SPTPRAC on, then HFI, DCVS OOB, OOB `GPU_SET` (16/24); read-only core probes; Linux shutdown (VBIF halt, notify_slumber, POWER_STATE 0xf) and CM3 reset | written, builds (sec. 5); the first GX power-up on the OP6 [HW-F1 sweetgpu=5] |
 | M13 | zap shader via TZ (PAS id 13), CP: `a630_sqe.fw`, ringbuffer, `CP_ME_INIT`, leave secure mode, NOP + MEM_WRITE through the GPU SMMU (SID 0) | todo [HW-F1 etapa 8] |
 | D | XNU driver (msm-like ioctls, HackiOS kernel is APSL and reusable with notice), GPU kept on | todo |
 | E/F | Mesa freedreno a630 + fake libdrm + our EAGL in backboardd (iOS 16 uses GLES natively when Metal is absent, `s9/ESTUDO` sec. 2), then Metal (Chlorophyll, MIT) | todo |
@@ -35,7 +35,7 @@ kgsl DT + msm-4.9, OP6 = mainline DT + msm DRM) and a few S9 M11 mistakes.
 | GMU clock | RCG 0x1120/0x1124 = 0x602 (GPLL0_OUT_MAIN_DIV / 1.5 = 200 MHz) | same; DT gmu opp 200/400 MHz (levels 0x30/0x80); mainline also sets cx_gmu CBCR wake/sleep = 0xf (added) | [V] gpucc-sdm845.c, DT |
 | clock branches | gpucc cxo 0x109c, ahb 0x1078, cx_gmu 0x1098; gcc cfg_ahb 0x71004, memnoc_gfx 0x7100c, snoc_dvm 0x71018, ddrss_gpu_axi 0x44038, GPLL0 vote 0x52004 b15/b16 | same. DT gmu clocks = gpucc 0/1 (cx_gmu, cxo) + gcc 18 (ddrss_gpu_axi) + gcc 33 (memnoc_gfx); SMMU clocks gcc 33 + gcc 30 (cfg_ahb, CLK_IS_CRITICAL). gpucc 0x1078 and snoc_dvm are kgsl-only, kept (S9 proven) | [V] DT + bindings; [HW-S9] |
 | rails | none voted | none voted by the CPU either: sdm845 gpucc/gmu have no rpmhpd domain; CX/MX are on (CPU, display); GX = `gfx.lvl` ARC (PM8005), voted only by the GMU through the GPU RSC/PDC | [V] DT; [I] |
-| PDC TCS addresses | 0x30010 / 0x30000 / 0x30080 | same (mainline `pdc_address_offset` = 0x30080 for a630). Bergamota: `gfx.lvl` = 0x30050 in the F1 cmd-db. M10/M11 print the OP6 cmd-db names at all three | [V] a6xx_gmu.c; [HW-F1]; [?] name of 0x30080 |
+| PDC TCS addresses | 0x30010 / 0x30000 / 0x30080 | M10/M11: third command 0x30050 (`GPU_PDC_GFX`). **M12: 0x30080 (`GPU_PDC_CMD2`)**, what Linux (a630 `pdc_address_offset`) and the S9 kgsl send; on the OP6 cmd-db 0x30080 = `xo.lvl`, so the GPU PDC's third vote is the XO vote, not a gfx vote: GX is voted by the GMU itself (`GMU_RPMH_CTRL` GFX enable + `GX_VOTE_IDX`). Bergamota used 0x30050 and lit GX too, so it only matters for `GPU_RPMH=1` | [V] a6xx_gmu.c + OP6 cmd-db (M10); [HW-F1] |
 | ARC levels | not used | M11 reads `cx.lvl`, `mx.lvl`, `gfx.lvl` aux lists from the OP6 cmd-db and builds the perf votes as `a6xx_gmu_rpmh_arc_votes_init` | [V] a6xx_gmu.c, cmd-db.c |
 | GPU OPPs / speed bin | 257..710 MHz (kgsl table) | DT gpu opp-table: 257/342/414/520/596/675/710 MHz, opp-level 0x40/0x80/0xc0/0x100/0x140/0x180/0x1a0, peak kBps 1648000..7216000; **no speed-bin nvmem / opp-supported-hw** (qfprom only has the hstx-trim cells) | [V] DT |
 | bus votes | none | none (DDR is busy anyway: CPU + display scanout). Mainline votes `gfx-mem` = MASTER_GFX3D (7) -> SLAVE_EBI1 (14) on mem_noc (BCMs SH0, MC0, ACV) at boot; to add in M12/M13 if the CP needs bandwidth | [V] DT, interconnect/sdm845.c; [I] |
@@ -59,6 +59,12 @@ kgsl DT + msm-4.9, OP6 = mainline DT + msm DRM) and a few S9 M11 mistakes.
   (cmd-db reads only).
 - `op6/tools/gpu-fw-embed.py <a630_gmu.bin>` writes `op6/shim/fw_a630_gmu.h` (git-ignored; `--remove` deletes it).
   Without it both stages build and say "SEM FIRMWARE" on screen (M11 then stops before writing the SMMU).
+- `m12.c` - `#include "m11.c"` (with `M11_LIB`, so M11's code is reused unchanged and its `shim_main` left out)
+  + the GX sequence. `gpu.c` gained `gpu_quiet` (M11 lines to the ramlog only, last 6 shown on failure: the
+  screen has ~47 rows), `gpu_rpmh_ctrl` (default 0 = m10/m11 behaviour; m12 sets 0xf11 and it is read back
+  before the CM3 is released), `gpu_rpmh_stop()`, `GPU_PDC_CMD2`.
+- `bash op6/build.sh m12` -> `boot-m12.img` (renamed to `boot-m12-gx.img`; `SHIM_CFLAGS=-DGPU_RPMH=1` ->
+  `boot-m12-gx-rpmh.img`). `-DM12_OPP=1` boots GX at 257 MHz / lvl 0x40 instead of Linux's 710 MHz / 0x1a0.
 - `bash op6/build.sh m10` / `m11` -> `op6/out/boot-m10.img` / `boot-m11.img`. Variants:
   `SHIM_CFLAGS=-DGPU_RPMH=1` (GPU RSC handshake), `-DGMU_CHIPID=0x06030100u` (S9 value),
   `-DGPU_PDC_GFX=0x30050u` (Bergamota's gfx.lvl, only if cmd-db says so).
@@ -78,7 +84,7 @@ signature.
 
 ## 5. Test checklist (one `fastboot boot` each, nothing flashed)
 
-Before: phone in fastboot on USB. `fastboot boot op6/out/boot-m10-gmu.img` (then `boot-m11-hfi.img`; `*-rpmh.img` = built with `GPU_RPMH=1`). Each screen counts 60 s and reboots
+Before: phone in fastboot on USB. `fastboot boot op6/out/boot-m10-gmu.img` (then `boot-m11-hfi.img`, `boot-m12-gx.img`; `*-rpmh.img` = built with `GPU_RPMH=1`). Each screen counts 60 s and reboots
 (PSCI). A hang shows the last **PASSO** line; the watchdog bites 18 s after the last pet. A Qualcomm
 CrashDump screen needs a long power-key press (no damage, lesson from M7). Photograph the whole screen
 when "Tire uma foto" or a hang appears; if it reboots into something with pstore, `ramoops` keeps the
@@ -105,6 +111,24 @@ full log (`ramlog` at 0xac480000).
    **"O GMU CONVERSA POR HFI (INIT/VER/PERF/BW)"**. Any `FALHA fsr=...` line = the GMU hit an unmapped
    address (FAR tells which); `SEM RESPOSTA` without FALHA = GMU silent (try `boot-m11-hfi-rpmh.img`).
 
+**M12, success looks like** (`boot-m12-gx.img` first; `boot-m12-gx-rpmh.img` = same + GPU-RSC wake before the
+firmware and RSC sleep at the end):
+1. `GX antes gd=... cf=... sp=.. p=..` (GX as ABL left it; `cf` bit 16 = POWER_UP_COMPLETE, expected off),
+   `M11 SMMU+ATS ok, GMU 0xBABEFACE`, `RPMH ctrl=00000F11 pwr=..`.
+2. `VOTO opp 710MHz gx=N mx=N lvl=1A0`, then **`OOB BOOT ack NNNus i=40000000 ...`** (bit 30) and
+   `GX gd=... cf=0001.... sp=..` with `sp` bits 6/7 clear = the GMU powered GX. `SPTPRAC st=28 ... ligado`.
+3. `HFI INIT/VER/PERF/BW ok`, `OOB DCVS ack ...`, `DCVS return=00000000 ok`, `OOB GPU ack ...` (bit 24).
+4. `RBBM st=...` (F1 saw 0x00000001), `RBBM1-3`, `CP flt= st1= vbif=`, `SQE cntl= base=0` (no microcode yet;
+   a6xx has no readable SQE version register, Linux reads it from the firmware file),
+   `AO GMU d=~1920000 em ~100000us conta` (19.2 MHz), `AO CP v=... d=...` (`PARADO` is the F1 observation,
+   not a failure), **"A GX LIGOU: O NUCLEO DA GPU RESPONDE"**.
+5. `VBIF halt ack, solto`, `SLUMBER ack ...` with `p=0F`, `DESLIGA slumber ok (0xf)`, `GX fim ... cf=` bit 16
+   clear (or `GDSC desligado pela CPU` if the GMU left it on), countdown.
+- Failure readings: `OOB BOOT SEM ACK` = the GMU did not power GX (default image: try `-rpmh`; the GMU may need
+  the RSC awake to vote); `RECUSA <reg> w= r=` = a readback mismatch, the stage stopped before the next
+  step; `GX nao confirmada` = acked but gpucc/SPTPRAC disagree, core not read (photo the `GX` line);
+  hang on PASSO `10 nucleo` = GX reads stall (bus) -> watchdog; CrashDump = needs a long power press.
+
 ## 6. Risks (what these stages write outside the GPU block)
 
 - RPMh: nothing from the CPU (cmd-db reads only). With `GPU_RPMH=1` the GPU's own PDC sends its wake TCS
@@ -113,10 +137,20 @@ full log (`ramlog` at 0xac480000).
 - GPU SMMU: one context bank, up to two SMR/S2CR pairs, sCR0.CLIENTPD cleared if set. Not the apps SMMU.
 - The GMU DMA only after the ATS self-test passed; on any SMMU readback mismatch the stage stops before
   releasing the CM3. Both stages put the CM3 back in reset before the countdown.
+- **M12** adds: `GMU_RPMH_CTRL`=0xf11, so the **GMU firmware sends RPMh votes through the GPU RSC** (gfx.lvl
+  for GX at the highest OPP level 0x1a0, mx.lvl, cx.lvl; DDR/LLC as its BW table says - one zero level). The
+  CPU itself still votes nothing, writes no PMIC (the PM8005 GFX rail moves because AOSS aggregates the GMU's
+  vote), no apps SMMU, no SCM/TZ. CPU writes in the GPU block: GMU vote/OOB/DCVS registers, SPTPRAC control,
+  GX GDSCR retain-FF bit (Linux sptprac_disable), VBIF XIN halt/unhalt (only with GX confirmed on), and - only
+  if GX is still on after slumber - GX GDSC SW_COLLAPSE + clamp IO (`a6xx_gmu_stop`'s gxpd put).
+- Not done vs Linux: the CPU's own `gfx-mem` interconnect vote (`a6xx_gmu_set_initial_bw`: DDR is busy
+  anyway), LLCC activation, GMU interrupts (polled), and in `force_off` the GX bus clear / sw reset.
+- If the GMU dies mid-way its RPMh votes stay until the PSCI reboot (the countdown); a hung GX read is the
+  watchdog's job. Linux boots GX at the highest OPP on every resume; `-DM12_OPP=1` is the gentler variant.
 
 ## 7. Roadmap details for M12/M13 (from mainline legacy path, to verify on screen)
 
-- M12 order (a6xx_gmu_fw_start legacy): `GMU_RPMH_CTRL` |= 0xf11 (interface, LLC, DDR, MX, CX, GFX vote enable)
+- (done in m12.c; kept for reference) M12 order (a6xx_gmu_fw_start legacy): `GMU_RPMH_CTRL` |= 0xf11 (interface, LLC, DDR, MX, CX, GFX vote enable)
   in power_config, boot, then `gfx_rail_on`: `BOOT_SLUMBER_OPTION`(0x23f8)=0, `GX_VOTE_IDX`(0x23f9) =
   vote[7]&0xff, `MX_VOTE_IDX`(0x23fa) = (vote[7]>>8)&0xff, OOB BOOT_SLUMBER; `a6xx_sptprac_enable`
   (`GMU_GX_SPTPRAC_POWER_CONTROL` 0x81 = 0x778000, poll `SPTPRAC_PWR_CLK_STATUS` 0x50d0 until
@@ -132,4 +166,5 @@ full log (`ramlog` at 0xac480000).
 
 - 2026-11-10 M10 (boot-m10-gmu.img): **GMU firmware runs, init=0xBABEFACE**; 8192 words loaded, 0 errors; DTCM readback 600D0001 0A110002; CX gdscr=F8222000. cmd-db on the OP6: **gfx.lvl = 0x30050** (levels 000,010,030,040,080,0C0,100,140,180,1A0), cx.lvl = 0x30000, mx.lvl = 0x30010, **0x30080 = xo.lvl** (so mainline's GPU PDC TCS address 0x30080 is NOT gfx on this firmware; the -rpmh variants must use 0x30050 before being tried). BW BCMs: MC0 SN7 ACV SH2 SN15 SN3.
 - 2026-11-10 M11 (boot-m11-hfi.img): **GPU SMMU + HFI work**. GPU SMMU idr0=48016605 (5 SMR, 5 CB, 4K pages, ATOS), no SMR valid before; CB with TTBR0=0x8009f000, cbar=0001F300 sctlr=1027 tcr=00802019; SID 5 and 4 mapped; ATOS VA 0x60009000 -> HFI buffer PA 0x80092B80 OK. GMU init=0xBABEFACE under the SMMU, HFI status=1, **GMU firmware v1.6 (0x10060000)**; H2F INIT, FW_VERSION, PERF_TABLE, BW_TABLE, TEST all ACKed (seq 1-5). No CrashDump.
+- 2026-11-10 M12 written (`boot-m12-gx.img`, `boot-m12-gx-rpmh.img`), not yet run.
 - Next: M12 = GX power through the GMU OOB (GPU core registers readable: RBBM_STATUS, CP_ALWAYS_ON), then M13 zap via TZ + SQE microcode + CP NOP/MEM_WRITE through the GPU SMMU.
