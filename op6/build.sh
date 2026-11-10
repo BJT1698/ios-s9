@@ -2,11 +2,13 @@
 # Build the OnePlus 6 (enchilada) shim and wrap it the way OnePlus ABL
 # expects a kernel: boot.img header v0, Image.gz with the DTB appended
 # (same layout pmOS uses, see /usr/share/deviceinfo/deviceinfo on the phone).
-#   ./build.sh [m1|m2|m8|m5|m7|m10|m11|m12] stage (default m1)
+#   ./build.sh [m1|m2|m8|m5|m7|m10|m11|m12|m13] stage (default m1)
 #   m10/m11/m12 embed shim/fw_a630_gmu.h if present (tools/gpu-fw-embed.py; git-ignored)
 #   SHIM_CFLAGS=-DGPU_RPMH=1 ./build.sh m11  GPU-RSC wake handshake as mainline (see GPU-NOTES.md)
 #   m12 = GX on through the GMU; PDC TCS cmd2 = 0x30080 as Linux unless SHIM_CFLAGS sets GPU_PDC_CMD2,
 #   -DM12_OPP=1 boots GX at the lowest OPP instead of Linux's highest
+#   m13 = m12 + zap shader via TZ (PAS 13) + CP ringbuffer (ME_INIT, NOP, MEM_WRITE); also embeds
+#   shim/fw_a630_sqe.h + fw_a630_zap.h (tools/gpu-fw-embed-cp.py; git-ignored); -DM13_STOP=1 stops after zap auth
 #   SHIM_CFLAGS=-DM7_SMMU=0 ./build.sh m7    extra compiler flags (M7: only report the SMMU)
 #   PAYLOAD=out/payload.bin ./build.sh m4   XNU payload as the ramdisk
 # Test with: fastboot boot out/boot.img   (nothing is flashed)
@@ -32,9 +34,17 @@ m10) main="m10.c gpu.c con.c plat.c rpmh.c i2c_bb.c" ;;
 m11) main="m11.c gpu.c con.c plat.c rpmh.c i2c_bb.c" ;;
 m12) main="m12.c gpu.c con.c plat.c rpmh.c i2c_bb.c"
      case "${SHIM_CFLAGS:-}" in *GPU_PDC_CMD2*) ;; *) CFLAGS="$CFLAGS -DGPU_PDC_CMD2=0x30080u" ;; esac ;;
+m13) main="m13.c gpu.c con.c plat.c rpmh.c i2c_bb.c"
+     case "${SHIM_CFLAGS:-}" in *GPU_PDC_CMD2*) ;; *) CFLAGS="$CFLAGS -DGPU_PDC_CMD2=0x30080u" ;; esac
+     # m13.c writes the zap into the DT carve-out: the DT we append must still say 0x8c415000 + 0x2000
+     grep -A1 'gpu@8c415000 {' "$DTS" | grep -q 'reg = <0x00 0x8c415000 0x00 0x2000>;' ||
+	{ echo "m13: $DTS has no gpu@8c415000 0x2000 zap carve-out (m13.c ZAP_PHYS/ZAP_SIZE)" >&2; exit 1; }
+     for h in fw_a630_gmu.h fw_a630_sqe.h fw_a630_zap.h; do
+	[ -f "shim/$h" ] || echo "m13: shim/$h missing: the image will only show SEM FIRMWARE" >&2
+     done ;;
 m4) main="m4.c con.c plat.c loader.c i2c_bb.c rpmh.c"
     [ -f "${PAYLOAD:-}" ] || { echo "m4 needs PAYLOAD=path/to/payload.bin" >&2; exit 2; } ;;
-*) echo "usage: build.sh [m1|m2|m8|m5|m7|m10|m11|m12|m4]" >&2; exit 2 ;;
+*) echo "usage: build.sh [m1|m2|m8|m5|m7|m10|m11|m12|m13|m4]" >&2; exit 2 ;;
 esac
 
 mkdir -p out/obj

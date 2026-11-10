@@ -117,13 +117,14 @@
 #define VBIF_XIN_HALT_CTRL1	0x3081
 
 static int booted, gx_boot, gpu_set, gx_on;
+static int m12_hush;	/* m13 sets it: M12's lines go to the ramlog (and the quiet ring) only */
 
 /* say() even while gpu_quiet hides the M11 part */
 static void tell(const char *label, const char *s)
 {
 	int q = gpu_quiet;
 
-	gpu_quiet = 0;
+	gpu_quiet = m12_hush;
 	say(label, s);
 	gpu_quiet = q;
 }
@@ -440,6 +441,7 @@ static void drop(void)
 	gx_gdsc_off();
 }
 
+#ifndef M12_LIB	/* m13.c includes this file for everything up to GX held on */
 void shim_main(uint64_t dtb)
 {
 	char b[96], *p;
@@ -532,3 +534,4 @@ out:
 	say("", "Tire uma foto desta tela!");
 	countdown_reboot(con_row(), END_SECONDS);
 }
+#endif

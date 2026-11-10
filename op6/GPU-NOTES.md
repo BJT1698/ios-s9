@@ -2,7 +2,7 @@
 
 Labels: **[V]** verified by reading the source or DT named next to it, **[HW-S9]** proven on the Galaxy S9
 hardware (same SDM845 / A630 v2), **[HW-F1]** proven on a Poco F1 by Bergamota (facts only, no licence),
-**[I]** inferred, **[?]** unknown until the phone answers. M10 and M11 ran on the OP6 (see "Device results"); M12 has not run yet.
+**[I]** inferred, **[?]** unknown until the phone answers. M10, M11 and M12 ran on the OP6 (see "Device results"); M13 has not run yet.
 
 Sources: OP6 live DT `../op6-live.dts` (mainline `sdm845.dtsi` + `sdm845-oneplus-common.dtsi` as pmOS boots
 it); Linux v6.6 `drivers/gpu/drm/msm/adreno/a6xx_gmu.c`, `a6xx_hfi.c/.h`, `a6xx_gmu.xml.h`, `a6xx.xml.h`,
@@ -17,7 +17,7 @@ it); Linux v6.6 `drivers/gpu/drm/msm/adreno/a6xx_gmu.c`, `a6xx_hfi.c/.h`, `a6xx_
 | **M10** | CX GDSC + GMU clocks 200 MHz, DTCM test, RSC/PDC micro-code, `a630_gmu.bin` into ITCM, CM3 out of reset -> `0xBABEFACE` | written, builds; S9 same stage passed first time [HW-S9] |
 | **M11** | M10 + GPU SMMU (tables, free CB, SID 5/4 rules, ATS1PR self-test) + boot with `HFI_QTBL_ADDR` + HFI v1: INIT, FW_VERSION, PERF_TABLE, BW_TABLE, TEST | written, builds; S9 M11 was flashed but never confirmed; the OP6 one follows mainline instead (sec. 2) |
 | **M12** | M11 + GX on through the GMU, Linux v6.6 legacy order: `GMU_RPMH_CTRL`=0xf11 at boot, `BOOT_SLUMBER_OPTION=0` + `GX_VOTE_IDX`/`MX_VOTE_IDX` (highest OPP), OOB `BOOT_SLUMBER` (bit 22 / ack 30), SPTPRAC on, then HFI, DCVS OOB, OOB `GPU_SET` (16/24); read-only core probes; Linux shutdown (VBIF halt, notify_slumber, POWER_STATE 0xf) and CM3 reset | written, builds (sec. 5); the first GX power-up on the OP6 [HW-F1 sweetgpu=5] |
-| M13 | zap shader via TZ (PAS id 13), CP: `a630_sqe.fw`, ringbuffer, `CP_ME_INIT`, leave secure mode, NOP + MEM_WRITE through the GPU SMMU (SID 0) | todo [HW-F1 etapa 8] |
+| **M13** | M12 (quiet) + zap shader via TZ (PAS 13: init_image / mem_setup / auth_and_reset), CP: `a630_sqe.fw`, own GPU SMMU context (SID 0, CB 0, 4K PTEs), a630 hw_init subset, ringbuffer, `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`, NOP + `CP_MEM_WRITE 0xC0FFEE01` (sec. 8) | written, builds; not run [HW-F1 etapa 8] |
 | D | XNU driver (msm-like ioctls, HackiOS kernel is APSL and reusable with notice), GPU kept on | todo |
 | E/F | Mesa freedreno a630 + fake libdrm + our EAGL in backboardd (iOS 16 uses GLES natively when Metal is absent, `s9/ESTUDO` sec. 2), then Metal (Chlorophyll, MIT) | todo |
 
@@ -65,6 +65,12 @@ kgsl DT + msm-4.9, OP6 = mainline DT + msm DRM) and a few S9 M11 mistakes.
   before the CM3 is released), `gpu_rpmh_stop()`, `GPU_PDC_CMD2`.
 - `bash op6/build.sh m12` -> `boot-m12.img` (renamed to `boot-m12-gx.img`; `SHIM_CFLAGS=-DGPU_RPMH=1` ->
   `boot-m12-gx-rpmh.img`). `-DM12_OPP=1` boots GX at 257 MHz / lvl 0x40 instead of Linux's 710 MHz / 0x1a0.
+- `m13.c` - `#include "m12.c"` (with `M12_LIB`; m12.c gained `m12_hush`, 0 = unchanged M12 behaviour) + zap + CP.
+  `op6/tools/gpu-fw-embed-cp.py <a630_sqe.fw> <a630_zap.mbn>` writes `shim/fw_a630_sqe.h` + `fw_a630_zap.h`
+  (git-ignored by `op6/.gitignore`; `--remove`). Without any of the three headers m13 builds and says
+  `SEM FIRMWARE: ...` before powering or writing anything. `bash op6/build.sh m13` also checks that the appended
+  DT still has `gpu@8c415000` 0x2000. Images: `boot-m13-cp.img` (full), `boot-m13-zap.img` (`-DM13_STOP=1`:
+  stops right after `auth_and_reset`, no CP).
 - `bash op6/build.sh m10` / `m11` -> `op6/out/boot-m10.img` / `boot-m11.img`. Variants:
   `SHIM_CFLAGS=-DGPU_RPMH=1` (GPU RSC handshake), `-DGMU_CHIPID=0x06030100u` (S9 value),
   `-DGPU_PDC_GFX=0x30050u` (Bergamota's gfx.lvl, only if cmd-db says so).
@@ -156,11 +162,91 @@ firmware and RSC sleep at the end):
   (`GMU_GX_SPTPRAC_POWER_CONTROL` 0x81 = 0x778000, poll `SPTPRAC_PWR_CLK_STATUS` 0x50d0 until
   `& 0x38 == 0x28`); OOB BOOT_SLUMBER = set bit 22, ack/clear bit 30 [V a6xx_gmu.c]; then HFI as M11;
   then OOB GPU and the first `RBBM_STATUS` (0x210) read. Needs `GPU_RPMH=1` behaviour.
-- M13: SMC `qcom_scm_pas_init_image/mem_setup/auth_and_reset` with PAS 13 on the zap loaded at 0x8c415000
+- (done in m13.c, sec. 8) M13: SMC `qcom_scm_pas_init_image/mem_setup/auth_and_reset` with PAS 13 on the zap loaded at 0x8c415000
   (outside XNU RAM, which starts at 0xae000000), `a630_sqe.fw` into a 4K-paged SMMU mapping for SID 0
   (GPU pages are 4K, XNU's 16K: one PTE per 4K [HW-F1]), ring + `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`,
   NOP + `CP_MEM_WRITE`; read CP_ALWAYS_ON through the GMU always-on counter (CPU-side read looked frozen
   on the F1 [HW-F1]).
+
+## 8. M13 (zap + CP) - sequence, screen, risks
+
+Sources (facts only): Linux v6.6 `drivers/soc/qcom/mdt_loader.c`, `drivers/firmware/qcom_scm.c`, `qcom_scm.h`,
+`qcom_scm-smc.c`, `drivers/gpu/drm/msm/adreno/adreno_gpu.c` (zap_shader_load_mdt, adreno_fw_create_bo),
+`a6xx_gpu.c` (hw_init, a6xx_cp_init, a6xx_ucode_check_version, a6xx_flush/idle), `a6xx.xml.h`,
+`adreno_pm4.xml.h`, `arm-smmu-qcom.c` behaviour (GPU on CB 0, SCTLR.HUPCF) from memory [I].
+
+**Zap facts [V]:** `a630_zap.mbn` = ELF32 Hexagon, 3 phdrs: [0] NULL 0x94 (ELF + phdrs), [1] hash (flags 0x02200000)
+file 0x1000 + 0x1988, [2] PT_LOAD paddr 0x5000 filesz = memsz 0x7b0, flags 0x08000007 (bit 27 = relocatable).
+`qcom_mdt_get_size` = 0x1000 (4K-aligned) <= DT 0x2000: fits. Metadata = 0x94 + 0x1988 = 0x1a1c bytes (hash
+read from p_offset, the file is not split). The code segment lands at 0x8c415000 + 0 (relocated to min paddr).
+
+**Sequence** (each step on screen + ramlog before it runs):
+1. M11 + M12 exactly as M12 (ramlog only; on failure the last 6 lines are shown) except: GMU context bank moves
+   off CB 0 (CB 0 is kept for the GPU, as arm-smmu-qcom does) -> one line `M12 GX 710MHz GPU_SET ok RBBM st=.. gmu cbN`.
+2. **Z1-Z7 zap** (SMC64, SIP, std call; x0 = 1 INTERRUPTED re-issued with x0 = 1 + x6 as returned, -12 EBUSY retried
+   20x / 30 ms; success = x0 == 0 && x1 == 0):
+   | step | x0 | x1 (arginfo) | x2.. | Linux |
+   |---|---|---|---|---|
+   | Z2 convention probe (fast) | 0xC2000601 | 0x01 | 0x02000601 | `__get_convention` (expects x1 = 1) |
+   | Z3 is_call_available | 0x42000601 | 0x01 | 0x02000207 | `__qcom_scm_is_call_available` (info only) |
+   | Z3 pas_supported | 0x42000207 | 0x01 | 13 | `qcom_scm_pas_supported` (info only) |
+   | Z4 init_image | 0x42000201 | 0x82 (VAL, RW) | 13, PA of 4K-aligned metadata buffer | `qcom_scm_pas_init_image` |
+   | Z5 mem_setup | 0x42000202 | 0x03 | 13, 0x8c415000, 0x1000 | `qcom_scm_pas_mem_setup` (relocatable) |
+   | Z6 (CPU) copy 0x7b0 bytes to 0x8c415000, read back | - | - | - | `__qcom_mdt_load` |
+   | Z7 auth_and_reset | 0x42000205 | 0x01 | 13 | `qcom_scm_pas_auth_and_reset` |
+   No `set_remote_state`: in v6.6 `a6xx_zap_shader_init` loads once per boot and never sends
+   SCM_GPU_ZAP_SHADER_RESUME. Order differs from Linux (which loads the zap after CP_ME_INIT) and matches kgsl
+   (zap before the CP starts); Linux and kgsl both work, GX is held on by OOB GPU_SET in either case.
+   Any refusal: stop -> OOB clear, M12 shutdown, countdown.
+3. **C1-C8 CP:** SQE (file minus word 0, 8546 words, version word & 0xfff = 0x207 >= 0x190 so CP_WHERE_AM_I is used)
+   at GPU VA 0x01000000 (read-only PTEs), ring 32 KiB at 0x01010000, scratch page at 0x01020000 (rptr shadow +0,
+   magic +0x100); GPU context bank (CB 0), S1 39-bit 4K, TTBR0 only, SCTLR M|TRE|AFE|CFRE|ASIDPNE|HUPCF,
+   SMR/S2CR SID 0 (mask 0), **sCR0.USFCFG set** (unmatched SIDs fault instead of bypassing to PA = VA; only when
+   both GMU SIDs 5 and 4 have rules), ATS1PR of ring and SQE+0x8000 must give the buffers' PAs (when ATOS exists). hw_init a630 subset (sec. table in m13.c: SECVID_TSB 0, 12x
+   ADDR_MODE_CNTL = 1, VBIF QoS 3, VBIF_GATE_OFF_WRREQ_EN 9, UCHE ranges/filter/ways, ROQ thresholds, MEM_POOL 128,
+   PC_DBG_ECO 0x180000, CP_AHB_CNTL 1, UBWC NC modes (hbb_lo 2), hang detect, UCHE_CLIENT_PF); not done: hwcg, perf
+   counters, CP protect (left off), RBBM_INT_0_MASK (polled). CP_SQE_INSTR_BASE, CP_RB_BASE, CP_RB_CNTL =
+   0x0800020c (BUFSZ 12, BLKSZ 2, NO_UPDATE), CP_RB_RPTR_ADDR (read back, refuse on mismatch), CP_SQE_CNTL = 1,
+   ring: `CP_ME_INIT` (0x70c80008 + 0x2f, 3, 0x20000000, 0 x5) + `CP_WHERE_AM_I` -> idle; `CP_SET_SECURE_MODE 0`
+   (0x70e60001, 0) -> idle; `CP_NOP` + `CP_MEM_WRITE` (0x703d8003, 0x01020100, 0, 0xC0FFEE01) -> idle, then the
+   scratch word is polled 100 ms. Idle = CP_RB_RPTR == WPTR, shadow == WPTR, RBBM_STATUS only bit 0, no hang irq.
+4. Fault dump (GPU CB FSR/FAR/FSYNR0, GFSR/GFSYNR0/GFSYNR1 = SID), OOB clear, M12 shutdown, CM3 reset, countdown.
+
+**Expected screen (success, `boot-m13-cp.img`):** `M12 GX 710MHz GPU_SET ok RBBM st=00000001 gmu cb1`;
+`ZAP n=3 hash=1 load=1 rel tam=1000/2000`, `ZAP meta 1A1C pa=... w0=464C457F`; `SCM conv a0=00000000
+a1=00000001 ... ok`, `SCM disp`, `SCM sup13` (info), `SCM init a0=00000000 a1=00000000 ... ok`, `SCM mem ... ok`,
+`ZAP copiado 07B0 bytes, erradas=0`, `SCM auth ... ok`, **`ZAP ACEITO PELO TRUSTZONE (PAS 13)`**,
+`SMMU pos-zap smr validos=2 cb on=02 cr0=...` (anything else = TZ touched the GPU SMMU); `SQE ver=207
+palavras=8546 erradas=0`, `SMMU cb0 sid0 smrN gmu cb1 cr0 X>Y` (Y has bit 10), `ATS anel ... sqe+8000 ...`,
+`INIT escritas=41 nao lidas=4 diferentes=N` (N > 0 is logged, not fatal), `CP rptr=0 wptr=0 cntl=0800020C`,
+`ME_INIT rptr=12 sombra=12 wptr=12 st=00000001 ...us ok`, `SECURE0 rptr=17 sombra=17 wptr=17 ... ok`,
+`MEMWRITE rptr=26 ... ok`, `MEM valor=C0FFEE01 ...`, **"O CP ESCREVEU C0FFEE01 NA RAM PELA SMMU"** = success;
+then `VBIF halt ack, solto`, `SLUMBER ack`, `DESLIGA slumber ok (0xf)`, `GX fim ...`, countdown.
+`boot-m13-zap.img` ends after `ZAP ACEITO` with `13 M13_STOP: CP nao iniciado` and the same shutdown.
+
+**Failure readings:** `SCM conv` not ok = TZ does not speak SMC64/SIP to us (QHEE?); `SCM init ... RECUSA` = TZ
+refused the metadata (wrong OEM signature / PAS 13 state); `SCM auth ... RECUSA` = image refused; `ZAP ...
+erradas` = carve-out not writable; `TEMPO` lines after ME_INIT = the CP did not consume the ring (with `FALHA
+fsr=... far=...` = GPU SMMU fault at that VA; `gsyn1(sid)=` = an unmatched stream ID, e.g. a secure SID);
+`sombra=0` with `rptr` advancing = CP runs but its writes do not land; `valor=00000000` after `MEMWRITE ok` = the
+write went elsewhere.
+
+**Risks (M13 on top of M12's sec. 6):**
+- TZ: three PAS SMCs + three info SMCs. A rejected image is harmless (Linux tolerates it). An accepted zap stays
+  loaded until the PSCI reboot. A wrong address/size in mem_setup is refused by TZ, not fatal.
+- Memory outside the GPU block: the carve-out 0x8c415000..0x8c4157af (written before auth, never read or written
+  after: TZ locks it - touching it would be an XPU violation -> Qualcomm CrashDump, long power press); the shim's
+  own 4K-aligned metadata buffer is lent to TZ during init_image (not touched afterwards). If ABL/TZ already
+  protected the carve-out, the Z6 write faults (panic screen or CrashDump).
+- GPU SMMU: a second context bank (CB 0), one more SMR/S2CR (SID 0), sCR0.USFCFG set (Linux's default; skipped if
+  the SID 4 rule is missing). If the GMU uses some other SID that used to bypass, it now faults (`FALHA gsyn1`).
+- Independent review (2026-11-10, Opus, against the v6.6 sources): no crash finding; fixed: ATS gated on ATOS,
+  USFCFG gated on SID 4/5 rules, no CB fault read before gpu_ctx, convention probe requires x1 == 1. Open: WAITQ_SLEEP
+  (x0 = 2) is reported as a failure (no resume), as is INTERRUPTED after 1M resumes.
+- GPU DMA: only inside the three mapped buffers (SQE read-only); unmatched SIDs fault instead of bypassing.
+  Never touched: RBBM_SECVID_TRUST_CNTL (secure; Linux writes it only without a zap), the apps SMMU, PMIC, CPU RPMh.
+- A CP that never goes idle is left as is (Linux does not stop the CP either); the M12 shutdown collapses GX.
+  Its VBIF halt may then report `SEM ack` (logged, the stage continues).
 
 ## Device results
 
