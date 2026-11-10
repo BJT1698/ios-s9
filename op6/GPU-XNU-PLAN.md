@@ -1,12 +1,14 @@
 # OnePlus 6 GPU in XNU (Adreno 630): architecture and milestones
 
-Status 2026-11-10: **G1 and G2 verified on device** (`xnu/patches/0107-op6-gpu-bringup.patch` +
-`xnu/patches/0108-op6-gpu-userclient.patch`, copies in `op6/xnu-patches/`, and `s9/ios-tools/sweetgpu-test.c`).
-With `boot-G2.img` (CI run `42847871854`, `sweetgpu=2 sweetgpudelay=30`), `SweetGPU` stays powered on
-(`SweetGPUStage=7`, `SweetGPUMagic=3237998081` = `0xC0FFEE01`, `SweetGPUState="on"`) and userland
-`/var/root/sweetgpu-test` passes `GET_PARAM`, BO alloc/map (`0x10000000`, `0x10004000`), single IB submit
-(`dst[0]=0xC0FFEE02` in 69 us), 100-submit stress loop (53 us/submit), and 1000-submit ring-wrap loop
-(51 us/submit, fences 1..1102, 0 SMMU faults). Next: G3 (Mesa freedreno + libdrm shim).
+Status 2026-11-10: **G1, G2, and G3 verified on device** (`xnu/patches/0107-op6-gpu-bringup.patch` +
+`xnu/patches/0108-op6-gpu-userclient.patch`, copies in `op6/xnu-patches/`, `op6/mesa/`,
+`s9/ios-tools/sweetgpu-test.c`, and `s9/ios-tools/sweet-gl-test.c`).
+With `boot-G3.img` (`sweetgpu=2 sweetgpudelay=30`, `--gpu-dma 0xa0000000,0x04000000` 64 MiB carve-out),
+`SweetGPU` stays powered on (`SweetGPUStage=7`, `SweetGPUMagic=3237998081` = `0xC0FFEE01`,
+`SweetGPUState="on"`), `/usr/local/lib/libOSMesa.8.dylib` (Mesa 25.0.7 `freedreno` + `sweet-drm`) initializes
+`FD630; OpenGL ES 3.2 Mesa 25.0.7`, and `/var/root/sweet-gl-test` passes 256x256 FBO `glClear` + `glReadPixels`
+(`51 102 204 255`, 491 us), `ir3` shader RGB triangle draw + readback (`17086/65536` = 26% pixels), and
+500-frame loop (180 us/frame, 0 SMMU faults: `MESA DRAWS WITH THE GPU`). Next: G4 (EAGL bridge in backboardd).
 
 Labels: **[V]** read in source/DT or verified on the device, **[I]** inferred, **[?]** open.
 
@@ -246,7 +248,7 @@ freedreno:
   zap. Otherwise the reviewer found the sequence identical to m13. Left out on purpose: the read-only RSC
   probes and `smmu_after_zap`.
 
-## 6. Files (G1 + G2)
+## 6. Files (G1 + G2 + G3)
 
 - `xnu/patches/0107-op6-gpu-bringup.patch` (+ copy `op6/xnu-patches/`):
   - new `bsd/dev/sweet_gpu.c` (hardware sequence) and `iokit/Kernel/arm/SweetGPU.cpp` (service + thread
@@ -268,9 +270,17 @@ freedreno:
   - opens `SweetGPU`, prints registry properties and `GET_PARAM` values, allocates command + destination BOs,
     maps them via `IOConnectMapMemory64`, submits an indirect buffer with `CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`,
     waits via `WAIT_FENCE`, verifies readback, and runs a 100-submit stress loop (`-n COUNT`).
+- `op6/mesa/` + `s9/ios-tools/sweet-gl-test.c` + `.github/workflows/op6-mesa.yml` (G3):
+  - `op6/mesa/build.sh` + `patches/0001-freedreno-darwin.patch` + `patches/0002-osmesa-es-profile.patch`:
+    cross-builds Mesa 25.0.7 (`libOSMesa.8.dylib`: Gallium `freedreno` + `softpipe`, `OSMESA_ES_PROFILE`).
+  - `op6/mesa/sweet-drm/sweet_drm.c` + `xf86drm.h`: `libdrm` stand-in over `SweetGPUUserClient` (`msm` 1.7).
+  - `s9/ios-tools/sweet-gl-test.c`: verifies `FD630` hardware GLES context, 256x256 FBO `glClear` + `glReadPixels`,
+    `ir3` shader compilation + RGB triangle draw + readback, and N-frame benchmark with `MSM_PARAM_FAULTS == 0`.
 - `op6/tools/mkadt-op6.py`: `--gpu-fw DIR`, `--gpu-dma PA,SIZE` (`/sweet-gpu` node; sha256 and overlap
   checks).
 - Origin of the code: our shim (`op6/shim/gpu.c`, `m10.c`-`m13.c`, `rpmh.c`; ios-op6, MIT); G2 uAPI
   dispatch and ring submission reference `oosexgang/hackios-xnu-kernel` @ `63fc2b4` (`drivers/gpu/hakios.adreno.c`
-  and `drivers/gpu/hakios.gpu.cpp`, APSL 2.0) and Mesa's `drm-uapi/msm_drm.h` (MIT). No code is copied from
-  guacamole (no licence), Linux (GPL) or Bergamota (no licence).
+  and `drivers/gpu/hakios.gpu.cpp`, APSL 2.0) and Mesa's `drm-uapi/msm_drm.h` (MIT); G3 `op6/mesa/` and
+  `sweet-gl-test.c` are adapted from HackiOS `tools/mesa/` (`Copyright (c) 2026 OOSEX GANG`, MIT) and
+  `aTechGeekDev/ios-apollo` `userland/mesa/` (`Copyright (c) 2026 Leo Malik / dipa-studio`, MIT). No code is
+  copied from guacamole (no licence), Linux (GPL) or Bergamota (no licence).

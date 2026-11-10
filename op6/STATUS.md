@@ -24,5 +24,6 @@ Labels: device-verified unless noted.
 
 | 2026-11-10 | GPU G1 (XNU) | kernel driver (0107) powers the A630 during iOS boot, zap + CP_MEM_WRITE 0xC0FFEE01, GPU back off; iOS unaffected |
 | 2026-11-10 | GPU G2 (XNU) | `SweetGPUUserClient` (0108, `sweetgpu=2`): `SweetGPUMagic=3237998081` (`0xC0FFEE01`), `SweetGPUState="on"`; userland `sweetgpu-test` allocates/maps carve-out BOs (`0x10000000`, `0x10004000`), submits IB `CP_NOP` + `CP_MEM_WRITE` `0xC0FFEE02` (69 us), and passes 100-submit (53 us/submit) + 1000-submit ring-wrap (51 us/submit) loops with 0 faults |
+| 2026-11-10 | GPU G3 (Mesa) | Mesa 25.0.7 `libOSMesa.8.dylib` (`freedreno` `FD630`, OpenGL ES 3.2) + `sweet-drm` shim + `/var/root/sweet-gl-test` on `boot-G3.img` (`--gpu-dma 0xa0000000,0x04000000` 64 MiB carve-out): `glClear(0.2, 0.4, 0.8, 1.0)` + `glReadPixels` exact match (`51 102 204 255` in 491 us), `ir3` vertex/fragment shader RGB triangle draw + readback verified (`17086/65536` = 26% pixels, corner `26 26 51 255`), 100-frame (207 us/frame) and 500-frame (180 us/frame, ~5555 fps) loops pass with `faults 0; error 0: MESA DRAWS WITH THE GPU` |
 
-Next: G3 Mesa freedreno, G4 EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+Next: G4 EAGL bridge in backboardd (CoreAnimation on the GPU), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.

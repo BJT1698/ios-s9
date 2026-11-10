@@ -22,7 +22,7 @@ Read these first, in this order: this file, `op6/STATUS.md` (what has been verif
 ### GPU (Adreno 630)
 
 - **Bare-metal shim:** M10 GMU boot, M11 GPU SMMU + HFI, M12 GX on, M13 zap via TZ + CP `CP_MEM_WRITE` 0xC0FFEE01.
-- **Inside XNU:** G1 (patch 0107, bring-up + power-off) and **G2** (patch 0108, `SweetGPUUserClient` msm DRM uAPI subset, BO carve-out allocator, `CP_INDIRECT_BUFFER` + fence completion, verified from iOS userland with `sweetgpu-test`).
+- **Inside XNU:** G1 (patch 0107, bring-up + power-off), **G2** (patch 0108, `SweetGPUUserClient` msm DRM uAPI subset, BO carve-out allocator, `CP_INDIRECT_BUFFER` + fence completion, verified with `sweetgpu-test`), and **G3** (Mesa 25.0.7 `libOSMesa.8.dylib` `freedreno` `FD630` OpenGL ES 3.2 + `op6/mesa/sweet-drm/` shim + `sweet-gl-test`: 256x256 FBO `glClear` + `ir3` RGB triangle draw + `glReadPixels` + 500-frame benchmark at 180 us/frame, 0 SMMU faults).
 
 ### Not working
 
@@ -79,7 +79,8 @@ debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata uf
 |---|---|
 | `boot-D.img` | iOS + USB + SSH, no GPU |
 | `boot-G1.img` | as boot-D, plus the GPU test at boot (`sweetgpu=1`, shuts GPU down after test) |
-| `boot-G2.img` | as boot-D, plus `SweetGPUUserClient` (`sweetgpu=2`, leaves GPU on for userland msm uAPI) |
+| `boot-G2.img` | as boot-D, plus `SweetGPUUserClient` (`sweetgpu=2`, 16 MiB GPU carve-out) |
+| `boot-G3.img` | as boot-G2, with 64 MiB GPU carve-out (`--gpu-dma 0xa0000000,0x04000000`) for Mesa `freedreno` |
 | `pmos-debugshell.img` | pmOS kernel with a debug shell |
 | `boot-m5/m7-smmu/m10-gmu/m11-hfi/m12-gx/m13-zap/m13-cp.img` | bare-metal shim stages |
 
@@ -122,7 +123,7 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - The CP always-on counter does count on the OP6.
 - **First iOS boot** on a new root takes about 30 minutes on the Apple logo (data migration). Later boots take a few minutes.
 
-## 5. Status of GPU G2 (verified on device 2026-11-10)
+## 5. Status of GPU G2 + G3 (verified on device 2026-11-10)
 
 - **G2 verified on device (`boot-G2.img`, CI run `42847871854`, `sweetgpu=2 sweetgpudelay=30`)**:
   - **Patch `xnu/patches/0108-op6-gpu-userclient.patch`** (and copy in `op6/xnu-patches/0108-op6-gpu-userclient.patch`):
@@ -133,11 +134,18 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
     - Verified `GEM_NEW` + `GEM_INFO(GET_IOVA)` + `IOConnectMapMemory64` (`cmd BO` at `iova=0x10000000`, `dst BO` at `iova=0x10004000`, `map_size=0x4000`).
     - Verified single IB submit (`CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`) + `WAIT_FENCE`: `fence=1`, `69 us`, `dst[0]=0xc0ffee02`.
     - Verified 100-submit loop (`fences=2..101`, `53 us/submit`) and 1000-submit ring-wrap loop (`fences=103..1102`, `51 us/submit`, `FAULTS=0`), plus BO/PTE/TLB cleanup on `clientClose`.
+- **G3 verified on device (`boot-G3.img`, `--gpu-dma 0xa0000000,0x04000000` 64 MiB carve-out)**:
+  - **Mesa 25.0.7 (`op6/mesa/`, `.github/workflows/op6-mesa.yml`, installed at `/usr/local/lib/libOSMesa.8.dylib`)**:
+    - Gallium `freedreno` (`FD630`, Adreno 630) + `softpipe` fallback + `OSMESA_ES_PROFILE` (OpenGL ES 3.2), talking to `SweetGPUUserClient` through `op6/mesa/sweet-drm/sweet_drm.c` (`msm` DRM 1.7 softpin).
+  - **OpenGL ES 2 CLI test (`s9/ios-tools/sweet-gl-test.c`, installed at `/var/root/sweet-gl-test`)**:
+    - Reports `freedreno; FD630; OpenGL ES 3.2 Mesa 25.0.7 (the GPU)`.
+    - 256x256 RGBA FBO `glClear(0.2, 0.4, 0.8, 1.0)` + `glReadPixels`: `pixel[0]=51 102 204 255 (CLEAR OK)` in 491 us.
+    - `ir3` vertex + fragment shader compile, RGB triangle draw + `glReadPixels`: corner `26 26 51 255`, red `213 22 20 255`, green `22 213 20 255`, blue `14 15 226 255`, coverage `17086/65536` (26% by geometry); output saved to `op6/out/sweet-gl-triangle.ppm`/`.png`.
+    - 100-frame (`207 us/frame`) and 500-frame (`180 us/frame`, ~5555 fps) render loops pass with `faults 0; error 0: MESA DRAWS WITH THE GPU`.
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
-- **G3:** Mesa gallium freedreno (it supports only the msm uAPI, not KGSL) cross-built for arm64-iOS on top of a fake libdrm that talks to the SweetGPU user client. HackiOS has an MIT `hakios.drm.c` you can start from. First test: GLES clear + readback over SSH.
-- **G4:** EAGL bridge inside backboardd, so that CoreAnimation renders through Mesa. backboardd looks up `IOAcceleratorES`, `IOAcceleratorESLegacy` and `AGXAccelerator`. Read s9/ESTUDO-2026-10-25-gpu.md section 2.
+- **G4:** EAGL bridge inside backboardd (`libsweet-gl.dylib` + `libsweet-ca.dylib` + kernel selector `0x7e` IOSurface import), so that CoreAnimation renders through Mesa on the Adreno 630. Read `s9/ESTUDO-2026-10-25-gpu.md` section 2.
 - **G5:** GPU IRQs (SPI 300 / INTID 332, GMU 336/337, SMMU 396-403; the SWEET GIC code only handles the timer and SGIs), slumber, hang recovery.
 - **G6:** Metal (Chlorophyll is MIT; Turnip + metal2vulkan as in flame).
 - **Smaller jobs:**
