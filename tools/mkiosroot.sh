@@ -80,7 +80,33 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	# rsync >= 3.5 tries to chmod symlinks; Linux cannot (EOPNOTSUPP) and rsync
+	# then exits 23. Accept exactly that: every error must be such a chmod
+	# failure on a path that is a symlink on the destination.
+	local log rc=0
+	log=$(mktemp)
+	sudo rsync -aH --numeric-ids "$1/" "$2/" 2> >(tee "$log" >&2) || rc=$?
+	sleep 1	# let tee flush
+	if [[ $rc == 23 ]]; then
+		local bad=0 n=0 p
+		while IFS= read -r line; do
+			if [[ $line =~ ^rsync:\ \[generator\]\ failed\ to\ set\ permissions\ on\ \"(.*)\":\ Operation\ not\ supported\ \(95\)$ ]]; then
+				p=${BASH_REMATCH[1]}
+				sudo test -L "$p" || { echo "not a symlink: $p" >&2; bad=1; }
+				n=$((n + 1))
+			elif [[ $line == "rsync error: some files/attrs were not transferred"* ]]; then
+				:
+			elif [[ -n $line ]]; then
+				echo "unexpected rsync error: $line" >&2
+				bad=1
+			fi
+		done < "$log"
+		[[ $bad == 0 ]] || { rm -f "$log"; exit 1; }
+		echo "ignored $n symlink chmod failures (harmless on Linux)"
+		rc=0
+	fi
+	rm -f "$log"
+	[[ $rc == 0 ]] || exit "$rc"
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
