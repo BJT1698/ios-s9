@@ -1,0 +1,73 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index dc5f1b1..21badee 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2584,6 +2584,50 @@ static const struct { pmap_paddr_t start, end; } sweet_ram_holes[] = {
+ };
+ #define SWEET_RAM_NHOLES (sizeof(sweet_ram_holes) / sizeof(sweet_ram_holes[0]))
+ 
++/*
++ * Board-neutral holes: /chosen/sweet-ram-holes, an array of (start, end)
++ * u64 pairs, physical, end exclusive (mkadt.py). When present it REPLACES
++ * the Galaxy S9 table above, an empty property meaning no holes; ADTs
++ * without it (all Galaxy S9 ones) keep the table. OnePlus 6: rmtfs
++ * (0xf5b00000, 0x202000) inside its DRAM span; see op6/XNU-PLAN.md.
++ * Parsed on the first pmap_is_bad_ram() call, from pmap_startup (single
++ * threaded), long before vm_free_delayed_pages runs.
++ */
++#define SWEET_RAM_MAX_ADT_HOLES 8
++static struct { pmap_paddr_t start, end; } sweet_ram_adt_holes[SWEET_RAM_MAX_ADT_HOLES];
++static unsigned int sweet_ram_adt_nholes;
++static int sweet_ram_holes_from_adt = -1;       /* -1: /chosen not read yet */
++
++static void
++sweet_ram_holes_init(void)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++
++	sweet_ram_holes_from_adt = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-ram-holes", &prop, &size) != kSuccess) {
++		return;
++	}
++	if (size % 16 != 0 || size / 16 > SWEET_RAM_MAX_ADT_HOLES) {
++		panic("/chosen/sweet-ram-holes: %u bytes, want at most %u (start, end) u64 pairs",
++		    size, SWEET_RAM_MAX_ADT_HOLES);
++	}
++	for (unsigned int i = 0; i < size / 16; i++) {
++		uint64_t start, end;
++		memcpy(&start, (const uint8_t *)prop + 16 * i, 8);      /* ADT data is only 4-byte aligned */
++		memcpy(&end, (const uint8_t *)prop + 16 * i + 8, 8);
++		if (end <= start) {
++			panic("/chosen/sweet-ram-holes[%u]: empty range 0x%llx-0x%llx", i, start, end);
++		}
++		sweet_ram_adt_holes[i].start = (pmap_paddr_t)start;
++		sweet_ram_adt_holes[i].end = (pmap_paddr_t)end;
++	}
++	sweet_ram_adt_nholes = size / 16;
++	sweet_ram_holes_from_adt = 1;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ 
+@@ -2601,6 +2645,17 @@ pmap_is_bad_ram(__unused ppnum_t ppn)
+ 	 * for allocation -- their vm_page stays in the (contiguous) array but is
+ 	 * never released to the free list. Called from pmap_startup. */
+ 	pmap_paddr_t pa = ptoa_64(ppn);
++	if (sweet_ram_holes_from_adt < 0) {
++		sweet_ram_holes_init();
++	}
++	if (sweet_ram_holes_from_adt) {
++		for (unsigned i = 0; i < sweet_ram_adt_nholes; i++) {
++			if (pa >= sweet_ram_adt_holes[i].start && pa < sweet_ram_adt_holes[i].end) {
++				return true;
++			}
++		}
++		return false;
++	}
+ 	for (unsigned i = 0; i < SWEET_RAM_NHOLES; i++) {
+ 		if (pa >= sweet_ram_holes[i].start && pa < sweet_ram_holes[i].end) {
+ 			return true;
