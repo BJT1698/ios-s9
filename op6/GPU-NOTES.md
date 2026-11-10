@@ -127,3 +127,7 @@ full log (`ramlog` at 0xac480000).
   (GPU pages are 4K, XNU's 16K: one PTE per 4K [HW-F1]), ring + `CP_ME_INIT`, `CP_SET_SECURE_MODE 0`,
   NOP + `CP_MEM_WRITE`; read CP_ALWAYS_ON through the GMU always-on counter (CPU-side read looked frozen
   on the F1 [HW-F1]).
+
+## Device results
+
+- 2026-11-10 M10 (boot-m10-gmu.img): **GMU firmware runs, init=0xBABEFACE**; 8192 words loaded, 0 errors; DTCM readback 600D0001 0A110002; CX gdscr=F8222000. cmd-db on the OP6: **gfx.lvl = 0x30050** (levels 000,010,030,040,080,0C0,100,140,180,1A0), cx.lvl = 0x30000, mx.lvl = 0x30010, **0x30080 = xo.lvl** (so mainline's GPU PDC TCS address 0x30080 is NOT gfx on this firmware; the -rpmh variants must use 0x30050 before being tried). BW BCMs: MC0 SN7 ACV SH2 SN15 SN3.
