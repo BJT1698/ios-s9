@@ -1,0 +1,842 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 4e086c7..e2118c5 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -15,6 +15,9 @@
+  * fingers at once. Only IC writes: CLEAR_EVENT_STACK, SET_TOUCHFUNCTION and
+  * SENSE_ON. Call once after the scheduler is running; all work runs on one
+  * thread.
++ * OnePlus 6: a Synaptics RMI4 (F12) controller instead, chosen by the ADT's
++ * /chosen/sweet-board; see rmi_run() below. Same bit-bang engine, thread,
++ * boot-args and HID delivery.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -25,6 +28,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <sys/sysctl.h>
+ #include <libkern/OSAtomic.h>
+ 
+@@ -78,10 +82,12 @@ static const struct touch_bus pm_bus = {PM_SDA, PM_SCL};
+ 
+ static struct {
+ 	vm_offset_t gpio;
++	vm_offset_t east;               /* OnePlus 6: TLMM EAST tile (GPIO125) */
+ 	bool started, probing;
+ 	uint32_t active;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+-} st;
++	int panel_w, panel_h;           /* coordinates handed to sweet_hid_touch */
++} st = {.panel_w = SECTS_PANEL_W, .panel_h = SECTS_PANEL_H};
+ static int touch_sleep_chan;
+ 
+ static uint32_t
+@@ -414,6 +420,631 @@ touch_sects(void)
+ extern int sweet_bind_current_thread(int cpu);       /* osfmk/kern/sched_prim.c */
+ extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ 
++/*
++ * OnePlus 6 (/chosen/sweet-board = "oneplus,enchilada"): Synaptics S3706B,
++ * RMI4 over I2C at 0x20 on i2c12's pins as plain GPIO (SDA GPIO49, SCL
++ * GPIO50, NORTH tile like the S9's 31/32), attention on GPIO125 (EAST tile,
++ * low while an interrupt is pending). The shim (op6/shim/m4.c) powers it
++ * before XNU starts: GPIO88 high (vio), RPMh ldoa28 3008 mV, reset pulse on
++ * GPIO99. Here it is only probed; no rail, reset or GPIO99 access.
++ * Register layout as the OP6 shim's rmi4.c (M5, proven on the phone):
++ *   - 256-byte pages, register 0xFF selects the page;
++ *   - Page Description Table from 0xE9 down, 6-byte entries;
++ *   - F01 ctrl0 |= nosleep | configured, F01 ctrl1.. interrupt enable;
++ *   - F12 register descriptors (query + 1/+4/+7) locate data1, 8-byte
++ *     object records (type, x LE16, y LE16, z, wx, wy); control 8
++ *     subpacket 0 is max X/Y.
++ * Only IC writes: page select, F01 ctrl0, F01 interrupt enable.
++ */
++#define OP6_EAST_PA       0x03500000u /* DT TLMM + EAST (0x100000) */
++#define OP6_EAST_LEN      0x0007e000u /* through GPIO125 */
++#define RMI_SDA           49u
++#define RMI_SCL           50u
++#define RMI_IRQ           125u        /* EAST tile */
++#define RMI_IRQ_CTL       ((7u << 6) | 3u) /* DT ts-int-state: gpio, input, pull-up, 16 mA */
++#define RMI_ADDR          0x20u
++#define RMI_PAGE_SELECT   0xffu
++#define RMI_PDT_TOP       0xe9
++#define RMI_PDT_BOTTOM    0x05
++#define RMI_MAX_FN        16u
++#define RMI_MAX_PAGES     16u
++#define RMI_DESC_REGS     64u
++#define RMI_DESC_BUF      255u
++#define RMI_F01_NOSLEEP   (1u << 2)
++#define RMI_F01_CONFIGURED (1u << 7)
++#define RMI_REC           8u          /* F12 data1 object record */
++#define RMI_FULL_EVERY    8u          /* reads with a finger down between full reads */
++
++static const struct touch_bus rmi_bus = {RMI_SDA, RMI_SCL};
++
++struct rmi_fn {
++	uint8_t num, page, query, cmd, ctrl, data, irqs, irq_pos;
++};
++
++struct rmi_desc {
++	uint16_t struct_size;
++	uint8_t nregs;
++	uint8_t present[RMI_DESC_REGS];
++	uint16_t size[RMI_DESC_REGS];
++	uint8_t nsub[RMI_DESC_REGS];
++	uint8_t sub0[RMI_DESC_REGS];
++};
++
++static struct {
++	int page;                       /* -1: unknown, select before the next access */
++	unsigned nfn, irq_count;
++	struct rmi_fn fn[RMI_MAX_FN];
++	struct rmi_desc desc;
++	const struct rmi_fn *f01, *f12;
++	uint16_t data_addr, data1_off, max_x, max_y;
++	unsigned fingers, flip, reads;
++} rmi;
++
++static bool
++touch_board_is(const char *want)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	size_t n = strlen(want) + 1;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-board", &prop, &size) != kSuccess) {
++		return false;
++	}
++	return size >= n && memcmp(prop, want, n) == 0;
++}
++
++static unsigned
++rmi_irq_level(void)
++{
++	return touch_rd(st.east, TOUCH_GPIO_IO(RMI_IRQ)) & 1u;
++}
++
++static int
++rmi_select(unsigned page)
++{
++	if (rmi.page == (int)page) {
++		return 0;
++	}
++	uint8_t sel[2] = {RMI_PAGE_SELECT, (uint8_t)page};
++	int err = i2c_wr(&rmi_bus, RMI_ADDR, sel, 2);
++	rmi.page = err ? -1 : (int)page;
++	return err;
++}
++
++static int
++rmi_read(uint16_t a, uint8_t *buf, unsigned n)
++{
++	int err = rmi_select(a >> 8);
++	return err ? err : i2c_rd(&rmi_bus, RMI_ADDR, (uint8_t)a, buf, n);
++}
++
++static int
++rmi_write(uint16_t a, const uint8_t *buf, unsigned n)
++{
++	uint8_t tx[17];
++	if (n > 16) {
++		return EINVAL;
++	}
++	int err = rmi_select(a >> 8);
++	if (err) {
++		return err;
++	}
++	tx[0] = (uint8_t)a;
++	memcpy(tx + 1, buf, n);
++	return i2c_wr(&rmi_bus, RMI_ADDR, tx, n + 1u);
++}
++
++static uint16_t
++rmi_addr(const struct rmi_fn *f, uint8_t base)
++{
++	return (uint16_t)((f->page << 8) | base);
++}
++
++static int
++rmi_scan(void)
++{
++	unsigned empty = 0;
++	rmi.nfn = 0;
++	rmi.irq_count = 0;
++	for (unsigned page = 0; page < RMI_MAX_PAGES && empty < 2; page++) {
++		unsigned found = 0;
++		for (int a = RMI_PDT_TOP; a >= RMI_PDT_BOTTOM; a -= 6) {
++			uint8_t e[6];
++			int err = rmi_read((uint16_t)((page << 8) | (unsigned)a), e, sizeof(e));
++			if (err) {
++				return err;
++			}
++			if (e[5] == 0x00 || e[5] == 0xff) {
++				break;
++			}
++			found++;
++			if (rmi.nfn < RMI_MAX_FN) {
++				struct rmi_fn *f = &rmi.fn[rmi.nfn++];
++				f->num = e[5];
++				f->page = (uint8_t)page;
++				f->query = e[0];
++				f->cmd = e[1];
++				f->ctrl = e[2];
++				f->data = e[3];
++				f->irqs = e[4] & 7u;
++				f->irq_pos = (uint8_t)rmi.irq_count;
++			}
++			rmi.irq_count += e[4] & 7u;
++		}
++		empty = found ? 0 : empty + 1;
++	}
++	return 0;
++}
++
++static const struct rmi_fn *
++rmi_find(uint8_t num)
++{
++	for (unsigned i = 0; i < rmi.nfn; i++) {
++		if (rmi.fn[i].num == num) {
++			return &rmi.fn[i];
++		}
++	}
++	return NULL;
++}
++
++/* A function's interrupt bits as a mask over the F01 status/enable bytes. */
++static uint32_t
++rmi_irq_mask(const struct rmi_fn *f)
++{
++	uint32_t m = 0;
++	for (unsigned i = 0; i < f->irqs && f->irq_pos + i < 32u; i++) {
++		m |= 1u << (f->irq_pos + i);
++	}
++	return m;
++}
++
++/*
++ * Register descriptor (op6/shim/rmi4.c rmi_read_desc): a size byte, the
++ * presence register (structure size, or 0 + LE16), a bitmap of present
++ * registers, then per register its size (8/16/32-bit) and subpacket bitmap
++ * bytes (7 bits each, bit 7 continues). 0 ok, errno or -1/-2/-3 malformed.
++ */
++static int
++rmi_read_desc(uint16_t a, struct rmi_desc *d)
++{
++	uint8_t psize = 0, pres[35], buf[RMI_DESC_BUF];
++	unsigned first, bit = 0, off = 0;
++	int err;
++
++	memset(d, 0, sizeof(*d));
++	if ((err = rmi_read(a, &psize, 1))) {
++		return err;
++	}
++	if (psize < 1 || psize > sizeof(pres)) {
++		return -1;
++	}
++	if ((err = rmi_read((uint16_t)(a + 1), pres, psize))) {
++		return err;
++	}
++	if (pres[0] == 0) {
++		if (psize < 3) {
++			return -1;
++		}
++		d->struct_size = (uint16_t)(pres[1] | (pres[2] << 8));
++		first = 3;
++	} else {
++		d->struct_size = pres[0];
++		first = 1;
++	}
++	if (d->struct_size > RMI_DESC_BUF) {
++		return -2;
++	}
++	if ((err = rmi_read((uint16_t)(a + 2), buf, d->struct_size))) {
++		return err;
++	}
++	for (unsigned i = first; i < psize; i++) {
++		for (unsigned b = 0; b < 8; b++, bit++) {
++			uint32_t size;
++			unsigned nsub = 0, sub0 = 0, sb = 0;
++			if (!((pres[i] >> b) & 1u)) {
++				continue;
++			}
++			if (off >= d->struct_size) {
++				return 0;       /* structure shorter than the map: stop */
++			}
++			size = buf[off++];
++			if (size == 0) {
++				if (off + 2 > d->struct_size) {
++					return -3;
++				}
++				size = buf[off] | ((uint32_t)buf[off + 1] << 8);
++				off += 2;
++			}
++			if (size == 0) {
++				if (off + 4 > d->struct_size) {
++					return -3;
++				}
++				size = buf[off] | ((uint32_t)buf[off + 1] << 8) |
++				    ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 3] << 24);
++				off += 4;
++			}
++			for (;;) {
++				if (off >= d->struct_size) {
++					return -3;
++				}
++				uint8_t v = buf[off++];
++				for (unsigned k = 0; k < 7; k++, sb++) {
++					if ((v >> k) & 1u) {
++						nsub++;
++						if (sb < 7) {
++							sub0 |= 1u << sb;
++						}
++					}
++				}
++				if (!(v & 0x80u)) {
++					break;
++				}
++			}
++			if (size == 0 || bit >= RMI_DESC_REGS) {
++				continue;
++			}
++			d->present[bit] = 1;
++			d->size[bit] = size > 0xffffu ? 0xffffu : (uint16_t)size;
++			d->nsub[bit] = nsub > 255 ? 255 : (uint8_t)nsub;
++			d->sub0[bit] = (uint8_t)sub0;
++			d->nregs++;
++		}
++	}
++	return 0;
++}
++
++/* Register address offset of reg from its base (-1 absent). */
++static int
++rmi_desc_index(const struct rmi_desc *d, unsigned reg)
++{
++	int idx = 0;
++	if (reg >= RMI_DESC_REGS || !d->present[reg]) {
++		return -1;
++	}
++	for (unsigned i = 0; i < reg; i++) {
++		idx += d->present[i];
++	}
++	return idx;
++}
++
++/* Byte offset of reg in a block read from the base (-1 absent). */
++static int
++rmi_desc_offset(const struct rmi_desc *d, unsigned reg)
++{
++	int off = 0;
++	if (reg >= RMI_DESC_REGS || !d->present[reg]) {
++		return -1;
++	}
++	for (unsigned i = 0; i < reg; i++) {
++		if (d->present[i]) {
++			off += d->size[i];
++		}
++	}
++	return off;
++}
++
++static void
++rmi_desc_log(const char *what, const struct rmi_desc *d)
++{
++	char list[3 * RMI_DESC_REGS + 1];
++	unsigned n = 0;
++	for (unsigned r = 0; r < RMI_DESC_REGS && n + 4 < sizeof(list); r++) {
++		if (d->present[r]) {
++			n += (unsigned)snprintf(list + n, sizeof(list) - n, " %u", r);
++		}
++	}
++	list[n] = 0;
++	printf("SWEET TOUCH: F12 %s registers:%s\n", what, n ? list : " none");
++}
++
++/* 0 ok; the step that failed otherwise (op6/shim/rmi4.c f12_setup's codes). */
++static int
++rmi_f12_setup(const struct rmi_fn *f)
++{
++	uint16_t q = rmi_addr(f, f->query);
++	struct rmi_desc *d = &rmi.desc;
++	uint8_t q0 = 0, buf[16];
++	int idx, off;
++
++	if (rmi_read(q, &q0, 1)) {
++		return 8;
++	}
++	if (!(q0 & 1u)) {
++		return 1;
++	}
++	if (rmi_read_desc((uint16_t)(q + 1), d)) {
++		return 2;
++	}
++	if (rmi_read_desc((uint16_t)(q + 4), d)) {
++		return 3;
++	}
++	rmi_desc_log("control", d);
++	if ((idx = rmi_desc_index(d, 8)) < 0) {
++		return 5;
++	}
++	unsigned n = d->size[8] > sizeof(buf) ? sizeof(buf) : d->size[8];
++	if (rmi_read((uint16_t)(rmi_addr(f, f->ctrl) + idx), buf, n)) {
++		return 7;
++	}
++	if ((d->sub0[8] & 1u) && n >= 4) {
++		rmi.max_x = (uint16_t)(buf[0] | (buf[1] << 8));
++		rmi.max_y = (uint16_t)(buf[2] | (buf[3] << 8));
++	}
++	if (rmi_read_desc((uint16_t)(q + 7), d)) {
++		return 4;
++	}
++	rmi_desc_log("data", d);
++	if ((off = rmi_desc_offset(d, 1)) < 0) {
++		return 6;
++	}
++	rmi.data_addr = rmi_addr(f, f->data);
++	rmi.data1_off = (uint16_t)off;
++	rmi.fingers = d->nsub[1];
++	if (rmi.fingers > d->size[1] / RMI_REC) {
++		rmi.fingers = d->size[1] / RMI_REC;
++	}
++	if (rmi.fingers > TOUCH_MAX) {
++		rmi.fingers = TOUCH_MAX;
++	}
++	if (rmi.data1_off > RMI_DESC_BUF) {
++		return 10;      /* rmi_objects reads data0.. data1 into one buffer */
++	}
++	printf("SWEET TOUCH: F12 q0=%#x data1 off=%u size=%u objects=%u max x=%u y=%u\n",
++	    q0, rmi.data1_off, d->size[1], rmi.fingers, rmi.max_x, rmi.max_y);
++	return rmi.fingers ? 0 : 9;
++}
++
++/* F01 ctrl0 = no sleep | configured (sleep bits 0-1 cleared); F01 + F12 interrupts on. */
++static int
++rmi_f01_config(void)
++{
++	const struct rmi_fn *f01 = rmi.f01;
++	uint8_t c0 = 0, v, rb = 0, en[4] = {0, 0, 0, 0}, en2[4];
++	unsigned nen = (rmi.irq_count + 7u) / 8u;
++	uint32_t want = rmi_irq_mask(f01) | rmi_irq_mask(rmi.f12);
++	int err;
++
++	if ((err = rmi_read(rmi_addr(f01, f01->ctrl), &c0, 1))) {
++		return err;
++	}
++	v = (uint8_t)((c0 & ~3u) | RMI_F01_NOSLEEP | RMI_F01_CONFIGURED);
++	if ((err = rmi_write(rmi_addr(f01, f01->ctrl), &v, 1)) ||
++	    (err = rmi_read(rmi_addr(f01, f01->ctrl), &rb, 1))) {
++		return err;
++	}
++	if (nen == 0 || nen > 4) {
++		return EINVAL;
++	}
++	uint16_t ea = (uint16_t)(rmi_addr(f01, f01->ctrl) + 1);
++	if ((err = rmi_read(ea, en, nen))) {
++		return err;
++	}
++	for (unsigned i = 0; i < nen; i++) {
++		en2[i] = (uint8_t)(en[i] | (want >> (8 * i)));
++	}
++	if ((err = rmi_write(ea, en2, nen)) || (err = rmi_read(ea, en2, nen))) {
++		return err;
++	}
++	printf("SWEET TOUCH: F01 ctrl0 %#x -> %#x (read %#x), irq enable %02x%02x%02x%02x -> %02x%02x%02x%02x\n",
++	    c0, v, rb, en[3], en[2], en[1], en[0],
++	    nen > 3 ? en2[3] : 0, nen > 2 ? en2[2] : 0, nen > 1 ? en2[1] : 0, en2[0]);
++	return 0;
++}
++
++/* RMI4 x/y (0..max) -> panel pixels; boot-arg sweettouchflip: 1 x, 2 y, 4 swap axes. */
++static void
++rmi_to_panel(unsigned rx, unsigned ry, int *px, int *py)
++{
++	int w = st.panel_w, h = st.panel_h;
++	unsigned mx = rmi.max_x, my = rmi.max_y;
++	if (rmi.flip & 4u) {
++		unsigned t = rx;
++		rx = ry;
++		ry = t;
++		t = mx;
++		mx = my;
++		my = t;
++	}
++	int x = mx ? (int)((uint64_t)rx * (unsigned)(w - 1) / mx) : (int)rx;
++	int y = my ? (int)((uint64_t)ry * (unsigned)(h - 1) / my) : (int)ry;
++	x = x < 0 ? 0 : (x >= w ? w - 1 : x);
++	y = y < 0 ? 0 : (y >= h ? h - 1 : y);
++	*px = (rmi.flip & 1u) ? w - 1 - x : x;
++	*py = (rmi.flip & 2u) ? h - 1 - y : y;
++}
++
++/*
++ * F12 objects 0..n-1. A read of all ten records is 80 bytes, ~5 ms of
++ * bit-banging, so only the slots up to one past the highest one down are
++ * read; a new contact takes the lowest free slot [I]. A full read follows
++ * when the F12 interrupt fired and that prefix showed nothing new, and
++ * every RMI_FULL_EVERY reads while a finger is down, so a contact in a slot
++ * further up is never lost for long.
++ */
++static int
++rmi_objects(void)
++{
++	uint8_t buf[RMI_DESC_BUF + RMI_REC * TOUCH_MAX];
++	int xs[TOUCH_MAX], ys[TOUCH_MAX];
++	unsigned hi = 0, n;
++	uint32_t mask = 0;
++
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		xs[i] = st.x[i];
++		ys[i] = st.y[i];
++		if (st.active & (1u << i)) {
++			hi = i + 1;
++		}
++	}
++	n = hi + 1 < 2 ? 2 : hi + 1;
++	if (st.active && ++rmi.reads % RMI_FULL_EVERY == 0) {
++		n = rmi.fingers;
++	}
++	for (;;) {
++		if (n > rmi.fingers) {
++			n = rmi.fingers;
++		}
++		if (rmi.data1_off + RMI_REC * n > sizeof(buf)) {
++			return EINVAL;
++		}
++		int err = rmi_read(rmi.data_addr, buf, rmi.data1_off + RMI_REC * n);
++		if (err) {
++			return err;
++		}
++		mask = 0;
++		for (unsigned i = 0; i < n; i++) {
++			const uint8_t *r = buf + rmi.data1_off + RMI_REC * i;
++			if (r[0] == 0) {
++				continue;       /* 0: no object; 1 finger, 2 stylus, 3 palm, ... */
++			}
++			rmi_to_panel(r[1] | ((unsigned)r[2] << 8), r[3] | ((unsigned)r[4] << 8), &xs[i], &ys[i]);
++			mask |= 1u << i;
++		}
++		if (n >= rmi.fingers || mask != 0) {
++			break;
++		}
++		n = rmi.fingers;        /* the interrupt fired, nothing seen in the prefix */
++	}
++	touch_report(mask, xs, ys);
++	return 0;
++}
++
++/* One attention: F01 interrupt status, then the device status or F12 objects. */
++static int
++rmi_attention(void)
++{
++	const struct rmi_fn *f01 = rmi.f01;
++	uint8_t s[4] = {0, 0, 0, 0};
++	unsigned nst = (rmi.irq_count + 7u) / 8u;
++	int err = rmi_read((uint16_t)(rmi_addr(f01, f01->data) + 1), s, nst);
++	if (err) {
++		return err;
++	}
++	uint32_t bits = s[0] | ((uint32_t)s[1] << 8) | ((uint32_t)s[2] << 16) | ((uint32_t)s[3] << 24);
++	if (bits & rmi_irq_mask(f01)) {
++		uint8_t status = 0;
++		if ((err = rmi_read(rmi_addr(f01, f01->data), &status, 1))) {
++			return err;
++		}
++		if ((status & 0x0fu) == 1u || (status & 0x80u)) {
++			/* Reset or unconfigured: the controller lost F01 ctrl0 and the enables. */
++			printf("SWEET TOUCH: F01 status %#x: reconfiguring\n", status);
++			touch_report(0, st.x, st.y);
++			rmi.page = -1;
++			if ((err = rmi_f01_config())) {
++				return err;
++			}
++		}
++	}
++	if (bits & rmi_irq_mask(rmi.f12)) {
++		return rmi_objects();
++	}
++	return 0;
++}
++
++/* OnePlus 6: the panel is the boot video mode (1080x2280), as SweetHID takes it. */
++static void
++touch_panel_from_video(void)
++{
++	PE_Video video;
++
++	bzero(&video, sizeof(video));
++	if (PE_current_console(&video) == 0 && video.v_width >= 16 && video.v_height >= 16 &&
++	    video.v_width <= 8192 && video.v_height <= 8192) {
++		st.panel_w = (int)video.v_width;
++		st.panel_h = (int)video.v_height;
++	}
++}
++
++static void
++rmi_run(void)
++{
++	int err = ETIMEDOUT;
++
++	(void)PE_parse_boot_argn("sweettouchflip", &rmi.flip, sizeof(rmi.flip));
++	rmi.page = -1;
++	st.east = ml_io_map(OP6_EAST_PA, OP6_EAST_LEN);
++	if (!st.east) {
++		printf("SWEET TOUCH: OP6 TLMM EAST mapping failed\n");
++		return;
++	}
++	touch_wr(st.east, TOUCH_GPIO_CFG(RMI_IRQ), RMI_IRQ_CTL);
++	bb_init(&rmi_bus);
++	printf("SWEET TOUCH: OP6 lines sda=%u scl=%u irq=%u, panel %dx%d\n",
++	    touch_level(RMI_SDA), touch_level(RMI_SCL), rmi_irq_level(), st.panel_w, st.panel_h);
++	if (!touch_level(RMI_SDA) || !touch_level(RMI_SCL)) {
++		printf("SWEET TOUCH: OP6 touch bus held low; stopping\n");
++		return;
++	}
++	for (int i = 0; i < 3 && err; i++) {
++		err = i2c_wr(&rmi_bus, RMI_ADDR, NULL, 0);     /* START, address + W, STOP */
++		if (err) {
++			delay(2000);
++		}
++	}
++	if (err) {
++		printf("SWEET TOUCH: OP6 touch: no ACK at 0x20 (err=%d)\n", err);
++		return;
++	}
++	if ((err = rmi_scan())) {
++		printf("SWEET TOUCH: OP6 PDT scan err=%d\n", err);
++		return;
++	}
++	for (unsigned i = 0; i < rmi.nfn; i++) {
++		const struct rmi_fn *f = &rmi.fn[i];
++		printf("SWEET TOUCH: F%02x page %u q%02x k%02x c%02x d%02x irqs %u@%u\n",
++		    f->num, f->page, f->query, f->cmd, f->ctrl, f->data, f->irqs, f->irq_pos);
++	}
++	rmi.f01 = rmi_find(0x01);
++	rmi.f12 = rmi_find(0x12);
++	if (!rmi.f01 || !rmi.f12 || rmi.irq_count == 0 || rmi.irq_count > 32) {
++		printf("SWEET TOUCH: OP6 no F01/F12 (irqs %u); stopping\n", rmi.irq_count);
++		return;
++	}
++	uint8_t q[21], status = 0;
++	if (!rmi_read(rmi_addr(rmi.f01, rmi.f01->query), q, sizeof(q)) &&
++	    !rmi_read(rmi_addr(rmi.f01, rmi.f01->data), &status, 1)) {
++		char id[11];
++		unsigned n = 0;
++		for (; n < 10 && q[11 + n]; n++) {
++			id[n] = q[11 + n] >= 0x20 && q[11 + n] < 0x7f ? (char)q[11 + n] : '.';
++		}
++		id[n] = 0;
++		printf("SWEET TOUCH: F01 manufacturer %#x product %s status %#x\n", q[0], id, status);
++	}
++	if ((err = rmi_f01_config())) {
++		printf("SWEET TOUCH: OP6 F01 configuration err=%d; stopping\n", err);
++		return;
++	}
++	if ((err = rmi_f12_setup(rmi.f12))) {
++		printf("SWEET TOUCH: OP6 F12 setup failed at step %d; stopping\n", err);
++		return;
++	}
++	printf("SWEET TOUCH: OP6 rmi4 sensing, %u objects, flip=%u, read while IRQ low, poll=5ms\n",
++	    rmi.fingers, rmi.flip);
++	printf("SWEET TOUCH: bound to cpu %d\n", sweet_bind_current_thread(1));
++	unsigned errors = 0;
++	for (;;) {
++		if (!rmi_irq_level()) {
++			err = rmi_attention();
++			if (err) {
++				rmi.page = -1;
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH: OP6 report err=%d\n", err);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y);
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(5);
++	}
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -432,6 +1063,10 @@ touch_thread(void *arg, wait_result_t result)
+ 		printf("SWEET TOUCH: TLMM mapping failed\n");
+ 		goto out;
+ 	}
++	if (touch_board_is("oneplus,enchilada")) {
++		rmi_run();      /* returns only if the controller is not usable */
++		goto out;
++	}
+ 	if (!touch_power()) {
+ 		goto out;
+ 	}
+@@ -503,10 +1138,10 @@ swipe_fling(int y0, int y1)
+ {
+ 	const int finger = TOUCH_MAX - 1, steps = 25;
+ 	for (int i = 0; i <= steps; i++) {
+-		sweet_hid_touch(finger, 1, SECTS_PANEL_W / 2, y0 + (y1 - y0) * i / steps);
++		sweet_hid_touch(finger, 1, st.panel_w / 2, y0 + (y1 - y0) * i / steps);
+ 		touch_wait(8);
+ 	}
+-	sweet_hid_touch(finger, 0, SECTS_PANEL_W / 2, y1);
++	sweet_hid_touch(finger, 0, st.panel_w / 2, y1);
+ }
+ 
+ static void
+@@ -516,9 +1151,10 @@ swipe_thread(void *arg, wait_result_t result)
+ 	(void)result;
+ 	printf("SWEET TOUCH: %d synthetic flings\n", n);
+ 	for (int i = 0; i < n; i++) {
+-		swipe_fling(2100, 900);
++		/* Galaxy S9 rows 2100 and 900, scaled to the panel in use */
++		swipe_fling(2100 * st.panel_h / SECTS_PANEL_H, 900 * st.panel_h / SECTS_PANEL_H);
+ 		touch_wait(1500);
+-		swipe_fling(900, 2100);
++		swipe_fling(900 * st.panel_h / SECTS_PANEL_H, 2100 * st.panel_h / SECTS_PANEL_H);
+ 		touch_wait(1500);
+ 	}
+ 	swipe_busy = 0;
+@@ -557,7 +1193,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_swipe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOC
+ 
+ /*
+  * sysctl kern.sweet_gesture="X0 Y0 X1 Y1 MS": one synthetic stroke in panel
+- * pixels (1440x2960) over MS milliseconds, or a tap at X0,Y0 if MS is 0. E.g.
++ * pixels (S9 1440x2960, OP6 1080x2280) over MS milliseconds, or a tap at X0,Y0 if MS is 0. E.g.
+  * "720 2950 720 1500 150" swipes up from the bottom edge (unlock, go home).
+  */
+ static int gesture_args[5];
+@@ -612,8 +1248,8 @@ sysctl_sweet_gesture SYSCTL_HANDLER_ARGS
+ 		}
+ 		v[n++] = x;
+ 	}
+-	if (n != 5 || v[0] >= SECTS_PANEL_W || v[2] >= SECTS_PANEL_W || v[1] >= SECTS_PANEL_H ||
+-	    v[3] >= SECTS_PANEL_H || v[4] > 5000) {
++	if (n != 5 || v[0] >= st.panel_w || v[2] >= st.panel_w || v[1] >= st.panel_h ||
++	    v[3] >= st.panel_h || v[4] > 5000) {
+ 		return EINVAL;
+ 	}
+ 	if (!OSCompareAndSwap(0, 1, &swipe_busy)) {
+@@ -653,6 +1289,9 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++	if (touch_board_is("oneplus,enchilada")) {
++		touch_panel_from_video();       /* also for kern.sweet_swipe/sweet_gesture */
++	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7f3c20b..258f856 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -368,6 +369,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;           /* coordinates sweet_hid_touch() takes: the panel */
+ 	bool fScale;                    /* Galaxy S9: same fit-height scale as AppleCLCD */
+ 	int fPanX, fPanY, fPanW, fPanH;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+@@ -436,34 +438,60 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	/*
++	 * The panel is the boot video mode, as SweetFramebuffer takes it:
++	 * Galaxy S9 1440x2960, OnePlus 6 1080x2280. Only if that is missing,
++	 * the S9's size.
++	 */
++	PE_Video video;
++	bzero(&video, sizeof(video));
++	fPanelW = 1440;
++	fPanelH = 2960;
++	if (PE_current_console(&video) == 0 && video.v_width >= 16 && video.v_height >= 16 &&
++	    video.v_width <= 8192 && video.v_height <= 8192) {
++		fPanelW = (int)video.v_width;
++		fPanelH = (int)video.v_height;
++	}
+ 	/* Galaxy S9: 1440x2960 panel, iPhone X canvas centered (SweetFramebuffer.cpp). */
+-	fLogicalW = native ? 1440 : 1125;
+-	fLogicalH = native ? 2960 : 2436;
+-	fOffX = (fLogicalW - 1440) / 2;
+-	fOffY = (fLogicalH - 2960) / 2;
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	int noscale = 0, aspect = 0;
+ 	PE_parse_boot_argn("sweetfb_noscale", &noscale, sizeof(noscale));
+ 	PE_parse_boot_argn("sweetfb_aspect", &aspect, sizeof(aspect));
+ 	fScale = !native && !noscale;
+ 	if (!aspect) {
+-		fPanW = 1440;
+-		fPanH = 2960;
+-	} else if ((int64_t)1440 * fLogicalH >= (int64_t)2960 * fLogicalW) {
+-		fPanH = 2960;
+-		fPanW = (int)((int64_t)fLogicalW * 2960 / fLogicalH);
++		fPanW = fPanelW;
++		fPanH = fPanelH;
++	} else if ((int64_t)fPanelW * fLogicalH >= (int64_t)fPanelH * fLogicalW) {
++		fPanH = fPanelH;
++		fPanW = (int)((int64_t)fLogicalW * fPanelH / fLogicalH);
+ 	} else {
+-		fPanW = 1440;
+-		fPanH = (int)((int64_t)fLogicalH * 1440 / fLogicalW);
++		fPanW = fPanelW;
++		fPanH = (int)((int64_t)fLogicalH * fPanelW / fLogicalW);
+ 	}
+-	fPanX = (1440 - fPanW) / 2;
+-	fPanY = (2960 - fPanH) / 2;
++	fPanX = (fPanelW - fPanW) / 2;
++	fPanY = (fPanelH - fPanH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++	/* Galaxy S9 68x151 mm; OnePlus 6 68x144 mm (DT touchscreen-x/y-mm) */
++	unsigned surfaceH = 151;
++	DTEntry chosen;
++	void const *board = NULL;
++	unsigned int boardSize = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "sweet-board", &board, &boardSize) == kSuccess &&
++	    boardSize >= sizeof("oneplus,enchilada") &&
++	    memcmp(board, "oneplus,enchilada", sizeof("oneplus,enchilada")) == 0) {
++		surfaceH = 144;
++	}
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(surfaceH << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	IOLog("SWEET HID: touch registered, panel %dx%d, canvas %dx%d%s\n", fPanelW, fPanelH,
++	    fLogicalW, fLogicalH, fScale ? " scaled" : "");
+ 	return true;
+ }
+ 
+@@ -477,8 +505,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1439 ? 1439 : x);
+-	y = y < 0 ? 0 : (y > 2959 ? 2959 : y);
++	x = x < 0 ? 0 : (x >= fPanelW ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y >= fPanelH ? fPanelH - 1 : y);
+ 	/* Panel -> canvas, inverse of AppleCLCD's scale; border touches stick to the edge. */
+ 	int lx = fScale ? (int)((int64_t)(x - fPanX) * fLogicalW / fPanW) : x + fOffX;
+ 	int ly = fScale ? (int)((int64_t)(y - fPanY) * fLogicalH / fPanH) : y + fOffY;

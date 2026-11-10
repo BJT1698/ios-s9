@@ -281,6 +281,9 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
         ('home-button-type', u32(2)),
         ('opposed-power-vol-buttons', u32(1)),
+        # OP6 volume-down is PM8998 GPIO5 (RT_STS 0xc410, active low), not
+        # PON RESIN: read by sweet_keys.c (patch 0104) when present.
+        ('voldown-pmic-gpio', u32(5)),
     ])
 
     product_props = d22ap_product(d22ap)

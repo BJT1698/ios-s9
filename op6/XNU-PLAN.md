@@ -197,7 +197,13 @@ B="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata
 passed, since CoreAnimation runs on the CPU. Expect the CPU-copy framebuffer path
 ("zero-copy unavailable"), so fps will be below the S9's until 0108.
 
-**C, touch:** 0105 + 0107, then `sweettouch=1 sweettouchdelay=20`.
+**C, touch:** 0104 + 0105 (section 7) and a shim m4 built from this tree, then the B2 args
+(as stored in `op6/out/payload-B2.bin`) + `sweettouch=1 sweettouchdelay=20`:
+```
+C="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 ufsroot=userdata ufsrw=1 rootrw=1 ufswait=1 ufslogsecs=60 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 cs_enforcement_disable=1 sweetfb_noconsole=1 sweetfb_hz=60 sweetcpu=0 sweetbattery=0 sweetusb=1 sweettouch=1 sweettouchdelay=20"
+```
+(`sweettouchdelay` is in seconds, default 45. If the axes come out mirrored or swapped,
+add `sweettouchflip=N`: 1 mirror x, 2 mirror y, 4 swap x/y.)
 **D, USB:** 0106, then `sweetusb=2` + `s9/tools/s9-log.py`.
 
 ## 6. Open risks and unknowns
@@ -218,3 +224,50 @@ passed, since CoreAnimation runs on the CPU. Expect the CPU-copy framebuffer pat
    written blindly to 0x9e415800. [I]
 8. 0102/0103 are compile-unverified as a whole (there is no local xnu build). The pieces were
    syntax-checked (section 0). [V partial]
+
+## 7. Touch/keys: done, untested in XNU
+
+Patches made with `git diff` on the reconstructed tree (section 0, rebuilt this session
+from `xnu-8796.141.3` + `xnu/patches/*` incl. 0102/0103 + the dxb patches; the two .sh
+staging scripts that call `xcrun` (0019 libpthread, 0026 hfs) could not run on Linux, which
+only affects files these patches do not touch). Both pass `git apply --check` in order on the
+post-0103 tree; copies in `xnu/patches/` and `op6/xnu-patches/`. **[V]**
+
+- **0104-op6-keys-voldown-gpio5** (`bsd/dev/sweet_keys.c`): ADT `/buttons voldown-pmic-gpio
+  = <n>` (mkadt-op6 now sets 5) switches volume-down from PON RESIN to PM8998 GPIOn: ppid
+  `0xc0+n-1` (GPIO5 = 0x0c4), RT_STS `0xc010+(n-1)*0x100` (0xc410), bit 0, active low. Same
+  read-only checks as volume-up (EN bit 7, digital input, from 0xc446/0xc440/0xc405);
+  otherwise it is withheld, without log spam. No property (every S9 ADT): unchanged. [I]
+- **0105-op6-rmi4-touch** (`bsd/dev/sweet_touch.c`, `iokit/Kernel/arm/hid/SweetHID.cpp`):
+  when `/chosen/sweet-board == "oneplus,enchilada"` the touch thread (same `sweettouch`,
+  `sweettouchdelay`, cpu1 binding, `sweet_hid_touch`) runs `rmi_run()` instead of the
+  S2DOS05/sec_ts path: bit-bang on GPIO49/50 (NORTH map the S9 already uses), GPIO125 from a
+  new EAST map (set to input pull-up), probe 0x20 (3 tries; no ACK -> `OP6 touch: no ACK at
+  0x20`, stop; no rail/reset access), PDT scan, F01 ctrl0 `|= 0x84`, F01+F12 irq enable,
+  F12 descriptors (port of `op6/shim/rmi4.c`), then while GPIO125 is low: F01 irq status ->
+  F12 objects. **Multi-touch, 10 contacts**, F12 slot = HID finger id; F01 reset/unconfigured
+  status re-runs the F01 config. Reads only objects up to one past the highest slot down
+  (a full read when the prefix shows nothing, and every 8th read while touching), because a
+  full 80-byte read costs ~5 ms of bit-banging.
+- **Coordinate mapping**: RMI4 0..max_x/max_y (1079/2279 read from F12 ctrl 8) -> panel px
+  `x*(W-1)/max_x`, W x H = boot video mode (1080x2280). SweetHID now takes its panel size from
+  `PE_current_console` instead of the literal 1440x2960 (identical on the S9), so the
+  panel -> canvas inverse is the same one the framebuffer uses (0086/0087 stretch by default:
+  828x1792 canvas over the full 1080x2280; `sweetfb_aspect=1` letterbox also matches). The
+  HID's logical size stays 1125x2436, as on the S9 with --scale2: the output is normalised 0..1,
+  so it only affects the 48-px edge-gesture band (~4% of the width). SurfaceHeight 144 mm on
+  the OP6. `kern.sweet_gesture`/`sweet_swipe` use the panel size on the OP6.
+- **Shim m4** (`op6/shim/m4.c`, `op6/build.sh`): after the WDT-off, probes 0x20; if it does not
+  answer: GPIO88 high, 10 ms, RPMh ldoa28 3008 mV HPM on (`rpmh.c`), 10 ms, reset 1/0/1 on
+  GPIO99, 200 ms, probe (+300 ms retry). GPIO125 input pull-up. Screen + ramlog; every failure
+  is logged and the boot continues. Compiles and links with the op6 CFLAGS, 0 ABS64. **[V]**
+- Verified: `git apply --check`; clang `-fsyntax-only` of the patched `sweet_touch.c` and
+  `sweet_keys.c` against stub declarations copied from the tree headers, with xnu's
+  `-Weverything` set: no new warnings beyond the base file's `-Wformat-signedness` kind; the
+  patched `SweetHIDTouch::start/touch` compiled in a C++ stub harness; mkadt-op6 `--dump` diff =
+  only `voldown-pmic-gpio`. Not verified: a real xnu build (CI), anything on the phone.
+- Risks [G]: (1) the slot-assignment assumption only costs latency if wrong; (2) bit-bang at
+  ~150 kHz on cpu1 spins ~1 ms per read with 1-2 fingers; (3) if XNU idle lets the apps RSC
+  sleep, the ACTIVE-only ldoa28 vote may drop (touch dies -> read errors, all fingers lifted);
+  (4) the m4 RPMh/MMIO steps run with no exception recovery: a fault there shows the panic
+  screen instead of booting (same code as M5, which ran clean).

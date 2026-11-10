@@ -22,7 +22,7 @@ m1) main="m1.c screen.c" ;;
 m2) main="m2.c con.c" ;;
 m8) main="m8.c con.c plat.c" ;;
 m5) main="m5.c con.c plat.c i2c_bb.c rmi4.c rpmh.c" ;;
-m4) main="m4.c con.c plat.c loader.c"
+m4) main="m4.c con.c plat.c loader.c i2c_bb.c rpmh.c"
     [ -f "${PAYLOAD:-}" ] || { echo "m4 needs PAYLOAD=path/to/payload.bin" >&2; exit 2; } ;;
 *) echo "usage: build.sh [m1|m2|m8|m5|m4]" >&2; exit 2 ;;
 esac
