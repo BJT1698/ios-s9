@@ -18,4 +18,6 @@ Labels: device-verified unless noted.
 
 | 2026-11-10 | GPU M10/M11 | GMU firmware boots (0xBABEFACE, fw v1.6); GPU SMMU context + HFI INIT/FW_VERSION/PERF/BW/TEST ACKed |
 
-Next: GPU M12 (GX on via GMU OOB), M13 (zap + CP), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+| 2026-11-10 | GPU M12 | GX powered via the GMU at 710 MHz, RBBM_STATUS=1, GMU and CP always-on counters at 19.2 MHz, clean slumber |
+
+Next: GPU M13 (zap via TZ + SQE + CP NOP/MEM_WRITE), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
