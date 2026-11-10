@@ -39,7 +39,7 @@
 #define GMU_CHIPID		0x06030200u
 #endif
 #ifndef GPU_PDC_GFX
-#define GPU_PDC_GFX		0x30080u	/* mainline pdc_address_offset for a630 (and S9 kgsl) */
+#define GPU_PDC_GFX		0x30050u	/* OP6 cmd-db: gfx.lvl = 0x30050 (M10, 2026-11-10); 0x30080 is xo.lvl here, not mainline's gfx */
 #endif
 
 #define SW_COLLAPSE		(1u << 0)
