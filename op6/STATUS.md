@@ -20,4 +20,6 @@ Labels: device-verified unless noted.
 
 | 2026-11-10 | GPU M12 | GX powered via the GMU at 710 MHz, RBBM_STATUS=1, GMU and CP always-on counters at 19.2 MHz, clean slumber |
 
-Next: GPU M13 (zap via TZ + SQE + CP NOP/MEM_WRITE), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+| 2026-11-10 | GPU M13 | zap shader accepted by TrustZone (PAS 13); SQE microcode loaded; CP ran ME_INIT, SET_SECURE_MODE 0, NOP + CP_MEM_WRITE: 0xC0FFEE01 in RAM through the GPU SMMU |
+
+Next: XNU GPU driver, Mesa freedreno + EAGL in backboardd, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
