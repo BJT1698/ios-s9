@@ -14,14 +14,23 @@ img=$OUT/ios16-root.img
 
 # Linux fsck_hfs sometimes needs a second pass ("Volume header needs minor
 # repair" right after a repair): repair until a read-only check is clean.
+# hfsprogs 540.1: on a clean image -n can keep reporting "Volume header needs
+# minor repair (1, 0)" (VIStat 0x8000) while -y finds nothing to fix and both
+# VHB copies are identical: accept a -y pass that changed nothing.
 fsck_clean() {
+	local out
 	for i in 1 2 3 4; do
 		if sudo fsck.hfsplus -f -n "$img" >/dev/null 2>&1; then
 			echo "fsck: clean"
 			return 0
 		fi
 		echo "fsck: repair pass $i"
-		sudo fsck.hfsplus -f -y "$img" | grep -v 'Illegal name' || true
+		out=$(sudo fsck.hfsplus -f -y "$img" 2>&1 | grep -v 'Illegal name' || true)
+		echo "$out"
+		if [[ $i -ge 2 && $out == *"appears to be OK"* && $out != *"Repairing volume"* ]]; then
+			echo "fsck: -y finds nothing to repair; -n only reports the header nit: accepted"
+			return 0
+		fi
 	done
 	sudo fsck.hfsplus -f -n "$img"	# show what is left, fail
 }
