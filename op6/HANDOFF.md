@@ -123,12 +123,15 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
 
 ## 5. Status of the work in progress (G2)
 
-- **G2 has not started**: the agent that was going to write it was stopped before producing any file, and the working tree is clean. Start from scratch according to `op6/GPU-XNU-PLAN.md`:
-  - **Patch `xnu/patches/0108-op6-gpu-userclient.patch`:** a SweetGPU user client implementing the msm DRM uAPI subset that Mesa freedreno needs: GET_PARAM, GEM_NEW/INFO/CLOSE, CPU_PREP/FINI, SUBMIT, WAIT_FENCE, SUBMITQUEUE. With `sweetgpu=2` the GPU stays on after G1.
-  - **iOS test tool `sweetgpu-test`:** it submits CP_MEM_WRITE 0xC0FFEE02 and waits on the fence. It is built in the CI on macos-26, like s9/ios-tools (`.github/workflows/s9-ios-tools.yml`, which must be moved to macos-26).
-- Base the patch on a tree of xnu-8796.141.3 with all patches up to 0107 applied, and check it with `git apply --check`.
-- Test: boot-args as above with `sweetgpu=2`, then over SSH `sweetgpu-test` (expected PASS) and `ioreg -l -c SweetGPU`.
-- Known small bug from G1, to fix in 0108: `SweetGPUMagic` is published sign-extended to 64 bits (18446744072652582401 = 0xC0FFEE01).
+- **G2 code written and locally verified** (2026-11-10):
+  - **Patch `xnu/patches/0108-op6-gpu-userclient.patch`** (and copy in `op6/xnu-patches/0108-op6-gpu-userclient.patch`):
+    - `bsd/dev/sweet_gpu.c`: 4K-page bitmap allocator over the remaining GPU carve-out (16K-aligned for XNU's 16K VM device pager, mapped with 4K PTEs into the GPU SMMU at `0x10000000 + p*4K`), 64-page GPU page-table pool, `pt_unmap` + `CB_TLBIALL`/`CB_TLBSYNC`, circular ring wrap-around, `CP_INDIRECT_BUFFER` + `CP_WAIT_FOR_IDLE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` fence submission, and `msm` uAPI parameter reporting when `sweetgpu=2`.
+    - `iokit/Kernel/arm/SweetGPU.cpp`: fixes `SweetGPUMagic` (and sibling numeric properties) `OSNumber` bit-width from 32 to 64 so `ioreg` does not sign-extend `0xC0FFEE01`; sets `IOUserClientClass = "SweetGPUUserClient"`; implements `SweetGPUUserClient` (selectors `0x09` `GEM_CLOSE`, `0x40` `GET_PARAM`, `0x41` `SET_PARAM`, `0x42` `GEM_NEW`, `0x43` `GEM_INFO`, `0x44` `GEM_CPU_PREP`, `0x45` `GEM_CPU_FINI`, `0x46` `GEM_SUBMIT`, `0x47` `WAIT_FENCE`, `0x48` `GEM_MADVISE`, `0x4a`..`0x4c` `SUBMITQUEUE_*`, plus `clientMemoryForType` with write-combine physical `IOMemoryDescriptor`).
+  - **iOS test tool `s9/ios-tools/sweetgpu-test.c`** and `.github/workflows/s9-ios-tools.yml` (updated from `macos-14` to `macos-26`): queries `GET_PARAM`, allocates command and destination BOs via `GEM_NEW` + `GEM_INFO(GET_IOVA)`, maps them via `IOConnectMapMemory64`, submits an IB with `CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`, waits via `WAIT_FENCE`, verifies readback, and runs a 100-submit stress loop (`-n COUNT`).
+  - Local checks passed: `git apply --check` on `xnu-8796.141.3` + `0000-0107`, `clang -fsyntax-only` under XNU's `-Weverything -Werror` flags, and `clang -Wall -Wextra -Werror` on `sweetgpu-test.c`.
+- **Next step to test G2 on device:**
+  1. Push and run CI workflows `xnu.yml` and `s9-ios-tools.yml` on `macos-26`.
+  2. Build `boot-G2.img` with `sweetgpu=2 sweetgpudelay=30`, boot via `fastboot boot`, copy `sweetgpu-test` over SSH, and run `sweetgpu-test` + `ioreg -l -c SweetGPU`.
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
 

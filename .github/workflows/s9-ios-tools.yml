@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Build and sign
@@ -36,12 +36,14 @@ jobs:
             codesign -f -s - --entitlements "$t.entitlements" "out/$t"
             codesign -d --entitlements - "out/$t"
           done
-          # measurement tools, read only: CPU per core and thread, memory speed, battery chain
+          # measurement tools, read only: CPU per core and thread, memory speed, battery chain, OP6 GPU user client
           xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Werror s9top.c -o out/s9top
           xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Werror s9membw.c -o out/s9membw
           xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall -Werror \
             -framework CoreFoundation -framework IOKit s9batt.c -o out/s9batt
-          for t in s9top s9membw s9batt; do
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Werror \
+            -framework CoreFoundation -framework IOKit sweetgpu-test.c -o out/sweetgpu-test
+          for t in s9top s9membw s9batt sweetgpu-test; do
             codesign -f -s - "out/$t"
           done
           # S9Audio HAL driver (audio path A: iOS's sound to the PC over the USB network) and s9play

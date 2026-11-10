@@ -1,9 +1,12 @@
 # OnePlus 6 GPU in XNU (Adreno 630): architecture and milestones
 
-Status 2026-11-10: plan written; **G1 patch drafted** (`xnu/patches/0107-op6-gpu-bringup.patch`, copy in
-`op6/xnu-patches/`). It passes `git apply --check` on xnu-8796.141.3 + 0000-0106 and a `clang -fsyntax-only`
-check with stubs under xnu's `-Weverything -Werror` set. Not built in CI yet, and not run on the phone. The
-hardware sequence it ports ran on the OP6 in the shim (M10-M13, `GPU-NOTES.md` "Device results").
+Status 2026-11-10: **G1 verified on device** (`xnu/patches/0107-op6-gpu-bringup.patch`, `SweetGPUStage=7`,
+`SweetGPUMagic=0xC0FFEE01`, `SweetGPUState="off"`). **G2 patch and userland test tool written and locally
+verified** (`xnu/patches/0108-op6-gpu-userclient.patch`, copy in `op6/xnu-patches/`, and
+`s9/ios-tools/sweetgpu-test.c`). Patch `0108` passes `git apply --check` on xnu-8796.141.3 + 0000-0107 and
+`clang -fsyntax-only` under XNU's `-Weverything -Werror` flags; `sweetgpu-test.c` passes `clang -Wall
+-Wextra -Werror`. Ready for CI build (`xnu.yml` + `s9-ios-tools.yml` on `macos-26`) and device test with
+`sweetgpu=2`.
 
 Labels: **[V]** read in source/DT or verified on the device, **[I]** inferred, **[?]** open.
 
@@ -243,14 +246,31 @@ freedreno:
   zap. Otherwise the reviewer found the sequence identical to m13. Left out on purpose: the read-only RSC
   probes and `smmu_after_zap`.
 
-## 6. Files (G1)
+## 6. Files (G1 + G2)
 
 - `xnu/patches/0107-op6-gpu-bringup.patch` (+ copy `op6/xnu-patches/`):
   - new `bsd/dev/sweet_gpu.c` (hardware sequence) and `iokit/Kernel/arm/SweetGPU.cpp` (service + thread
     + result properties)
   - `bsd/conf/files`, `iokit/conf/files.arm64`, `iokit/KernelConfigTables.cpp` (SweetGPU personality)
+- `xnu/patches/0108-op6-gpu-userclient.patch` (+ copy `op6/xnu-patches/`):
+  - `bsd/dev/sweet_gpu.c`: 4K-page bitmap allocator over the remaining carve-out (16K-aligned for XNU's 16K
+    VM device pager, mapped with 4K PTEs into the GPU SMMU at `0x10000000 + p*4K`), 64-page GPU page-table
+    pool, `pt_unmap` + `CB_TLBIALL`/`CB_TLBSYNC`, circular ring wrap-around (`wp = (wp + 1) % RING_DW`),
+    `CP_INDIRECT_BUFFER` + `CP_WAIT_FOR_IDLE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` fence submission, and `msm`
+    parameter reporting.
+  - `iokit/Kernel/arm/SweetGPU.cpp`: fixes `OSNumber` bit-width (64 instead of 32) on `SweetGPUMagic` and
+    sibling properties, sets `kIOUserClientClassKey = "SweetGPUUserClient"`, and implements
+    `SweetGPUUserClient` (selectors `0x09` `GEM_CLOSE`, `0x40` `GET_PARAM`, `0x41` `SET_PARAM`, `0x42`
+    `GEM_NEW`, `0x43` `GEM_INFO`, `0x44` `GEM_CPU_PREP`, `0x45` `GEM_CPU_FINI`, `0x46` `GEM_SUBMIT`,
+    `0x47` `WAIT_FENCE`, `0x48` `GEM_MADVISE`, `0x4a`..`0x4c` `SUBMITQUEUE_*`, plus `clientMemoryForType`
+    with `kIOMapWriteCombineCache`).
+- `s9/ios-tools/sweetgpu-test.c` + `.github/workflows/s9-ios-tools.yml` (moved to `macos-26`):
+  - opens `SweetGPU`, prints registry properties and `GET_PARAM` values, allocates command + destination BOs,
+    maps them via `IOConnectMapMemory64`, submits an indirect buffer with `CP_NOP` + `CP_MEM_WRITE 0xC0FFEE02`,
+    waits via `WAIT_FENCE`, verifies readback, and runs a 100-submit stress loop (`-n COUNT`).
 - `op6/tools/mkadt-op6.py`: `--gpu-fw DIR`, `--gpu-dma PA,SIZE` (`/sweet-gpu` node; sha256 and overlap
   checks).
-- Origin of the code: our shim (`op6/shim/gpu.c`, `m10.c`-`m13.c`, `rpmh.c`; ios-op6, MIT). No code is
-  copied from HackiOS (APSL, reusable with notice), guacamole (no licence), Linux (GPL) or Bergamota (no
-  licence).
+- Origin of the code: our shim (`op6/shim/gpu.c`, `m10.c`-`m13.c`, `rpmh.c`; ios-op6, MIT); G2 uAPI
+  dispatch and ring submission reference `oosexgang/hackios-xnu-kernel` @ `63fc2b4` (`drivers/gpu/hakios.adreno.c`
+  and `drivers/gpu/hakios.gpu.cpp`, APSL 2.0) and Mesa's `drm-uapi/msm_drm.h` (MIT). No code is copied from
+  guacamole (no licence), Linux (GPL) or Bergamota (no licence).
