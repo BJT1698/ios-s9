@@ -131,3 +131,5 @@ full log (`ramlog` at 0xac480000).
 ## Device results
 
 - 2026-11-10 M10 (boot-m10-gmu.img): **GMU firmware runs, init=0xBABEFACE**; 8192 words loaded, 0 errors; DTCM readback 600D0001 0A110002; CX gdscr=F8222000. cmd-db on the OP6: **gfx.lvl = 0x30050** (levels 000,010,030,040,080,0C0,100,140,180,1A0), cx.lvl = 0x30000, mx.lvl = 0x30010, **0x30080 = xo.lvl** (so mainline's GPU PDC TCS address 0x30080 is NOT gfx on this firmware; the -rpmh variants must use 0x30050 before being tried). BW BCMs: MC0 SN7 ACV SH2 SN15 SN3.
+- 2026-11-10 M11 (boot-m11-hfi.img): **GPU SMMU + HFI work**. GPU SMMU idr0=48016605 (5 SMR, 5 CB, 4K pages, ATOS), no SMR valid before; CB with TTBR0=0x8009f000, cbar=0001F300 sctlr=1027 tcr=00802019; SID 5 and 4 mapped; ATOS VA 0x60009000 -> HFI buffer PA 0x80092B80 OK. GMU init=0xBABEFACE under the SMMU, HFI status=1, **GMU firmware v1.6 (0x10060000)**; H2F INIT, FW_VERSION, PERF_TABLE, BW_TABLE, TEST all ACKed (seq 1-5). No CrashDump.
+- Next: M12 = GX power through the GMU OOB (GPU core registers readable: RBBM_STATUS, CP_ALWAYS_ON), then M13 zap via TZ + SQE microcode + CP NOP/MEM_WRITE through the GPU SMMU.

@@ -16,4 +16,6 @@ Labels: device-verified unless noted.
 | 2026-11-10 | D | kernel with 0106 (boot-D, `sweetusb=2`): **iOS USB Ethernet, ping 192.168.7.2 from the PC ~1 ms** |
 | 2026-11-10 | SSH | Procursus 1800 bootstrap + OpenSSH 9.7 written into the live root via pmOS usb-storage (backup userdata-16G-before-ssh.img): `ssh -i ~/.ssh/ios-op6 root@192.168.7.2` -> root shell, iOS 16.7.16 20H392, 8 CPUs, 3.28 GiB |
 
-Next: GPU, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+| 2026-11-10 | GPU M10/M11 | GMU firmware boots (0xBABEFACE, fw v1.6); GPU SMMU context + HFI INIT/FW_VERSION/PERF/BW/TEST ACKed |
+
+Next: GPU M12 (GX on via GMU OOB), M13 (zap + CP), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
