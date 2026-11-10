@@ -14,5 +14,6 @@ Labels: device-verified unless noted.
 | 2026-11-10 | C | kernel with 0104/0105 (boot-C): **touch works in iOS (unlock, taps), volume up/down work** |
 | 2026-11-10 | M7 | bare-metal USB warm start: QUSB2 power-up, rail/bus votes, SMMU rule SID 0x740 (U-Boot recipe; without it the first DMA -> Qualcomm CrashDump) -> PC enumerates CDC-ECM 1209:0001 |
 | 2026-11-10 | D | kernel with 0106 (boot-D, `sweetusb=2`): **iOS USB Ethernet, ping 192.168.7.2 from the PC ~1 ms** |
+| 2026-11-10 | SSH | Procursus 1800 bootstrap + OpenSSH 9.7 written into the live root via pmOS usb-storage (backup userdata-16G-before-ssh.img): `ssh -i ~/.ssh/ios-op6 root@192.168.7.2` -> root shell, iOS 16.7.16 20H392, 8 CPUs, 3.28 GiB |
 
-Next: SSH (bootstrap + openssh via pmOS usb-storage), GPU, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+Next: GPU, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
