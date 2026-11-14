@@ -118,7 +118,7 @@ index 38d6dd1..8cc4697 100644
      * match, in other cases just fall back to sw:
      */
 diff --git a/src/gallium/drivers/freedreno/freedreno_draw.c b/src/gallium/drivers/freedreno/freedreno_draw.c
-index b352d12..fa175b2 100644
+index b352d12..ba15738 100644
 --- a/src/gallium/drivers/freedreno/freedreno_draw.c
 +++ b/src/gallium/drivers/freedreno/freedreno_draw.c
 @@ -9,6 +9,7 @@
@@ -160,7 +160,7 @@ index b352d12..fa175b2 100644
 +}
 +
 +static bool
-+shader_stage_has_null_bo(struct fd_context *ctx, enum pipe_shader_type s)
++shader_stage_has_null_bo(struct fd_context *ctx, enum pipe_shader_type s) assert_dt
 +{
 +   u_foreach_bit (i, ctx->constbuf[s].enabled_mask) {
 +      struct pipe_constant_buffer *cb = &ctx->constbuf[s].cb[i];
@@ -189,7 +189,7 @@ index b352d12..fa175b2 100644
 +
 +static bool
 +draw_has_null_bo(struct fd_context *ctx, const struct pipe_draw_info *info,
-+                 const struct pipe_draw_indirect_info *indirect)
++                 const struct pipe_draw_indirect_info *indirect) assert_dt
 +{
 +   struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
 +
@@ -244,7 +244,7 @@ index b352d12..fa175b2 100644
 +}
 +
 +static bool
-+clear_has_null_bo(struct fd_context *ctx, unsigned buffers)
++clear_has_null_bo(struct fd_context *ctx, unsigned buffers) assert_dt
 +{
 +   struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
 +
@@ -270,7 +270,7 @@ index b352d12..fa175b2 100644
 +
 +static bool
 +launch_grid_has_null_bo(struct fd_context *ctx,
-+                        const struct pipe_grid_info *info)
++                        const struct pipe_grid_info *info) assert_dt
 +{
 +   if (shader_stage_has_null_bo(ctx, PIPE_SHADER_COMPUTE))
 +      return true;
