@@ -1,0 +1,896 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f120461..fe3b36d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -54,6 +54,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <pexpert/arm/protos.h>
+ #include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -88,6 +89,12 @@ struct sweet_gpu_mem_stats {
+ };
+ void sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st);
+ const char *sweet_gpu_bo_error(int err);
++typedef void (*sweet_gpu_wake_fn)(void *arg);
++void sweet_gpu_set_wake_cb(sweet_gpu_wake_fn fn, void *arg);
++int sweet_gpu_irq_enabled(void);
++int sweet_gpu_irq_fatal(void);
++uint64_t sweet_gpu_irq_count(void);
++void sweet_gpu_irq_drain_logs(void);
+ 
+ #define LOG(...)		printf("SWEET GPU: " __VA_ARGS__)
+ 
+@@ -193,7 +200,14 @@ static struct {
+ #define GMU_GMU2HOST_INTR_MASK	0x5193
+ #define GMU_HOST2GMU_INTR_SET	0x5194
+ #define GMU_GENERAL_7		0x51cc
++#define GMU_AO_HOST_INTR_CLR	0x9304
++#define GMU_AO_HOST_INTR_STATUS	0x9305
+ #define GMU_AO_HOST_INTR_MASK	0x9306
++#define GMU_AO_WDOG_BITE	(1u << 0)
++#define GMU_AO_FENCE_ERR	(1u << 3)
++#define GMU_AO_HOST_AHB_ERR	(1u << 5)
++#define GMU_AO_ERR_MASK		(GMU_AO_WDOG_BITE | GMU_AO_FENCE_ERR | GMU_AO_HOST_AHB_ERR)
++#define INTR_CM3_FAULT		(1u << 23)
+ #define GMU_RSCC_CONTROL_ACK	0x9308
+ #define GMU_CX_BUSY_STATUS	0x930c
+ #define GMU_AO_FENCE_CTRL	0x9310
+@@ -220,6 +234,7 @@ static struct {
+ /* GPU SMMU (SMMUv2) */
+ #define S_CR0			0x000
+ #define S_CR0_CLIENTPD		(1u << 0)
++#define S_CR0_GFIE		(1u << 2)
+ #define S_CR0_USFCFG		(1u << 10)
+ #define S_IDR0			0x020
+ #define S_IDR1			0x024
+@@ -255,6 +270,7 @@ static struct {
+ #define CB_ATSR			0x8f0
+ #define CBAR_S1			((1u << 16) | (3u << 8) | (0xfu << 12))
+ #define SCTLR_ON		((1u << 0) | (1u << 1) | (1u << 2) | (1u << 5) | (1u << 12))
++#define SCTLR_CFIE		(1u << 6)
+ #define SCTLR_HUPCF		(1u << 8)
+ #define TCR_VAL			(25u | (2u << 12) | (1u << 23))
+ #define TCR2_VAL		(1u | (1u << 4) | (7u << 15))
+@@ -297,6 +313,8 @@ static struct {
+ #define INTR_MSGQ		1u
+ 
+ /* GPU core (a6xx.xml.h) */
++#define RBBM_INT_CLEAR_CMD	0x0037
++#define RBBM_INT_0_MASK		0x0038
+ #define RBBM_INT_0_STATUS	0x0201
+ #define RBBM_STATUS		0x0210
+ #define CP_RB_BASE		0x0800
+@@ -320,7 +338,26 @@ static struct {
+ #define VBIF_XIN_HALT_CTRL0	0x3080
+ #define VBIF_XIN_HALT_CTRL1	0x3081
+ #define RBBM_STATUS_CXMASTER	1u
++#define INT0_CP_AHB_ERROR	(1u << 1)
++#define INT0_ATB_ASYNCFIFO_OVR	(1u << 6)
++#define INT0_CP_HW_ERROR	(1u << 9)
++#define INT0_CP_CACHE_FLUSH_TS	(1u << 20)
++#define INT0_ATB_BUS_OVR	(1u << 22)
+ #define INT0_HANG		(1u << 23)
++#define INT0_UCHE_OOB		(1u << 24)
++#define INT0_UCHE_TRAP		(1u << 25)
++#define INT0_ERR_MASK		(INT0_CP_AHB_ERROR | INT0_ATB_ASYNCFIFO_OVR | INT0_CP_HW_ERROR | \
++				 INT0_ATB_BUS_OVR | INT0_HANG | INT0_UCHE_OOB | INT0_UCHE_TRAP)
++#define INT0_ACTIVE_MASK	(INT0_CP_CACHE_FLUSH_TS | INT0_ERR_MASK)
++#define CP_EVENT_WRITE_IRQ	(1u << 31)
++
++/* OP6 DT interrupt mapping: GIC INTID = SPI + 32 */
++#define SWEET_GPU_INTID		332u	/* gpu@5000000 SPI 300, level high */
++#define SWEET_GMU_HFI_INTID	336u	/* gmu@506a000 "hfi" SPI 304, level high */
++#define SWEET_GMU_AO_INTID	337u	/* gmu@506a000 "gmu" SPI 305, level high */
++#define SWEET_SMMU_GLB0_INTID	261u	/* iommu@5040000 global SPI 229, level high */
++#define SWEET_SMMU_GLB1_INTID	263u	/* iommu@5040000 global SPI 231, level high */
++#define SWEET_SMMU_CB_INTID(b)	(396u + (uint32_t)(b))	/* CB 0..7 SPI 364..371, edge rising */
+ #define CP_NOP			0x10u
+ #define CP_WAIT_FOR_IDLE	0x26u
+ #define CP_MEM_WRITE		0x3du
+@@ -1402,6 +1439,8 @@ gx_gdsc_off(void)
+ 	LOG("GX end: GDSC %s by the CPU gd=%08x\n", ok ? "off" : "NOT off", rd32(GPUCC(GPUCC_GX_GDSCR)));
+ }
+ 
++static void gpu_irq_disarm(void);
++
+ static void
+ drop(void)
+ {
+@@ -1449,6 +1488,7 @@ drop(void)
+ 		hfi_stop_masks();
+ 	}
+ 	gx_gdsc_off();
++	gpu_irq_disarm();
+ 	(void)faulted("end");
+ 	gmu_halt();
+ 	booted = 0;
+@@ -2102,7 +2142,7 @@ sweet_gpu_get_param(uint32_t param, uint64_t *val)
+ 		*val = 0;
+ 		return 1;
+ 	case 0x09:	/* MSM_PARAM_FAULTS */
+-		*val = gpu_faults;
++		*val = __atomic_load_n(&gpu_faults, __ATOMIC_RELAXED);
+ 		return 1;
+ 	case 0x10:	/* MSM_PARAM_HIGHEST_BANK_BIT (SDM845: bit 15) */
+ 		*val = 15;
+@@ -2266,6 +2306,299 @@ sweet_gpu_last_fence(void)
+ 	return gpu_fence;
+ }
+ 
++/* ---- 9. Interrupts (G5: RBBM / GPU SMMU / GMU) ---- */
++
++static int irq_boot_arg = 1;
++static int irq_armed;
++static uint64_t gpu_irq_total;
++static int gpu_irq_error_seen;
++static sweet_gpu_wake_fn gpu_wake_fn;
++static void *gpu_wake_arg;
++
++static uint32_t irq_cb_fault_pending;
++static int irq_cb_fault_bank;
++static uint32_t irq_cb_fault_fsr, irq_cb_fault_fsynr;
++static uint64_t irq_cb_fault_far;
++
++static uint32_t irq_glb_fault_pending;
++static uint32_t irq_glb_fault_gfsr, irq_glb_fault_gsyn0, irq_glb_fault_gsyn1;
++
++static uint32_t irq_gpu_err_pending;
++static uint32_t irq_gpu_err_i0, irq_gpu_err_ci, irq_gpu_err_flt, irq_gpu_err_pr;
++
++static uint32_t irq_gmu_err_pending;
++static uint32_t irq_gmu_err_ao, irq_gmu_err_hfi;
++
++void
++sweet_gpu_set_wake_cb(sweet_gpu_wake_fn fn, void *arg)
++{
++	gpu_wake_arg = arg;
++	__atomic_store_n(&gpu_wake_fn, fn, __ATOMIC_RELEASE);
++}
++
++int
++sweet_gpu_irq_enabled(void)
++{
++	return __atomic_load_n(&irq_armed, __ATOMIC_ACQUIRE);
++}
++
++int
++sweet_gpu_irq_fatal(void)
++{
++	return __atomic_load_n(&gpu_irq_error_seen, __ATOMIC_ACQUIRE);
++}
++
++uint64_t
++sweet_gpu_irq_count(void)
++{
++	return __atomic_load_n(&gpu_irq_total, __ATOMIC_RELAXED);
++}
++
++static inline void
++gpu_irq_wake(void)
++{
++	sweet_gpu_wake_fn fn = __atomic_load_n(&gpu_wake_fn, __ATOMIC_ACQUIRE);
++	if (fn != NULL) {
++		fn(gpu_wake_arg);
++	}
++}
++
++void
++sweet_gpu_irq_drain_logs(void)
++{
++	if (__atomic_exchange_n(&irq_cb_fault_pending, 0, __ATOMIC_ACQUIRE)) {
++		LOG("FAULT irq cb%d fsr=%08x far=%llx fsynr=%08x\n",
++		    irq_cb_fault_bank, irq_cb_fault_fsr, irq_cb_fault_far, irq_cb_fault_fsynr);
++	}
++	if (__atomic_exchange_n(&irq_glb_fault_pending, 0, __ATOMIC_ACQUIRE)) {
++		LOG("FAULT irq global gfsr=%08x gsyn0=%08x gsyn1(sid)=%08x\n",
++		    irq_glb_fault_gfsr, irq_glb_fault_gsyn0, irq_glb_fault_gsyn1);
++	}
++	if (__atomic_exchange_n(&irq_gpu_err_pending, 0, __ATOMIC_ACQUIRE)) {
++		LOG("RBBM error irq i0=%08x ci=%08x flt=%08x pr=%08x\n",
++		    irq_gpu_err_i0, irq_gpu_err_ci, irq_gpu_err_flt, irq_gpu_err_pr);
++	}
++	if (__atomic_exchange_n(&irq_gmu_err_pending, 0, __ATOMIC_ACQUIRE)) {
++		LOG("GMU error irq ao=%08x hfi=%08x\n",
++		    irq_gmu_err_ao, irq_gmu_err_hfi);
++	}
++}
++
++static void
++gpu_irq_handler(void *refcon __unused, uint32_t intid __unused)
++{
++	uint32_t st = gr(RBBM_INT_0_STATUS);
++
++	__atomic_fetch_add(&gpu_irq_total, 1, __ATOMIC_RELAXED);
++	if (st == 0) {
++		return;
++	}
++	wr(GPU(RBBM_INT_CLEAR_CMD), st);
++
++	uint32_t err = st & INT0_ERR_MASK;
++	if (err != 0) {
++		/* Mask persistent error bits to prevent a level-triggered storm before EOI. */
++		uint32_t mask = gr(RBBM_INT_0_MASK);
++		wr(GPU(RBBM_INT_0_MASK), mask & ~err);
++		irq_gpu_err_i0 = err;
++		irq_gpu_err_ci = gr(CP_INTERRUPT_STATUS);
++		irq_gpu_err_flt = gr(CP_HW_FAULT);
++		irq_gpu_err_pr = gr(CP_PROTECT_STATUS);
++		__atomic_store_n(&irq_gpu_err_pending, 1, __ATOMIC_RELEASE);
++		__atomic_store_n(&gpu_irq_error_seen, 1, __ATOMIC_RELEASE);
++		kprintf("SWEET GPU: RBBM error irq i0=%08x ci=%08x flt=%08x pr=%08x\n",
++		    err, irq_gpu_err_ci, irq_gpu_err_flt, irq_gpu_err_pr);
++	}
++	if (st & (INT0_CP_CACHE_FLUSH_TS | INT0_ERR_MASK)) {
++		gpu_irq_wake();
++	}
++}
++
++static void
++smmu_cb_irq_handler(void *refcon, uint32_t intid)
++{
++	int bank = (int)(uintptr_t)refcon;
++	if (bank < 0) {
++		return;
++	}
++	uint32_t base = npage * pgsz + (uint32_t)bank * pgsz;
++	vm_offset_t c = SMMU(base);
++	uint32_t fsr = rd32(c + CB_FSR);
++
++	__atomic_fetch_add(&gpu_irq_total, 1, __ATOMIC_RELAXED);
++	if (!(fsr & FSR_ALL)) {
++		return;
++	}
++	uint64_t far = rd64(c + CB_FAR);
++	uint32_t fsynr = rd32(c + CB_FSYNR0);
++	wr(c + CB_FSR, fsr & FSR_ALL);
++	__atomic_fetch_add(&gpu_faults, 1, __ATOMIC_RELAXED);
++	irq_cb_fault_bank = bank;
++	irq_cb_fault_fsr = fsr;
++	irq_cb_fault_far = far;
++	irq_cb_fault_fsynr = fsynr;
++	__atomic_store_n(&irq_cb_fault_pending, 1, __ATOMIC_RELEASE);
++	kprintf("SWEET GPU: SMMU fault irq(intid=%u cb%d) fsr=%08x far=%llx fsynr=%08x\n",
++	    intid, bank, fsr, far, fsynr);
++	if (bank == gcb) {
++		gpu_irq_wake();
++	}
++}
++
++static void
++smmu_global_irq_handler(void *refcon __unused, uint32_t intid)
++{
++	uint32_t gfsr = rd32(SMMU(S_GFSR));
++
++	__atomic_fetch_add(&gpu_irq_total, 1, __ATOMIC_RELAXED);
++	if (gfsr == 0) {
++		return;
++	}
++	uint32_t gsyn0 = rd32(SMMU(S_GFSYNR0));
++	uint32_t gsyn1 = rd32(SMMU(S_GFSYNR1));
++	wr(SMMU(S_GFSR), gfsr);
++	__atomic_fetch_add(&gpu_faults, 1, __ATOMIC_RELAXED);
++	irq_glb_fault_gfsr = gfsr;
++	irq_glb_fault_gsyn0 = gsyn0;
++	irq_glb_fault_gsyn1 = gsyn1;
++	__atomic_store_n(&irq_glb_fault_pending, 1, __ATOMIC_RELEASE);
++	kprintf("SWEET GPU: SMMU global fault irq(intid=%u) gfsr=%08x gsyn0=%08x gsyn1(sid)=%08x\n",
++	    intid, gfsr, gsyn0, gsyn1);
++}
++
++static void
++gmu_hfi_irq_handler(void *refcon __unused, uint32_t intid)
++{
++	uint32_t info = rd32(GMU(GMU_GMU2HOST_INTR_INFO));
++
++	__atomic_fetch_add(&gpu_irq_total, 1, __ATOMIC_RELAXED);
++	if (info == 0) {
++		return;
++	}
++	wr(GMU(GMU_GMU2HOST_INTR_CLR), info);
++	if (info & INTR_CM3_FAULT) {
++		uint32_t mask = rd32(GMU(GMU_GMU2HOST_INTR_MASK));
++		wr(GMU(GMU_GMU2HOST_INTR_MASK), mask | INTR_CM3_FAULT);
++		irq_gmu_err_hfi = info;
++		__atomic_store_n(&irq_gmu_err_pending, 1, __ATOMIC_RELEASE);
++		__atomic_store_n(&gpu_irq_error_seen, 1, __ATOMIC_RELEASE);
++		kprintf("SWEET GPU: GMU CM3_FAULT irq(intid=%u) info=%08x\n", intid, info);
++		gpu_irq_wake();
++	}
++}
++
++static void
++gmu_ao_irq_handler(void *refcon __unused, uint32_t intid)
++{
++	uint32_t st = rd32(GMU(GMU_AO_HOST_INTR_STATUS));
++
++	__atomic_fetch_add(&gpu_irq_total, 1, __ATOMIC_RELAXED);
++	if (st == 0) {
++		return;
++	}
++	wr(GMU(GMU_AO_HOST_INTR_CLR), st);
++	uint32_t err = st & GMU_AO_ERR_MASK;
++	if (err != 0) {
++		uint32_t mask = rd32(GMU(GMU_AO_HOST_INTR_MASK));
++		wr(GMU(GMU_AO_HOST_INTR_MASK), mask | err);
++		irq_gmu_err_ao = err;
++		__atomic_store_n(&irq_gmu_err_pending, 1, __ATOMIC_RELEASE);
++		kprintf("SWEET GPU: GMU AO irq(intid=%u) st=%08x\n", intid, st);
++		if (err & GMU_AO_WDOG_BITE) {
++			__atomic_store_n(&gpu_irq_error_seen, 1, __ATOMIC_RELEASE);
++			gpu_irq_wake();
++		}
++	}
++}
++
++static void
++gpu_irq_disarm(void)
++{
++	if (!__atomic_exchange_n(&irq_armed, 0, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	sweet_gic_disable_spi(SWEET_GPU_INTID);
++	sweet_gic_disable_spi(SWEET_GMU_HFI_INTID);
++	sweet_gic_disable_spi(SWEET_GMU_AO_INTID);
++	sweet_gic_disable_spi(SWEET_SMMU_GLB0_INTID);
++	sweet_gic_disable_spi(SWEET_SMMU_GLB1_INTID);
++	if (gcb >= 0) {
++		sweet_gic_disable_spi(SWEET_SMMU_CB_INTID(gcb));
++	}
++	if (cb >= 0 && cb != gcb) {
++		sweet_gic_disable_spi(SWEET_SMMU_CB_INTID(cb));
++	}
++	if (g.gpu) {
++		wr(GPU(RBBM_INT_0_MASK), 0);
++	}
++	if (g.gmu) {
++		wr(GMU(GMU_AO_HOST_INTR_MASK), ~0u);
++	}
++	if (g.smmu) {
++		if (gcbbase) {
++			wr(SMMU(gcbbase + CB_SCTLR), rd32(SMMU(gcbbase + CB_SCTLR)) & ~SCTLR_CFIE);
++		}
++		if (cbbase) {
++			wr(SMMU(cbbase + CB_SCTLR), rd32(SMMU(cbbase + CB_SCTLR)) & ~SCTLR_CFIE);
++		}
++		wr(SMMU(S_CR0), rd32(SMMU(S_CR0)) & ~S_CR0_GFIE);
++	}
++}
++
++static void
++gpu_irq_arm(void)
++{
++	if (!irq_boot_arg) {
++		LOG("IRQs disabled by boot-arg (sweetgpuirq=0): using polled waits\n");
++		return;
++	}
++	/* Clear pending hardware sources and enable device interrupt masks before unmasking at GIC. */
++	if (gcbbase) {
++		wr(SMMU(gcbbase + CB_FSR), FSR_ALL);
++		wr(SMMU(gcbbase + CB_SCTLR), rd32(SMMU(gcbbase + CB_SCTLR)) | SCTLR_CFIE);
++	}
++	if (cbbase) {
++		wr(SMMU(cbbase + CB_FSR), FSR_ALL);
++		wr(SMMU(cbbase + CB_SCTLR), rd32(SMMU(cbbase + CB_SCTLR)) | SCTLR_CFIE);
++	}
++	wr(SMMU(S_GFSR), rd32(SMMU(S_GFSR)));
++	wr(SMMU(S_CR0), rd32(SMMU(S_CR0)) | S_CR0_GFIE);
++
++	wr(GPU(RBBM_INT_CLEAR_CMD), ~0u);
++	wr(GPU(RBBM_INT_0_MASK), INT0_ACTIVE_MASK);
++
++	wr(GMU(GMU_GMU2HOST_INTR_CLR), ~0u);
++	wr(GMU(GMU_GMU2HOST_INTR_MASK), ~(INTR_MSGQ | INTR_CM3_FAULT));
++	wr(GMU(GMU_AO_HOST_INTR_CLR), ~0u);
++	wr(GMU(GMU_AO_HOST_INTR_MASK), ~GMU_AO_ERR_MASK);
++
++	if (sweet_gic_register_spi(SWEET_GPU_INTID, 0, gpu_irq_handler, NULL, 1) != 0) {
++		wr(GPU(RBBM_INT_0_MASK), 0);
++		wr(GMU(GMU_AO_HOST_INTR_MASK), ~0u);
++		LOG("GIC SPI registration failed for INTID %u: falling back to polled waits\n", SWEET_GPU_INTID);
++		return;
++	}
++	if (gcb >= 0) {
++		(void)sweet_gic_register_spi(SWEET_SMMU_CB_INTID(gcb), 1, smmu_cb_irq_handler,
++		    (void *)(uintptr_t)gcb, 1);
++	}
++	if (cb >= 0 && cb != gcb) {
++		(void)sweet_gic_register_spi(SWEET_SMMU_CB_INTID(cb), 1, smmu_cb_irq_handler,
++		    (void *)(uintptr_t)cb, 1);
++	}
++	(void)sweet_gic_register_spi(SWEET_GMU_HFI_INTID, 0, gmu_hfi_irq_handler, NULL, 1);
++	(void)sweet_gic_register_spi(SWEET_GMU_AO_INTID, 0, gmu_ao_irq_handler, NULL, 1);
++	(void)sweet_gic_register_spi(SWEET_SMMU_GLB0_INTID, 0, smmu_global_irq_handler, NULL, 1);
++	(void)sweet_gic_register_spi(SWEET_SMMU_GLB1_INTID, 0, smmu_global_irq_handler, NULL, 1);
++
++	__atomic_store_n(&irq_armed, 1, __ATOMIC_RELEASE);
++	LOG("IRQs armed: GPU=%u GMU=%u/%u SMMU_CB=%u/%u glb=%u/%u\n",
++	    SWEET_GPU_INTID, SWEET_GMU_HFI_INTID, SWEET_GMU_AO_INTID,
++	    gcb >= 0 ? SWEET_SMMU_CB_INTID(gcb) : 0u,
++	    cb >= 0 ? SWEET_SMMU_CB_INTID(cb) : 0u,
++	    SWEET_SMMU_GLB0_INTID, SWEET_SMMU_GLB1_INTID);
++}
++
+ int
+ sweet_gpu_fence_done(uint32_t fence)
+ {
+@@ -2283,6 +2616,7 @@ sweet_gpu_report(const char *why)
+ 	if (!gpu_ready) {
+ 		return;
+ 	}
++	sweet_gpu_irq_drain_logs();
+ 	uint32_t done = ((volatile uint32_t *)scratch)[SCR_FENCE];
+ 	LOG("report (%s): fence=%u/%u rptr=%u shadow=%u wptr=%u st=%08x i0=%08x flt=%08x ci=%08x pr=%08x\n",
+ 	    why, done, gpu_fence, gr(CP_RB_RPTR), ((volatile uint32_t *)scratch)[SCR_SHADOW], wp,
+@@ -2292,7 +2626,7 @@ sweet_gpu_report(const char *why)
+ 	    ((uint64_t)gr(CP_IB1_BASE + 1) << 32) | gr(CP_IB1_BASE), gr(CP_IB1_REM_SIZE),
+ 	    ((uint64_t)gr(CP_IB2_BASE + 1) << 32) | gr(CP_IB2_BASE), gr(CP_IB2_REM_SIZE));
+ 	if (faulted(why)) {
+-		gpu_faults++;
++		__atomic_fetch_add(&gpu_faults, 1, __ATOMIC_RELAXED);
+ 		if (gcbbase) {
+ 			wr(SMMU(gcbbase + CB_FSR), FSR_ALL);
+ 		}
+@@ -2332,7 +2666,7 @@ sweet_gpu_submit(const uint64_t *ib_iovas, const uint32_t *ib_dwords, uint32_t n
+ 	}
+ 	pkt7(CP_WAIT_FOR_IDLE, 0);
+ 	pkt7(CP_EVENT_WRITE, 4);
+-	emit(EVENT_CACHE_FLUSH);
++	emit(EVENT_CACHE_FLUSH | (__atomic_load_n(&irq_armed, __ATOMIC_ACQUIRE) ? CP_EVENT_WRITE_IRQ : 0u));
+ 	emit(VA_SCRATCH + 4 * SCR_FENCE);
+ 	emit(0);
+ 	emit(gpu_fence);
+@@ -2348,7 +2682,10 @@ sweet_gpu_g1(int keep, struct sweet_gpu_result *res)
+ 	int ok = 0;
+ 
+ 	bzero(res, sizeof(*res));
+-	LOG("G1 start (sweetgpu=%d: %s)\n", keep ? 2 : 1, keep ? "leave the GPU on" : "power down after the test");
++	irq_boot_arg = 1;
++	(void)PE_parse_boot_argn("sweetgpuirq", &irq_boot_arg, sizeof(irq_boot_arg));
++	LOG("G1 start (sweetgpu=%d: %s, sweetgpuirq=%d)\n", keep ? 2 : 1,
++	    keep ? "leave the GPU on" : "power down after the test", irq_boot_arg ? 1 : 0);
+ 	res->stage = 0;
+ 	if (!setup()) {
+ 		return -1;
+@@ -2412,6 +2749,7 @@ down:
+ 	}
+ 	if (ok && keep) {
+ 		bo_init();
++		gpu_irq_arm();
+ 		gpu_ready = 1;
+ 		res->kept_on = 1;
+ 		LOG("GPU left on: GMU running, GX held by OOB GPU_SET, ring idle at wptr %u, BO pool %u pages (%u KiB)\n",
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 1d564fc..dfabe74 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -96,6 +96,12 @@ struct sweet_gpu_mem_stats {
+ };
+ void sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st);          /* gSweetGPULock held */
+ const char *sweet_gpu_bo_error(int err);
++typedef void (*sweet_gpu_wake_fn)(void *arg);
++void sweet_gpu_set_wake_cb(sweet_gpu_wake_fn fn, void *arg);
++int sweet_gpu_irq_enabled(void);
++int sweet_gpu_irq_fatal(void);
++uint64_t sweet_gpu_irq_count(void);
++void sweet_gpu_irq_drain_logs(void);
+ bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);
+ int sweet_bind_current_thread(int cpu);                         /* osfmk/kern/sched_prim.c */
+ void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+@@ -103,6 +109,8 @@ kern_return_t thread_terminate(thread_t);                       /* Mach MIG, not
+ }
+ 
+ static IOLock *gSweetGPULock;
++static IOSimpleLock *gGpuIrqLock;
++static int gGpuWaitChannel;
+ static bool gSweetGPUReported;
+ static volatile int gSweetGPUState;     /* 0 = starting, 1 = on, -1 = off/failed */
+ static volatile uint32_t gSurfaceFence[4096];
+@@ -121,6 +129,7 @@ static uint64_t gSweetGPUSecondAbs;             /* ... or after one second (mach
+ static uint64_t gStatSubmits, gStatImports, gStatHangs, gStatOpens, gStatLogLines, gStatLogDropped;
+ static uint64_t gStatImportFails, gStatImportedBytes, gStatImportLogs;  /* 0112 */
+ static uint64_t gStatAllocFails, gStatBOs;                              /* 0114 */
++static uint64_t gStatWaitsSlept, gStatWaitsSpun;                        /* 0115 */
+ static uint32_t gStatClients;
+ static uint64_t gStatEvents, gStatPublishedEvents, gStatPublishedAt;
+ static char gStatLastClient[SWEET_GPU_NAME_MAX];        /* under gSweetGPUStatLock */
+@@ -146,6 +155,17 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetGPU, IOService);
+ 
++static void
++sweet_gpu_irq_wakeup(void *arg __unused)
++{
++	if (gGpuIrqLock == NULL) {
++		return;
++	}
++	IOInterruptState istate = IOSimpleLockLockDisableInterrupt(gGpuIrqLock);
++	thread_wakeup((event_t)&gGpuWaitChannel);
++	IOSimpleLockUnlockEnableInterrupt(gGpuIrqLock, istate);
++}
++
+ /*
+  * Copy the counters to the registry. Called with no lock held (setProperty takes the registry's
+  * own lock). Unforced calls return at once unless SWEET_GPU_STAT_EVENTS events or a second have
+@@ -155,7 +175,12 @@ static void
+ sweet_gpu_stat_publish(bool force, const char *client)
+ {
+ 	SweetGPU *service = gSweetGPUService;
+-	uint64_t events = SWEET_STAT_LOAD(gStatEvents), now = mach_absolute_time();
++	uint64_t irqs = sweet_gpu_irq_count();
++	uint64_t faults = 0;
++	if (!sweet_gpu_get_param(0x09u, &faults)) {     /* MSM_PARAM_FAULTS: SMMU faults seen by IRQ / report */
++		faults = 0;
++	}
++	uint64_t events = SWEET_STAT_LOAD(gStatEvents) + irqs + faults, now = mach_absolute_time();
+ 
+ 	if (service == NULL || gSweetGPUStatLock == NULL) {
+ 		return;
+@@ -179,10 +204,7 @@ sweet_gpu_stat_publish(bool force, const char *client)
+ 		strlcpy(gStatLastClient, client, sizeof(gStatLastClient));
+ 		service->setProperty("SweetGPULastClient", gStatLastClient);
+ 	}
+-	uint64_t faults = 0, hangs = SWEET_STAT_LOAD(gStatHangs);
+-	if (!sweet_gpu_get_param(0x09u, &faults)) {     /* MSM_PARAM_FAULTS: SMMU faults seen by sweet_gpu_report() */
+-		faults = 0;
+-	}
++	uint64_t hangs = SWEET_STAT_LOAD(gStatHangs);
+ 	service->setProperty("SweetGPUSubmits", (unsigned long long)SWEET_STAT_LOAD(gStatSubmits), 64);
+ 	service->setProperty("SweetGPUImports", (unsigned long long)SWEET_STAT_LOAD(gStatImports), 64);
+ 	service->setProperty("SweetGPUImportFails", (unsigned long long)SWEET_STAT_LOAD(gStatImportFails), 64);
+@@ -191,6 +213,9 @@ sweet_gpu_stat_publish(bool force, const char *client)
+ 	service->setProperty("SweetGPUOpens", (unsigned long long)SWEET_STAT_LOAD(gStatOpens), 64);
+ 	service->setProperty("SweetGPUFaults", (unsigned long long)(faults + hangs), 64);
+ 	service->setProperty("SweetGPUHangs", (unsigned long long)hangs, 64);
++	service->setProperty("SweetGPUIrqs", (unsigned long long)irqs, 64);
++	service->setProperty("SweetGPUWaitsSlept", (unsigned long long)SWEET_STAT_LOAD(gStatWaitsSlept), 64);
++	service->setProperty("SweetGPUWaitsSpun", (unsigned long long)SWEET_STAT_LOAD(gStatWaitsSpun), 64);
+ 	service->setProperty("SweetGPULogLines", (unsigned long long)SWEET_STAT_LOAD(gStatLogLines), 64);
+ 	service->setProperty("SweetGPULogDropped", (unsigned long long)SWEET_STAT_LOAD(gStatLogDropped), 64);
+ 	service->setProperty("SweetGPUAllocFails", (unsigned long long)SWEET_STAT_LOAD(gStatAllocFails), 64);
+@@ -243,8 +268,10 @@ SweetGPU::bringup(void *arg, wait_result_t wr)
+ 	self->setProperty("SweetGPUMagic", (unsigned long long)r.magic, 64);
+ 	self->setProperty("SweetGPUFirmwareGMU", (unsigned long long)r.gmu_fw_version, 64);
+ 	self->setProperty("SweetGPUFirmwareSQE", (unsigned long long)r.sqe_version, 64);
++	self->setProperty("SweetGPUIrqMode", sweet_gpu_irq_enabled() ? "irq" : "poll");
+ 	self->setProperty("SweetGPUState", rc ? "failed" : r.kept_on ? "on" : "off");
+ 	gSweetGPUState = (!rc && r.kept_on) ? 1 : -1;
++	sweet_gpu_stat_publish(true, NULL);
+ 	self->registerService();
+ 	IOLog("SWEET GPU: service registered (stage %u, magic 0x%08x, %s)\n", r.stage, r.magic,
+ 	    rc ? "failed" : r.kept_on ? "GPU on" : "GPU off");
+@@ -280,6 +307,13 @@ SweetGPU::start(IOService *provider)
+ 			return false;
+ 		}
+ 	}
++	if (gGpuIrqLock == NULL) {
++		gGpuIrqLock = IOSimpleLockAlloc();
++		if (gGpuIrqLock == NULL) {
++			return false;
++		}
++	}
++	sweet_gpu_set_wake_cb(sweet_gpu_irq_wakeup, NULL);
+ 	if (gSweetGPUStatLock == NULL) {
+ 		gSweetGPUStatLock = IOLockAlloc();
+ 		if (gSweetGPUStatLock == NULL) {
+@@ -575,23 +609,51 @@ sweet_gpu_wait_locked(uint32_t fence, uint64_t ms)
+ 	uint64_t began = mach_absolute_time(), patience = 0;
+ 
+ 	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &patience);
++	uint64_t deadline = began + patience;
++	bool use_irq = (sweet_gpu_irq_enabled() != 0 && gGpuIrqLock != NULL);
+ 	for (;;) {
+ 		if (sweet_gpu_fence_done(fence)) {
++			sweet_gpu_irq_drain_logs();
+ 			return true;
+ 		}
+-		if (mach_absolute_time() - began >= patience || gSweetGPUReported) {
++		if (mach_absolute_time() - began >= patience || gSweetGPUReported || sweet_gpu_irq_fatal()) {
+ 			break;
+ 		}
+-		IOLockUnlock(gSweetGPULock);
+-		delay_for_interval(50, NSEC_PER_USEC);
+-		IOLockLock(gSweetGPULock);
++		if (use_irq) {
++			IOInterruptState istate = IOSimpleLockLockDisableInterrupt(gGpuIrqLock);
++			if (sweet_gpu_fence_done(fence)) {
++				IOSimpleLockUnlockEnableInterrupt(gGpuIrqLock, istate);
++				sweet_gpu_irq_drain_logs();
++				return true;
++			}
++			wait_result_t wres = assert_wait_deadline((event_t)&gGpuWaitChannel,
++			    THREAD_INTERRUPTIBLE, deadline);
++			IOSimpleLockUnlockEnableInterrupt(gGpuIrqLock, istate);
++			sweet_gpu_stat_event(&gStatWaitsSlept);
++			IOLockUnlock(gSweetGPULock);
++			if (wres == THREAD_WAITING) {
++				wres = thread_block(THREAD_CONTINUE_NULL);
++			}
++			IOLockLock(gSweetGPULock);
++			sweet_gpu_irq_drain_logs();
++			if (wres == THREAD_INTERRUPTED) {
++				return sweet_gpu_fence_done(fence);
++			}
++		} else {
++			sweet_gpu_stat_event(&gStatWaitsSpun);
++			IOLockUnlock(gSweetGPULock);
++			delay_for_interval(50, NSEC_PER_USEC);
++			IOLockLock(gSweetGPULock);
++		}
+ 	}
+-	if (ms >= 500) {
++	sweet_gpu_irq_drain_logs();
++	bool fatal = sweet_gpu_irq_fatal() != 0;
++	if (ms >= 500 || fatal) {
+ 		sweet_gpu_stat_event(&gStatHangs);
+ 	}
+-	if (ms >= 500 && !gSweetGPUReported) {
++	if ((ms >= 500 || fatal) && !gSweetGPUReported) {
+ 		gSweetGPUReported = true;
+-		sweet_gpu_report("wait timeout");
++		sweet_gpu_report(fatal ? "irq fault" : "wait timeout");
+ 	}
+ 	return false;
+ }
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..3c5e3dd 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1882,11 +1882,15 @@ sleh_irq(arm_saved_state_t *state)
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
+-			cdp->interrupt_handler(cdp->interrupt_target,
+-			    cdp->interrupt_refCon,
+-			    cdp->interrupt_nub,
+-			    intid);
++		if (!sweet_gic_handle_irq(intid)) {
++			if (cdp->interrupt_handler) {
++				cdp->interrupt_handler(cdp->interrupt_target,
++				    cdp->interrupt_refCon,
++				    cdp->interrupt_nub,
++				    intid);
++			} else if (intid >= 32) {
++				sweet_gic_disable_spi(intid);
++			}
+ 		}
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	}
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..a86fd09 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/arm/protos.h>
+ 
+ 
+ #if HAS_GIC_V3
+@@ -20,6 +21,16 @@ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS,
+ #if defined(SWEET)
+ /* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+ SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++SECURITY_READ_ONLY_LATE(static uint32_t) sweet_gic_max_intid;
++SECURITY_READ_ONLY_LATE(static uint64_t) sweet_boot_irouter;
++
++struct sweet_spi_desc {
++	sweet_spi_handler_t handler;
++	void *refcon;
++	int active;
++};
++static struct sweet_spi_desc sweet_spi_table[SWEET_GIC_MAX_INTID];
++static volatile int sweet_spi_lock;
+ #endif
+ 
+ static vm_offset_t gicd_base;
+@@ -44,12 +55,138 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ 	*((volatile uint32_t *) addr) = value;
+ }
+ 
++#if defined(SWEET)
++static void
++_gic_write64(vm_offset_t addr, uint64_t value)
++{
++	*((volatile uint64_t *) addr) = value;
++}
++#endif
++
+ #define gicd_read32(offset) (_gic_read32(gicd_base + (offset)))
+ #define gicd_write32(offset, data) (_gic_write32(gicd_base + (offset), (data)))
++#if defined(SWEET)
++#define gicd_write64(offset, data) (_gic_write64(gicd_base + (offset), (data)))
++#endif
+ #define gicr_read32(offset) (_gic_read32(gicr_pe_base + (offset)))
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(SWEET)
++static boolean_t
++sweet_spi_lock_acquire(void)
++{
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	while (__atomic_exchange_n(&sweet_spi_lock, 1, __ATOMIC_ACQUIRE) != 0) {
++		__asm__ volatile ("yield");
++	}
++	return istate;
++}
++
++static void
++sweet_spi_lock_release(boolean_t istate)
++{
++	__atomic_store_n(&sweet_spi_lock, 0, __ATOMIC_RELEASE);
++	(void)ml_set_interrupts_enabled(istate);
++}
++
++static void
++gicd_wait_rwp(void)
++{
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++}
++
++int
++sweet_gic_register_spi(uint32_t intid, int edge_triggered, sweet_spi_handler_t handler, void *refcon, int enable)
++{
++	if (!gicd_base || intid < 32U || intid >= sweet_gic_max_intid || intid >= SWEET_GIC_MAX_INTID ||
++	    handler == NULL) {
++		return -1;
++	}
++
++	uint32_t word = intid / 32U;
++	uint32_t bit = 1U << (intid % 32U);
++	boolean_t istate = sweet_spi_lock_acquire();
++
++	/* Mask while configuring trigger mode, group, priority, and target CPU. */
++	gicd_write32(GICD_ICENABLER(word), bit);
++	gicd_wait_rwp();
++
++	uint32_t grp = gicd_read32(GICD_IGROUPR(word));
++	gicd_write32(GICD_IGROUPR(word), grp | bit);
++
++	uint32_t pshift = 8U * (intid % 4U);
++	uint32_t prio = gicd_read32(GICD_IPRIORITYR(intid / 4U));
++	prio = (prio & ~(0xffU << pshift)) | (0xa0U << pshift);
++	gicd_write32(GICD_IPRIORITYR(intid / 4U), prio);
++
++	uint32_t cfgshift = 2U * (intid % 16U) + 1U;
++	uint32_t icfgr = gicd_read32(GICD_ICFGR(intid / 16U));
++	if (edge_triggered) {
++		icfgr |= (1U << cfgshift);
++	} else {
++		icfgr &= ~(1U << cfgshift);
++	}
++	gicd_write32(GICD_ICFGR(intid / 16U), icfgr);
++
++	gicd_write64(GICD_IROUTER(intid), sweet_boot_irouter);
++	gicd_write32(GICD_ICPENDR(word), bit);
++	__asm__ volatile ("dsb sy" : : : "memory");
++
++	sweet_spi_table[intid].handler = handler;
++	sweet_spi_table[intid].refcon = refcon;
++	__atomic_store_n(&sweet_spi_table[intid].active, 1, __ATOMIC_RELEASE);
++
++	if (enable) {
++		gicd_write32(GICD_ISENABLER(word), bit);
++		__asm__ volatile ("dsb sy" : : : "memory");
++	}
++	sweet_spi_lock_release(istate);
++	return 0;
++}
++
++void
++sweet_gic_enable_spi(uint32_t intid)
++{
++	if (!gicd_base || intid < 32U || intid >= sweet_gic_max_intid || intid >= SWEET_GIC_MAX_INTID) {
++		return;
++	}
++	gicd_write32(GICD_ISENABLER(intid / 32U), 1U << (intid % 32U));
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++void
++sweet_gic_disable_spi(uint32_t intid)
++{
++	if (!gicd_base || intid < 32U || intid >= sweet_gic_max_intid || intid >= SWEET_GIC_MAX_INTID) {
++		return;
++	}
++	gicd_write32(GICD_ICENABLER(intid / 32U), 1U << (intid % 32U));
++	gicd_wait_rwp();
++}
++
++int
++sweet_gic_handle_irq(uint32_t intid)
++{
++	if (intid < 32U || intid >= sweet_gic_max_intid || intid >= SWEET_GIC_MAX_INTID) {
++		return 0;
++	}
++	if (!__atomic_load_n(&sweet_spi_table[intid].active, __ATOMIC_ACQUIRE)) {
++		return 0;
++	}
++	sweet_spi_handler_t fn = sweet_spi_table[intid].handler;
++	void *refcon = sweet_spi_table[intid].refcon;
++	if (fn == NULL) {
++		return 0;
++	}
++	fn(refcon, intid);
++	return 1;
++}
++#endif /* SWEET */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -141,6 +278,26 @@ pe_init_fiq()
+ 		}
+ 
+ 		gicr_size = gicr_size_prop;
++
++#if defined(SWEET)
++		uint32_t typer = gicd_read32(GICD_TYPER);
++		uint32_t max_lines = 32U * ((typer & GICD_TYPER_ITLINES_MASK) + 1U);
++		if (max_lines > SWEET_GIC_MAX_INTID) {
++			max_lines = SWEET_GIC_MAX_INTID;
++		}
++		if (gicd_size_prop <= 0x6000) {
++			max_lines = 32U;
++		} else {
++			uint32_t by_sz = (uint32_t)((gicd_size_prop - 0x6000) / 8ULL);
++			if (max_lines > by_sz) {
++				max_lines = by_sz;
++			}
++		}
++		sweet_gic_max_intid = max_lines;
++		sweet_boot_irouter = __builtin_arm_rsr64("MPIDR_EL1") & 0xff00ffffffULL;
++		kprintf("SWEET GIC: typer=0x%08x max_intid=%u boot_irouter=0x%llx\n",
++		    typer, sweet_gic_max_intid, sweet_boot_irouter);
++#endif
+ 	}
+ 
+ 	// Find the redistributor for this processor
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..daf9b4a 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,11 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++typedef void (*sweet_spi_handler_t)(void *refcon, uint32_t intid);
++int sweet_gic_register_spi(uint32_t intid, int edge_triggered, sweet_spi_handler_t handler, void *refcon, int enable);
++void sweet_gic_enable_spi(uint32_t intid);
++void sweet_gic_disable_spi(uint32_t intid);
++int sweet_gic_handle_irq(uint32_t intid);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..3bddd56 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -56,6 +56,19 @@
+ 
+ /* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
+ #define GICD_CTLR                 0x0
++#define GICD_TYPER                0x0004
++#define GICD_IGROUPR(n)           (0x0080 + 4 * (n))
++#define GICD_ISENABLER(n)         (0x0100 + 4 * (n))
++#define GICD_ICENABLER(n)         (0x0180 + 4 * (n))
++#define GICD_ICPENDR(n)           (0x0280 + 4 * (n))
++#define GICD_IPRIORITYR(n)        (0x0400 + 4 * (n))
++#define GICD_ICFGR(n)             (0x0c00 + 4 * (n))
++#define GICD_IROUTER(n)           (0x6000 + 8 * (n))
++
++#define GICD_TYPER_ITLINES_MASK   0x1fU
++#define GICD_ICFGR_LEVEL          0U
++#define GICD_ICFGR_EDGE           1U
++#define SWEET_GIC_MAX_INTID       512U
+ 
+ /* Non-secure view of GICD_CTLR (DS=0) */
+ #define GICD_CTLR_ENABLEGRP1      0x1
