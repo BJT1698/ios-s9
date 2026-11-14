@@ -143,6 +143,17 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
     - `ir3` vertex + fragment shader compile, RGB triangle draw + `glReadPixels`: corner `26 26 51 255`, red `213 22 20 255`, green `22 213 20 255`, blue `14 15 226 255`, coverage `17086/65536` (26% by geometry); output saved to `op6/out/sweet-gl-triangle.ppm`/`.png`.
     - 100-frame (`207 us/frame`) and 500-frame (`180 us/frame`, ~5555 fps) render loops pass with `faults 0; error 0: MESA DRAWS WITH THE GPU`.
 
+## 5b. Status of GPU G4 (verified on device 2026-11-14)
+
+- **CoreAnimation renders on the Adreno 630.** The pieces:
+  - `boot-G4d.img`: kernel run `43583724699`, with `0110` (sweetinject at env time; 0109's version never fired) and `0111` (ioreg counters `SweetGPUSubmits/Imports/Clients/LastClient/Faults/Hangs/LogLines`, plus selector `0x7f` = bridge log into dmesg as `sweet-gl[proc]:`).
+  - ADT `op6/out/op6-gpu128.adt` (`--gpu-fw ../gpu-fw --gpu-dma 0xa0000000,0x08000000`, 128 MiB).
+  - boot-args as D, plus `sweetgpu=2 sweetgpudelay=30 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd`.
+- **Userland from CI:** op6-mesa run `43583728286` (macos-26), artifact with `lib/` plus `dSYM/`. Installed on the phone in `/usr/local/lib`: `libOSMesa.8.dylib`, `libsweet-gl.dylib`, `libsweet-ca.dylib`. The earlier unverified prebuilt libs are in `/var/root/old-libs` on the phone; do not reinstall them.
+- **Memory:** 64 MiB was not enough. Mesa crashed in `fd_bo_ref(NULL)` after `fd_bo_heap_alloc` failed. With 128 MiB the phone ran 5+ minutes stable (7447 submits, 0 faults).
+- **Performance:** about 16–26 fps. Every frame is rendered off-screen and copied out ("1 picture copied out, 0 drawn in place"). Next step: zero-copy present.
+- **Symbolizing a backboardd crash:** take the .ips from `/var/mobile/Library/Logs/CrashReporter/`, then run `llvm-symbolizer --obj=<dSYM DWARF file> <imageOffset>`. The dylib's `__TEXT` vmaddr is 0.
+
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
 - **G4:** EAGL bridge inside backboardd (`libsweet-gl.dylib` + `libsweet-ca.dylib` + kernel selector `0x7e` IOSurface import), so that CoreAnimation renders through Mesa on the Adreno 630. Read `s9/ESTUDO-2026-10-25-gpu.md` section 2.
