@@ -1,0 +1,1035 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2cc87e4..3533fb8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -56,6 +56,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern "C" int sweet_bind_current_thread(int cpu);   /* osfmk/kern/sched_prim.c */
+ extern "C" void thread_set_thread_name(thread_t th, const char *name);  /* osfmk/kern/thread.c */
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);      /* iokit/Kernel/arm/SweetGPU.cpp */
++extern "C" bool sweet_gpu_surface_wait(uint32_t id, void *kernel, uint64_t size, bool *waitedOut);
+ 
+ /*
+  * Galaxy S9: the framebuffer's own threads (the present work loop: cache
+@@ -98,6 +99,7 @@ s9_panel_autorefresh(uint32_t every_te)
+ #include <IOKit/IOInterruptEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ #include <sys/sysctl.h>
+@@ -114,6 +116,14 @@ s9_panel_autorefresh(uint32_t every_te)
+ #define S9_CTL0_FLUSH           (0x2000 + 0x018)
+ #define S9_VIG(p)               ((p) ? 0x7000 : 0x5000)
+ #define S9_FLUSH_BITS           ((1U << 17) | (1U << 1) | (1U << 0))    /* CTL, VIG1, VIG0 */
++#define OP6_FLUSH_BITS          ((1U << 17) | (1U << 0))                /* CTL, VIG0 only */
++#define OP6_SLOT_PA             0x9de00000ULL   /* inside splash@9d400000..0x9f800000, outside panel FB & XNU */
++#define OP6_SLOT_SIZE           0x720000ULL     /* covers 828x1792 'b3a8' (0x71c000 B) + alignment */
++#define OP6_SLOT_COUNT          3U
++#define OP6_PANEL_W             1080U
++#define OP6_PANEL_H             2280U
++#define OP6_ABL_FMT             0x000237ffU
++#define OP6_ABL_UNPACK          0x03020001U
+ #define S9_INTR_STATUS          0x1014          /* MDP top interrupts (sde_hw_interrupts.c) */
+ #define S9_INTR_CLEAR           0x1018
+ #define S9_INTR_INTF1_UNDERRUN  (1U << 26)      /* INTF_1 = DSI0, the panel */
+@@ -126,12 +136,16 @@ s9_panel_autorefresh(uint32_t every_te)
+ #define SSPP_OUT_XY             0x10
+ #define SSPP_SRC0_ADDR          0x14
+ #define SSPP_YSTRIDE0           0x24
++#define SSPP_FORMAT             0x30
++#define SSPP_UNPACK             0x34
+ #define SSPP_OP_MODE            0x38
++#define OP_PE_OVERRIDE          (1U << 31)
+ #define SSPP_DECIMATION         0xb4
+ #define SSPP_PE(c)              (0x100 + 0x10 * (c))    /* pixel extension C0, C1C2, C3: LR, TB, REQ */
+ #define QS                      0xa00                   /* QSEED3 in the VIG pipe */
+ #define QS_VERSION              0x00
+ #define QS_OP_MODE              0x04
++#define QS_PHASE_INIT           0x0c                    /* version 0x1002 only */
+ #define QS_STEP_Y_H             0x10
+ #define QS_STEP_Y_V             0x14
+ #define QS_STEP_UV_H            0x18
+@@ -156,6 +170,7 @@ static const uint16_t sweet_zc_regs[] = {
+ 	QS + QS_INIT_Y_H, QS + QS_INIT_Y_V, QS + QS_INIT_UV_H, QS + QS_INIT_UV_V,
+ };
+ #define SWEET_ZC_NREGS          (sizeof(sweet_zc_regs) / sizeof(sweet_zc_regs[0]))
++#define SWEET_ZC_R_OP_MODE      6
+ 
+ static inline uint32_t
+ s9_rd(vm_offset_t a)
+@@ -169,8 +184,23 @@ s9_wr(vm_offset_t a, uint32_t v)
+ 	*(volatile uint32_t *)a = v;
+ }
+ 
++static bool
++sweet_fb_board_is(const char *want)
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	size_t n = strlen(want) + 1;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "sweet-board", &prop, &size) != kSuccess) {
++		return false;
++	}
++	return size >= n && memcmp(prop, want, n) == 0;
++}
++
+ /*
+- * Galaxy S9: presentation path switches and counters, for measuring from userland.
++ * Galaxy S9 / OP6: presentation path switches and counters, for measuring from userland.
+  * sweetfb_wait: 0 = SwapWait always says "shown" (0095: may tear), 1 = honest:
+  * a poll (flags bit 31, what CoreAnimation sends with page flipping; its
+  * swap_wait_timeout polls it every 100 us for at most 1 ms, then draws into
+@@ -178,12 +208,15 @@ s9_wr(vm_offset_t a, uint32_t v)
+  * sweetfb_fullclean: 1 = clean the whole slot before each flip, 0 = only the
+  * rows the dirty regions say CoreAnimation wrote.
+  */
+-static int sweetfb_zerocopy = 1, sweetfb_wait = 1, sweetfb_fullclean = 1;
++static int sweetfb_zerocopy = 1, sweetfb_wait = 1, sweetfb_fullclean = 1, sweetfb_scale;
+ static uint64_t sweetfb_swaps, sweetfb_flips, sweetfb_copies, sweetfb_present_ns;
+ static uint64_t sweetfb_waits, sweetfb_wait_ns, sweetfb_wait_timeouts, sweetfb_wait_busy;
+ static uint64_t sweetfb_underruns;
++static uint64_t sweetfb_fallbacks, sweetfb_fence_waits, sweetfb_fence_timeouts;
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_zerocopy, CTLFLAG_RW | CTLFLAG_LOCKED, &sweetfb_zerocopy, 0,
+-    "S9: 1 = the display engine scans out CoreAnimation's framebuffers, 0 = CPU copy");
++    "S9/OP6: 1 = the display engine scans out CoreAnimation's framebuffers, 0 = CPU copy");
++SYSCTL_INT(_kern, OID_AUTO, sweetfb_scale, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_scale, 0,
++    "OP6: 1 = sweetfbscale=1 active (MDSS VIG0 + QSEED3 scan-out)");
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &sweetfb_wait, 0,
+     "S9: SwapWait 0 = never waits, 1 = polls answer at once (default), 2 = always waits");
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_fullclean, CTLFLAG_RW | CTLFLAG_LOCKED, &sweetfb_fullclean, 0,
+@@ -191,8 +224,11 @@ SYSCTL_INT(_kern, OID_AUTO, sweetfb_fullclean, CTLFLAG_RW | CTLFLAG_LOCKED, &swe
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_wait_busy, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_wait_busy, "S9: SwapWait polls answered busy");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_underruns, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_underruns, "S9: display interface underruns seen");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_swaps, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_swaps, "S9: swaps received");
+-SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_flips, "S9: frames shown zero-copy");
+-SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_copies, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_copies, "S9: frames copied by the CPU");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_flips, "S9/OP6: frames shown zero-copy");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_copies, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_copies, "S9/OP6: frames copied by the CPU");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_fallbacks, "OP6: zero-copy fallbacks to CPU copy");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_fence_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_fence_waits, "OP6: flips that waited on an in-flight GPU fence");
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_fence_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_fence_timeouts, "OP6: flips skipped because GPU fence timed out");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_present_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_present_ns, "S9: CPU time presenting");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_waits, "S9: SwapWait calls");
+ SYSCTL_QUAD(_kern, OID_AUTO, sweetfb_wait_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &sweetfb_wait_ns, "S9: time in SwapWait");
+@@ -257,19 +293,19 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t                fPresentNs, fPresentMaxNs;     /* stats, logged every 300 frames */
+ 	uint32_t                fPresentCount;
+ 	uint64_t                fStatsStart;    /* mach time of the first frame of the 300 */
+-	uint32_t                fFlipsWin, fCopiesWin;          /* ...and how they were shown */
++	uint32_t                fFlipsWin, fCopiesWin, fFallbacksWin; /* ...and how they were shown */
+ 	uint64_t                fWaitsAtWin, fWaitNsAtWin;
+ 	/*
+-	 * Galaxy S9 zero-copy (see the top): the SDE registers, the splash layout
+-	 * ABL left in VIG0/VIG1 (put back for CPU copies), the scaler geometry.
++	 * Galaxy S9 / OP6 zero-copy (see the top): the SDE registers, the splash
++	 * layout ABL left in VIG0(/VIG1) (put back for CPU copies), the scaler geometry.
+ 	 * fShowLock serializes everything that changes what the panel shows.
+ 	 */
+ 	IOLock                 *fShowLock;
+ 	vm_offset_t             fMdss;
+-	bool                    fZCReady, fZCActive;
++	bool                    fOP6Scale, fZCReady, fZCActive;
+ 	bool                    fPanelStale;    /* the panel memory lags behind the last frame */
+ 	uint32_t                fZCSaved[2][SWEET_ZC_NREGS];
+-	uint32_t                fZCHalf, fZCOutW, fZCOutH;
++	uint32_t                fZCHalf, fZCOutW, fZCOutH, fZCQseedVer, fZCPhaseInit;
+ 	/* Swap ids (fLock): last SwapEnd, last shown, flip handed to the SDE and not yet taken. */
+ 	uint32_t                fEndedID, fPresentedID, fPendingFlipID;
+ 	int32_t                 fDirtyY0, fDirtyY1;     /* canvas rows changed since the last copy (fLock) */
+@@ -284,12 +320,17 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void presentFired(OSObject *owner, IOInterruptEventSource *sender, int count);
+ 	void presentPending(void);
++	void pauseConsoleOnce(void);
++	void updateStatsProperties(void);
++	bool op6Wr32Chk(const char *what, vm_offset_t off, uint32_t val, uint32_t mask);
+ 	bool zeroCopyInit(void);
+-	void zeroCopyStart(void);
++	bool zeroCopyInitOP6(void);
++	bool zeroCopyStart(void);
++	bool zeroCopyStartOP6(void);
+ 	void zeroCopyStop(void);
+ 	bool zeroCopyLatched(void);
+ 	SweetSurface *zeroCopySurface(const uint8_t *rec);
+-	void flip(SweetSurface *s, uint32_t id);
++	bool flip(SweetSurface *s, uint32_t id);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -532,22 +573,31 @@ AppleCLCD::start(IOService *provider)
+ 	fVsync->setTimeoutUS(fVsyncUS);
+ 
+ 	/*
+-	 * Galaxy S9 zero-copy: check ABL's splash layout, then hand the rest of
+-	 * the splash region (after the panel buffer, before TIMA) to SweetSurface
+-	 * as display slots for backboardd's canvas-sized framebuffers.
++	 * Galaxy S9 / OP6 zero-copy: check ABL's splash layout, then hand the
++	 * splash-tail display slots to SweetSurface for backboardd's framebuffers.
++	 * On OP6 this runs ONLY when sweetfbscale=1 on board "oneplus,enchilada".
+ 	 */
+-	int zc = 1;
++	int op6scale = 0, zc = 1;
++	PE_parse_boot_argn("sweetfbscale", &op6scale, sizeof(op6scale));
+ 	PE_parse_boot_argn("sweetfb_zerocopy", &zc, sizeof(zc));
++	fOP6Scale = (op6scale != 0) && sweet_fb_board_is("oneplus,enchilada");
++	sweetfb_scale = fOP6Scale ? 1 : 0;
+ 	sweetfb_zerocopy = zc;
+ 	if (!fVsync60 && fScale && zeroCopyInit()) {
+-		uint32_t bpr = (fLogicalW * 4 + 63) & ~63U;     /* SweetSurface's row alignment */
+-		uint64_t slotSize = round_page((uint64_t)bpr * fLogicalH);
+-		uint64_t base = fPhys + S9_FBCON_SIZE;
+-		uint32_t count = (uint32_t)((S9_SPLASH_END - base) / slotSize);
+-		if (count >= 2) {
+-			sweet_surface_set_display_slots(base, slotSize, count, fLogicalW, fLogicalH, SWEET_FB_FORMAT_BGRA);
++		if (fOP6Scale) {
++			sweet_surface_set_display_slots_ex(OP6_SLOT_PA, OP6_SLOT_SIZE, OP6_SLOT_COUNT,
++			    fLogicalW, fLogicalH, SWEET_SURFACE_FMT_B3A8, SWEET_SURFACE_FMT_BGRA,
++			    kIOMapWriteCombineCache);
+ 		} else {
+-			fZCReady = false;
++			uint32_t bpr = (fLogicalW * 4 + 63) & ~63U;     /* SweetSurface's row alignment */
++			uint64_t slotSize = round_page((uint64_t)bpr * fLogicalH);
++			uint64_t base = fPhys + S9_FBCON_SIZE;
++			uint32_t count = (uint32_t)((S9_SPLASH_END - base) / slotSize);
++			if (count >= 2) {
++				sweet_surface_set_display_slots(base, slotSize, count, fLogicalW, fLogicalH, SWEET_FB_FORMAT_BGRA);
++			} else {
++				fZCReady = false;
++			}
+ 		}
+ 	}
+ 
+@@ -555,11 +605,15 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	setProperty("SweetWaitsForGPU", true);
++	setProperty("SweetFBScale", fOP6Scale);
++	setProperty("SweetFBZeroCopyReady", fZCReady);
++	updateStatsProperties();
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s, vsync %u us%s, zero-copy %s\n",
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s, vsync %u us%s, zero-copy %s%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+ 	    fCached ? "cached" : "write-combined", fVsyncUS, fVsync60 ? " (copies throttled)" : ", present on swap",
+-	    !fZCReady ? "unavailable" : (sweetfb_zerocopy ? "on" : "off (sysctl kern.sweetfb_zerocopy=1)"));
++	    !fZCReady ? "unavailable" : (sweetfb_zerocopy ? "on" : "off (sysctl kern.sweetfb_zerocopy=1)"),
++	    fOP6Scale ? " [OP6 VIG0+QSEED3]" : "");
+ 	return true;
+ }
+ 
+@@ -675,14 +729,54 @@ AppleCLCD::presentPending(void)
+ 			fWaitsAtWin = sweetfb_waits;
+ 			fWaitNsAtWin = sweetfb_wait_ns;
+ 		}
+-		IOLockLock(fShowLock);
+ 		SweetSurface *zs = (fZCReady && sweetfb_zerocopy) ? zeroCopySurface(rec) : NULL;
++		bool fenceTimeout = false;
++		if (zs != NULL) {
++			bool waited = false;
++			void *kbuf = (zs->mapCache == kIOMapCopybackCache) ? (void *)zs->kernelAddress() : NULL;
++			uint64_t ksz = (kbuf != NULL) ? zs->allocSize : 0;
++			if (!sweet_gpu_surface_wait(zs->id, kbuf, ksz, &waited)) {
++				static uint32_t ft_logged;
++				fenceTimeout = true;
++				OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fence_timeouts);
++				if (ft_logged < 16 || (ft_logged++ & 63) == 0) {
++					IOLog("SWEET FB: swap %u surface %u skipped: GPU fence timeout (%llu total)\n",
++					    id, zs->id, sweetfb_fence_timeouts);
++				}
++				zs->release();
++				zs = NULL;
++			} else if (waited) {
++				OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fence_waits);
++			}
++		}
++		IOLockLock(fShowLock);
++		pauseConsoleOnce();
++		bool flipped = false;
++		bool regFallback = false;
+ 		if (zs != NULL) {
+-			flip(zs, id);           /* shown from the next frame on: SwapWait tells */
++			flipped = flip(zs, id); /* shown from the next frame on: SwapWait tells */
+ 			zs->release();
+-			fFlipsWin++;
+-			OSIncrementAtomic64((volatile SInt64 *)&sweetfb_flips);
+-		} else if (!fZCActive || (get32(rec, 0x104) & 0xf) != 0) {
++			zs = NULL;
++			if (flipped) {
++				fFlipsWin++;
++				OSIncrementAtomic64((volatile SInt64 *)&sweetfb_flips);
++			} else {
++				regFallback = true;
++				fFallbacksWin++;
++				OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fallbacks);
++			}
++		}
++		if (!flipped && !fenceTimeout && (!fZCActive || (get32(rec, 0x104) & 0xf) != 0)) {
++			if (!regFallback && fOP6Scale && sweetfb_zerocopy && fZCReady &&
++			    (get32(rec, 0x104) & 0xf) != 0) {
++				static uint32_t fb_logged;
++				fFallbacksWin++;
++				OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fallbacks);
++				if (fb_logged < 16 || (fb_logged++ & 63) == 0) {
++					IOLog("SWEET FB: OP6 CPU fallback swap %u (mask 0x%x surf %u, fallbacks %llu)\n",
++					    id, get32(rec, 0x104) & 0xf, get32(rec, 0x54), sweetfb_fallbacks);
++				}
++			}
+ 			/*
+ 			 * CPU copy, of the changed rows only (all of them when the panel
+ 			 * memory is behind: zero-copy showed the frames meanwhile). A swap
+@@ -698,7 +792,7 @@ AppleCLCD::presentPending(void)
+ 			fCopiesWin++;
+ 			OSIncrementAtomic64((volatile SInt64 *)&sweetfb_copies);
+ 		}
+-		if (zs == NULL) {
++		if (!flipped) {
+ 			IOLockLock(fLock);
+ 			if (id > fPresentedID) {
+ 				fPresentedID = id;
+@@ -713,8 +807,15 @@ AppleCLCD::presentPending(void)
+ 		if (ns > fPresentMaxNs) {
+ 			fPresentMaxNs = ns;
+ 		}
+-		if (++fPresentCount == 300) {
++		fPresentCount++;
++		if ((fPresentCount % 60) == 0 || regFallback) {
++			updateStatsProperties();
++		}
++		if (fPresentCount == 300) {
+ 			uint64_t span, waits = sweetfb_waits - fWaitsAtWin, waitNs = sweetfb_wait_ns - fWaitNsAtWin;
++			uint32_t slotsTotal = 0, slotsUsed = 0;
++			uint64_t slotAllocs = 0, slotFallbacks = 0;
++			sweet_surface_slot_stats(&slotsTotal, &slotsUsed, &slotAllocs, &slotFallbacks);
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - fStatsStart, &span);
+ 			/* fps over the window; idle gaps (nothing to draw) count, so it is a lower bound */
+ 			uint64_t fps10 = 3000000000000ULL / (span ? span : 1);
+@@ -731,12 +832,15 @@ AppleCLCD::presentPending(void)
+ 			fFullSwaps = fNoRegionSwaps = 0;
+ 			IOLockUnlock(fLock);
+ 			IOLog("SWEET FB: present avg %llu us max %llu us, 300 frames in %llu ms (%llu.%llu fps), "
+-			    "%u flips %u copies, SwapWait %llu x %llu us; swaps: %u full, %u no region, top %d,%d %dx%d x%u\n",
++			    "%u flips %u copies %u fallbacks, slots %u/%u (fb %llu), fenceWait %llu/%llu, "
++			    "SwapWait %llu x %llu us; swaps: %u full, %u no region, top %d,%d %dx%d x%u\n",
+ 			    fPresentNs / 300000, fPresentMaxNs / 1000, span / 1000000, fps10 / 10, fps10 % 10,
+-			    fFlipsWin, fCopiesWin, waits, waits ? waitNs / waits / 1000 : 0, full, none, tx, ty, tw, th, tn);
++			    fFlipsWin, fCopiesWin, fFallbacksWin, slotsUsed, slotsTotal, slotFallbacks,
++			    sweetfb_fence_waits, sweetfb_fence_timeouts,
++			    waits, waits ? waitNs / waits / 1000 : 0, full, none, tx, ty, tw, th, tn);
+ 			fPresentCount = 0;
+ 			fPresentNs = fPresentMaxNs = 0;
+-			fFlipsWin = fCopiesWin = 0;
++			fFlipsWin = fCopiesWin = fFallbacksWin = 0;
+ 		}
+ 	}
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+@@ -884,33 +988,58 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
+-/* y0, y1: canvas rows to update (Galaxy S9 scaled path; the swaps' dirty region). */
+ void
+-AppleCLCD::present(const uint8_t *rec, int32_t y0, int32_t y1)
++AppleCLCD::updateStatsProperties(void)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-
++	uint32_t slotsTotal = 0, slotsUsed = 0;
++	uint64_t slotAllocs = 0, slotFallbacks = 0;
++	sweet_surface_slot_stats(&slotsTotal, &slotsUsed, &slotAllocs, &slotFallbacks);
++	setProperty("SweetFBZeroCopyReady", fZCReady);
++	setProperty("SweetFBZeroCopyActive", fZCActive);
++	setProperty("SweetFBFlips", (unsigned long long)sweetfb_flips, 64);
++	setProperty("SweetFBCopies", (unsigned long long)sweetfb_copies, 64);
++	setProperty("SweetFBFallbacks", (unsigned long long)sweetfb_fallbacks, 64);
++	setProperty("SweetFBFenceWaits", (unsigned long long)sweetfb_fence_waits, 64);
++	setProperty("SweetFBFenceTimeouts", (unsigned long long)sweetfb_fence_timeouts, 64);
++	setProperty("SweetFBSlotsTotal", (unsigned long long)slotsTotal, 32);
++	setProperty("SweetFBSlotsUsed", (unsigned long long)slotsUsed, 32);
++	setProperty("SweetFBSlotAllocs", (unsigned long long)slotAllocs, 64);
++	setProperty("SweetFBSlotFallbacks", (unsigned long long)slotFallbacks, 64);
++}
+ 
+-	if (!fConsolePaused) {
+-		int quiet = 0;
+-		fConsolePaused = true;
+-		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			/* Not PE_initialize_console(kPEDisableScreen): its console switch
+-			 * writes the read-only-late cons_ops_index and panics. */
+-			sweet_console_muted = 1;
+-			/*
+-			 * Galaxy S9: the iPhone X canvas leaves borders on the larger
+-			 * panel; wipe the boot console text there once, now that the
+-			 * GUI owns the screen (this frame redraws the centre).
+-			 */
+-			if (fOffX < 0 || fOffY < 0) {
+-				for (uint32_t y = 0; y < fHeight; y++) {
+-					bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
+-				}
+-				markRows(0, fHeight);
++void
++AppleCLCD::pauseConsoleOnce(void)
++{
++	if (fConsolePaused) {
++		return;
++	}
++	int quiet = 0;
++	fConsolePaused = true;
++	if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++		/* Not PE_initialize_console(kPEDisableScreen): its console switch
++		 * writes the read-only-late cons_ops_index and panics. */
++		sweet_console_muted = 1;
++		/*
++		 * Galaxy S9 / OP6: the iOS canvas leaves borders on the larger
++		 * panel; wipe the boot console text there once, now that the
++		 * GUI owns the screen.
++		 */
++		if (fOffX < 0 || fOffY < 0) {
++			for (uint32_t y = 0; y < fHeight; y++) {
++				bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
+ 			}
++			markRows(0, fHeight);
+ 		}
+ 	}
++}
++
++/* y0, y1: canvas rows to update (Galaxy S9 scaled path; the swaps' dirty region). */
++void
++AppleCLCD::present(const uint8_t *rec, int32_t y0, int32_t y1)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++	pauseConsoleOnce();
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -1093,6 +1222,77 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	}
+ }
+ 
++bool
++AppleCLCD::op6Wr32Chk(const char *what, vm_offset_t off, uint32_t val, uint32_t mask)
++{
++	s9_wr(fMdss + off, val);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t got = s9_rd(fMdss + off);
++	if ((got & mask) != (val & mask)) {
++		IOLog("SWEET FB: OP6 mismatch %s off 0x%lx wrote 0x%x read 0x%x mask 0x%x -> CPU fallback\n",
++		    what, (unsigned long)off, val, got, mask);
++		return false;
++	}
++	return true;
++}
++
++/*
++ * OnePlus 6 zero-copy + QSEED3 (op6/shim/m9.c): ABL leaves a single VIG0 pipe
++ * scanning 0x9d400000 (1080x2280, ystride 4320, BGRA) into LM0 + PP0 (autorefresh
++ * 0x80000001). Save ABL's VIG0+QSEED3 state so CPU copies and blank() can restore it.
++ */
++bool
++AppleCLCD::zeroCopyInitOP6(void)
++{
++	bool ok = fPhys == S9_SPLASH_PA && fWidth == OP6_PANEL_W && fHeight == OP6_PANEL_H &&
++	    fRowBytes == OP6_PANEL_W * 4;
++	if (ok) {
++		fMdss = ml_io_map(S9_MDSS_PA, S9_MDSS_LEN);
++		ok = fMdss != 0;
++	}
++	if (!ok) {
++		OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fallbacks);
++		IOLog("SWEET FB: OP6 zero-copy unavailable (splash 0x%llx %ux%u stride %u)\n",
++		    fPhys, fWidth, fHeight, fRowBytes);
++		return false;
++	}
++	vm_offset_t b = fMdss + S9_VIG(0);
++	for (uint32_t r = 0; r < SWEET_ZC_NREGS; r++) {
++		fZCSaved[0][r] = s9_rd(b + sweet_zc_regs[r]);
++	}
++	fZCPhaseInit = s9_rd(b + QS + QS_PHASE_INIT);
++	uint32_t fmt = s9_rd(b + SSPP_FORMAT);
++	uint32_t unp = s9_rd(b + SSPP_UNPACK);
++	uint32_t out = s9_rd(b + SSPP_OUT_SIZE);
++	uint32_t qver = s9_rd(b + QS + QS_VERSION);
++	vm_offset_t pp0Ar = fMdss + (S9_PP_PA - S9_MDSS_PA) + S9_PP_AUTOREFRESH;
++	uint32_t ar = s9_rd(pp0Ar);
++	if ((ar & (1U << 31)) != 0 && (ar & 0xffffU) != 1U) {
++		s9_wr(pp0Ar, (1U << 31) | 1U);
++		ar = s9_rd(pp0Ar);
++	}
++	fZCOutW = out & 0xffff;
++	fZCOutH = out >> 16;
++	fZCQseedVer = qver;
++	ok = s9_rd(b + SSPP_SRC0_ADDR) == (uint32_t)fPhys &&
++	    s9_rd(b + SSPP_SRC_SIZE) == ((fHeight << 16) | fWidth) &&
++	    s9_rd(b + SSPP_SRC_XY) == 0 &&
++	    (s9_rd(b + SSPP_YSTRIDE0) & 0xffff) == fRowBytes &&
++	    fmt == OP6_ABL_FMT && unp == OP6_ABL_UNPACK &&
++	    fZCOutW == fWidth && fZCOutH == fHeight &&
++	    (qver == 0x1002 || qver == 0x1003);
++	IOLog("SWEET FB: OP6 zero-copy %s: VIG0 src 0x%x xy 0x%x out 0x%x addr 0x%x ystr 0x%x fmt 0x%x unp 0x%x op 0x%x qver 0x%x pp0 0x%x flush 0x%x\n",
++	    ok ? "ready" : "NOT ready (ABL layout mismatch)",
++	    s9_rd(b + SSPP_SRC_SIZE), s9_rd(b + SSPP_SRC_XY), out,
++	    s9_rd(b + SSPP_SRC0_ADDR), s9_rd(b + SSPP_YSTRIDE0), fmt, unp,
++	    s9_rd(b + SSPP_OP_MODE), qver, ar, s9_rd(fMdss + S9_CTL0_FLUSH));
++	if (!ok) {
++		OSIncrementAtomic64((volatile SInt64 *)&sweetfb_fallbacks);
++	}
++	fZCReady = ok;
++	return ok;
++}
++
+ /*
+  * Galaxy S9 zero-copy. Read ABL's splash layout (shim M9 step 0) and check it
+  * is the one the rest of this code assumes; false leaves the CPU copy alone.
+@@ -1100,6 +1300,9 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ bool
+ AppleCLCD::zeroCopyInit(void)
+ {
++	if (fOP6Scale) {
++		return zeroCopyInitOP6();
++	}
+ 	uint32_t half = fWidth / 2;
+ 	bool ok = fPhys == S9_SPLASH_PA && fWidth == 1440 && fHeight == 2960 && (fLogicalW & 1) == 0;
+ 
+@@ -1138,15 +1341,77 @@ AppleCLCD::zeroCopyInit(void)
+ 	return ok;
+ }
+ 
++bool
++AppleCLCD::zeroCopyStartOP6(void)
++{
++	static uint32_t on_logged;
++	vm_offset_t b = S9_VIG(0), q = b + QS;
++	uint32_t sw = fLogicalW, sh = fLogicalH, dw = fZCOutW, dh = fZCOutH;
++	uint32_t src = (sh << 16) | sw, dst = (dh << 16) | dw;
++	uint32_t stx = (uint32_t)(((uint64_t)sw << 21) / dw);
++	uint32_t sty = (uint32_t)(((uint64_t)sh << 21) / dh);
++	uint32_t qop = 1U | (3U << 16) | (1U << 14) | (1U << 10) |
++	    ((fZCQseedVer == 0x1002) ? (1U << 30) : (1U << 29));
++	bool ok = true;
++
++	ok = ok && op6Wr32Chk("SRC_XY", b + SSPP_SRC_XY, 0, 0xffffffffU);
++	ok = ok && op6Wr32Chk("SRC_SIZE", b + SSPP_SRC_SIZE, src, 0xffffffffU);
++	ok = ok && op6Wr32Chk("OUT_SIZE", b + SSPP_OUT_SIZE, dst, 0xffffffffU);
++	ok = ok && op6Wr32Chk("OUT_XY", b + SSPP_OUT_XY, 0, 0xffffffffU);
++	ok = ok && op6Wr32Chk("DECIMATION", b + SSPP_DECIMATION, 0, 0xffffffffU);
++	for (uint32_t c = 0; ok && c < 3; c++) {
++		ok = ok && op6Wr32Chk("PE_LR", b + SSPP_PE(c), 0, 0xffffffffU);
++		ok = ok && op6Wr32Chk("PE_TB", b + SSPP_PE(c) + 4, 0, 0xffffffffU);
++		ok = ok && op6Wr32Chk("PE_REQ", b + SSPP_PE(c) + 8, src, 0xffffffffU);
++	}
++	ok = ok && op6Wr32Chk("SSPP_OP", b + SSPP_OP_MODE,
++	    fZCSaved[0][SWEET_ZC_R_OP_MODE] | OP_PE_OVERRIDE, OP_PE_OVERRIDE);
++	if (ok) {
++		if (fZCQseedVer == 0x1002) {
++			ok = op6Wr32Chk("QS_PHINIT", q + QS_PHASE_INIT, 0, 0xffffffffU);
++		} else {
++			ok = ok && op6Wr32Chk("QS_IYH", q + QS_INIT_Y_H, 0, 0xffffffffU);
++			ok = ok && op6Wr32Chk("QS_IYV", q + QS_INIT_Y_V, 0, 0xffffffffU);
++			ok = ok && op6Wr32Chk("QS_IUVH", q + QS_INIT_UV_H, 0, 0xffffffffU);
++			ok = ok && op6Wr32Chk("QS_IUVV", q + QS_INIT_UV_V, 0, 0xffffffffU);
++		}
++	}
++	ok = ok && op6Wr32Chk("QS_SYH", q + QS_STEP_Y_H, stx, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_SYV", q + QS_STEP_Y_V, sty, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_SUVH", q + QS_STEP_UV_H, stx, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_SUVV", q + QS_STEP_UV_V, sty, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_PRE", q + QS_PRELOAD, 4U | (3U << 8) | (4U << 16) | (3U << 24), 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_SRC", q + QS_SRC_SIZE, src, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_SUV", q + QS_SRC_SIZE_UV, src, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_DST", q + QS_DST_SIZE, dst, 0xffffffffU);
++	ok = ok && op6Wr32Chk("QS_OP", q + QS_OP_MODE, qop, qop);
++	if (!ok) {
++		zeroCopyStop();
++		fZCReady = false;
++		setProperty("SweetFBZeroCopyReady", false);
++		return false;
++	}
++	fZCActive = true;
++	fPanelStale = true;
++	if (on_logged++ < 8) {
++		IOLog("SWEET FB: OP6 zero-copy on: VIG0+QSEED3(0x%x) %ux%u -> %ux%u step 0x%x/0x%x\n",
++		    fZCQseedVer, sw, sh, dw, dh, stx, sty);
++	}
++	return true;
++}
++
+ /*
+  * Each pipe fetches its half of the canvas (VIG1 from SRC_XY x = half) and
+  * its QSEED3 scales it bilinearly to its 720x2960 half of the panel, as
+  * sde_plane.c's default scaler3 setup (shim M9 step B). Addresses come with
+  * each flip; one flush applies everything at the next frame start.
+  */
+-void
++bool
+ AppleCLCD::zeroCopyStart(void)
+ {
++	if (fOP6Scale) {
++		return zeroCopyStartOP6();
++	}
+ 	uint32_t src = (fLogicalH << 16) | fZCHalf;
+ 	uint32_t stx = (uint32_t)(((uint64_t)fZCHalf << 21) / fZCOutW);
+ 	uint32_t sty = (uint32_t)(((uint64_t)fLogicalH << 21) / fZCOutH);
+@@ -1180,32 +1445,43 @@ AppleCLCD::zeroCopyStart(void)
+ 	fPanelStale = true;
+ 	IOLog("SWEET FB: zero-copy on: canvas halves %ux%u -> %ux%u, step 0x%x/0x%x\n",
+ 	    fZCHalf, fLogicalH, fZCOutW, fZCOutH, stx, sty);
++	return true;
+ }
+ 
+ /* The pipes back on the panel memory as ABL left them (CPU copies). fShowLock held. */
+ void
+ AppleCLCD::zeroCopyStop(void)
+ {
+-	for (uint32_t p = 0; p < 2; p++) {
++	static uint32_t off_logged;
++	uint32_t pipes = fOP6Scale ? 1 : 2;
++	uint32_t flushMask = fOP6Scale ? OP6_FLUSH_BITS : S9_FLUSH_BITS;
++
++	for (uint32_t p = 0; p < pipes; p++) {
+ 		vm_offset_t b = fMdss + S9_VIG(p);
+ 		for (uint32_t r = 0; r < SWEET_ZC_NREGS; r++) {
+ 			s9_wr(b + sweet_zc_regs[r], fZCSaved[p][r]);
+ 		}
++		if (fOP6Scale && fZCQseedVer == 0x1002) {
++			s9_wr(b + QS + QS_PHASE_INIT, fZCPhaseInit);
++		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	s9_wr(fMdss + S9_CTL0_FLUSH, S9_FLUSH_BITS);
++	s9_wr(fMdss + S9_CTL0_FLUSH, flushMask);
+ 	fZCActive = false;
+ 	IOLockLock(fLock);
+ 	fPendingFlipID = 0;
+ 	IOLockUnlock(fLock);
+-	IOLog("SWEET FB: zero-copy off: pipes back on the panel memory\n");
++	if (off_logged++ < 8) {
++		IOLog("SWEET FB: zero-copy off: pipes back on the panel memory (flush 0x%x)\n", flushMask);
++	}
+ }
+ 
+ /* The SDE took the last flush (it clears the bits at the frame start that applies them). */
+ bool
+ AppleCLCD::zeroCopyLatched(void)
+ {
+-	return fMdss == 0 || (s9_rd(fMdss + S9_CTL0_FLUSH) & S9_FLUSH_BITS) == 0;
++	uint32_t mask = fOP6Scale ? OP6_FLUSH_BITS : S9_FLUSH_BITS;
++	return fMdss == 0 || (s9_rd(fMdss + S9_CTL0_FLUSH) & mask) == 0;
+ }
+ 
+ /* The display slot surface a swap shows full screen in layer 0 alone (retained), or NULL. */
+@@ -1219,42 +1495,75 @@ AppleCLCD::zeroCopySurface(const uint8_t *rec)
+ 		return NULL;
+ 	}
+ 	SweetSurface *s = sweet_surface_copy(get32(rec, 0x54));
+-	if (s != NULL && (s->slot < 0 || s->width != fLogicalW || s->height != fLogicalH ||
+-	    s->bytesPerRow > 0xffff || s->phys == 0 || s->phys + s->allocSize > S9_SPLASH_END)) {
++	if (s == NULL) {
++		return NULL;
++	}
++	bool ok = s->slot >= 0 && s->width == fLogicalW && s->height == fLogicalH &&
++	    s->offset == 0 && s->phys != 0 && s->phys + s->allocSize <= S9_SPLASH_END;
++	if (ok) {
++		if (s->planeCount > 0) {
++			const struct sweet_surface_plane *p0 = &s->planes[0];
++			ok = s->pixelFormat == SWEET_SURFACE_FMT_B3A8 &&
++			    p0->width == fLogicalW && p0->height == fLogicalH &&
++			    p0->offset == 0 && p0->bytesPerElement == 4 &&
++			    p0->elementWidth == 1 && p0->elementHeight == 1 &&
++			    p0->bytesPerRow > 0 && p0->bytesPerRow <= 0xffff &&
++			    (!fOP6Scale || (p0->bytesPerRow & 63) == 0);
++		} else {
++			ok = s->pixelFormat == SWEET_FB_FORMAT_BGRA &&
++			    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
++			    s->bytesPerRow > 0 && s->bytesPerRow <= 0xffff &&
++			    (!fOP6Scale || (s->bytesPerRow & 63) == 0);
++		}
++	}
++	if (!ok) {
+ 		OSSafeReleaseNULL(s);
+ 	}
+ 	return s;
+ }
+ 
+ /* Show slot surface s from the next frame on. fShowLock held. */
+-void
++bool
+ AppleCLCD::flip(SweetSurface *s, uint32_t id)
+ {
+ 	static uint32_t logged;
+ 	uint32_t y0 = 0, y1 = 0;
+ 
+-	if (!fZCActive) {
+-		zeroCopyStart();
++	if (!fZCActive && !zeroCopyStart()) {
++		return false;
+ 	}
++	uint32_t bpr = s->planeCount > 0 ? s->planes[0].bytesPerRow : s->bytesPerRow;
+ 	bool dirty = sweet_surface_take_dirty(s, &y0, &y1);
+ 	if (sweetfb_fullclean) {
+ 		y0 = 0;
+ 		y1 = s->height;
+ 		dirty = true;
+ 	}
+-	if (dirty) {
++	if (dirty && s->kernelMapCache != kIOMapWriteCombineCache) {
+ 		uintptr_t k = s->kernelAddress();
+ 		if (k != 0) {
+-			sweet_surface_clean(k + (uint64_t)y0 * s->bytesPerRow, (uint64_t)(y1 - y0) * s->bytesPerRow);
++			sweet_surface_clean(k + (uint64_t)y0 * bpr, (uint64_t)(y1 - y0) * bpr);
+ 		}
+ 	}
+-	for (uint32_t p = 0; p < 2; p++) {
+-		vm_offset_t b = fMdss + S9_VIG(p);
+-		s9_wr(b + SSPP_YSTRIDE0, s->bytesPerRow & 0xffff);
+-		s9_wr(b + SSPP_SRC0_ADDR, (uint32_t)s->phys);
++	uint32_t flushMask = fOP6Scale ? OP6_FLUSH_BITS : S9_FLUSH_BITS;
++	if (fOP6Scale) {
++		vm_offset_t b = S9_VIG(0);
++		if (!op6Wr32Chk("YSTRIDE0", b + SSPP_YSTRIDE0, bpr & 0xffff, 0xffffU) ||
++		    !op6Wr32Chk("SRC0_ADDR", b + SSPP_SRC0_ADDR, (uint32_t)s->phys, 0xffffffffU)) {
++			zeroCopyStop();
++			fZCReady = false;
++			setProperty("SweetFBZeroCopyReady", false);
++			return false;
++		}
++	} else {
++		for (uint32_t p = 0; p < 2; p++) {
++			vm_offset_t b = fMdss + S9_VIG(p);
++			s9_wr(b + SSPP_YSTRIDE0, bpr & 0xffff);
++			s9_wr(b + SSPP_SRC0_ADDR, (uint32_t)s->phys);
++		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	s9_wr(fMdss + S9_CTL0_FLUSH, S9_FLUSH_BITS);
++	s9_wr(fMdss + S9_CTL0_FLUSH, flushMask);
+ 	IOLockLock(fLock);
+ 	fPendingFlipID = id;
+ 	IOLockUnlock(fLock);
+@@ -1263,14 +1572,15 @@ AppleCLCD::flip(SweetSurface *s, uint32_t id)
+ 		logged++;
+ 		uint32_t f0 = s9_rd(fMdss + S9_CTL0_FLUSH), f = f0;
+ 		uint64_t t0 = mach_absolute_time(), ns;
+-		for (int i = 0; i < 200 && (f & S9_FLUSH_BITS) != 0; i++) {
++		for (int i = 0; i < 200 && (f & flushMask) != 0; i++) {
+ 			delay_for_interval_with_leeway(200, 0, kMicrosecondScale);
+ 			f = s9_rd(fMdss + S9_CTL0_FLUSH);
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-		IOLog("SWEET FB: flip %u slot %d at 0x%llx, rows %u-%u cleaned, flush 0x%x -> 0x%x after %llu us\n",
+-		    id, s->slot, s->phys, y0, y1, f0, f, ns / 1000);
++		IOLog("SWEET FB: flip %u slot %d at 0x%llx bpr %u fmt 0x%x, flush 0x%x -> 0x%x after %llu us\n",
++		    id, s->slot, s->phys, bpr, s->pixelFormat, f0, f, ns / 1000);
+ 	}
++	return true;
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index dfabe74..c9fc0c6 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -556,6 +556,10 @@ struct sweet_gpu_bo {
+ static void
+ sweet_gpu_to_memory(SweetSurface *surface)
+ {
++	if (surface->mapCache == kIOMapWriteCombineCache) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		return;
++	}
+ 	uintptr_t va = surface->kernelAddress();
+ 	if (va != 0) {
+ 		flush_dcache((vm_offset_t)va, (unsigned)surface->allocSize, FALSE);
+@@ -1368,8 +1372,11 @@ SweetGPUUserClient::kernelLog(const void *text, uint32_t size)
+ }
+ 
+ extern "C" bool
+-sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
++sweet_gpu_surface_wait(uint32_t id, void *kernel, uint64_t size, bool *waitedOut)
+ {
++	if (waitedOut != NULL) {
++		*waitedOut = false;
++	}
+ 	if (id == 0 || id >= 4096 || !sweet_gpu_ready()) {
+ 		return true;
+ 	}
+@@ -1378,6 +1385,9 @@ sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
+ 		return true;
+ 	}
+ 	if (!sweet_gpu_fence_done(fence)) {
++		if (waitedOut != NULL) {
++			*waitedOut = true;
++		}
+ 		if (gSweetGPULock == NULL) {
+ 			return false;
+ 		}
+@@ -1400,6 +1410,12 @@ sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
+ 	return true;
+ }
+ 
++extern "C" bool
++sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
++{
++	return sweet_gpu_surface_wait(id, kernel, size, NULL);
++}
++
+ IOReturn
+ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c8d5063..28fea73 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -84,10 +84,22 @@ SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_create_bytes, CTLFLAG_RD | CTLFLAG_LO
+     "S9: bytes of IOSurfaces created (each one zeroed)");
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+-/* Galaxy S9: display slots (sweet_surface_set_display_slots), under sweet_surface_lock. */
++/* Galaxy S9 / OP6: display slots (sweet_surface_set_display_slots*), under sweet_surface_lock. */
+ static uint64_t      sweet_slot_phys, sweet_slot_size;
+ static uint32_t      sweet_slot_count, sweet_slot_width, sweet_slot_height, sweet_slot_format;
++static uint32_t      sweet_slot_alt_format;
++static IOOptionBits  sweet_slot_cache = kIOMapCopybackCache;
++static uint64_t      sweet_slot_total, sweet_slot_used;
++static uint64_t      sweet_slot_allocs, sweet_slot_fallbacks;
+ static SweetSurface *sweet_slot_surface[SWEET_SURFACE_MAX_SLOTS];
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_slots_total, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_slot_total,
++    "SWEET: display scan-out slots reserved");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_slots_used, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_slot_used,
++    "SWEET: display scan-out slots currently occupied");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_slot_allocs, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_slot_allocs,
++    "SWEET: surfaces placed in contiguous display slots");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_slot_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_slot_fallbacks,
++    "SWEET: screen-sized surfaces that fell back to normal VM pages");
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -101,6 +113,9 @@ SweetSurface::free()
+ 		IOLockLock(sweet_surface_lock);
+ 		if (sweet_slot_surface[slot] == this) {
+ 			sweet_slot_surface[slot] = NULL;
++			if (sweet_slot_used > 0) {
++				sweet_slot_used--;
++			}
+ 		}
+ 		IOLockUnlock(sweet_surface_lock);
+ 	}
+@@ -150,38 +165,101 @@ sweet_surface_clean(uintptr_t va, uint64_t len)
+ static void sweet_surface_init_lock(void);
+ 
+ void
+-sweet_surface_set_display_slots(uint64_t phys, uint64_t slotSize, uint32_t count,
+-    uint32_t width, uint32_t height, uint32_t pixelFormat)
++sweet_surface_set_display_slots_ex(uint64_t phys, uint64_t slotSize, uint32_t count,
++    uint32_t width, uint32_t height, uint32_t pixelFormat, uint32_t altFormat,
++    IOOptionBits mapCache)
+ {
+ 	sweet_surface_init_lock();
+ 	IOLockLock(sweet_surface_lock);
+ 	sweet_slot_phys = phys;
+ 	sweet_slot_size = slotSize;
+ 	sweet_slot_count = count < SWEET_SURFACE_MAX_SLOTS ? count : SWEET_SURFACE_MAX_SLOTS;
++	sweet_slot_total = sweet_slot_count;
+ 	sweet_slot_width = width;
+ 	sweet_slot_height = height;
+ 	sweet_slot_format = pixelFormat;
++	sweet_slot_alt_format = altFormat;
++	sweet_slot_cache = mapCache ? mapCache : kIOMapCopybackCache;
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: %u display slots of 0x%llx bytes at 0x%llx for %ux%u fmt 0x%x/0x%x cache %u\n",
++	    sweet_slot_count, slotSize, phys, width, height, pixelFormat, altFormat, (unsigned)sweet_slot_cache);
++}
++
++void
++sweet_surface_set_display_slots(uint64_t phys, uint64_t slotSize, uint32_t count,
++    uint32_t width, uint32_t height, uint32_t pixelFormat)
++{
++	sweet_surface_set_display_slots_ex(phys, slotSize, count, width, height,
++	    pixelFormat, 0, kIOMapCopybackCache);
++}
++
++void
++sweet_surface_slot_stats(uint32_t *totalOut, uint32_t *usedOut,
++    uint64_t *allocsOut, uint64_t *fallbacksOut)
++{
++	if (sweet_surface_lock == NULL) {
++		if (totalOut) { *totalOut = 0; }
++		if (usedOut) { *usedOut = 0; }
++		if (allocsOut) { *allocsOut = 0; }
++		if (fallbacksOut) { *fallbacksOut = 0; }
++		return;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (totalOut) { *totalOut = sweet_slot_count; }
++	if (usedOut) { *usedOut = (uint32_t)sweet_slot_used; }
++	if (allocsOut) { *allocsOut = sweet_slot_allocs; }
++	if (fallbacksOut) { *fallbacksOut = sweet_slot_fallbacks; }
+ 	IOLockUnlock(sweet_surface_lock);
+-	IOLog("SWEET SURF: %u display slots of %llu bytes at 0x%llx for %ux%u 0x%x\n",
+-	    sweet_slot_count, slotSize, phys, width, height, pixelFormat);
++}
++
++/* Check whether s has backboardd's framebuffer geometry for scan-out slots. */
++static bool
++sweet_surface_matches_slot(const SweetSurface *s)
++{
++	if (sweet_slot_count == 0 || s->width != sweet_slot_width ||
++	    s->height != sweet_slot_height || s->offset != 0 ||
++	    s->allocSize == 0 || s->allocSize > sweet_slot_size) {
++		return false;
++	}
++	bool fmtOk = (s->pixelFormat == sweet_slot_format) ||
++	    (sweet_slot_alt_format != 0 && s->pixelFormat == sweet_slot_alt_format);
++	if (!fmtOk) {
++		return false;
++	}
++	if (s->pixelFormat == SWEET_SURFACE_FMT_B3A8) {
++		if (s->planeCount == 0) {
++			return false;
++		}
++		const struct sweet_surface_plane *p0 = &s->planes[0];
++		return p0->width == sweet_slot_width && p0->height == sweet_slot_height &&
++		    p0->offset == 0 && p0->bytesPerElement == 4 &&
++		    p0->elementWidth == 1 && p0->elementHeight == 1 &&
++		    p0->bytesPerRow > 0 && p0->bytesPerRow <= 0xffff &&
++		    (p0->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) == 0;
++	}
++	return s->planeCount == 0 && s->bytesPerElement == 4 &&
++	    s->elementWidth == 1 && s->elementHeight == 1 &&
++	    s->bytesPerRow > 0 && s->bytesPerRow <= 0xffff;
+ }
+ 
+ /* A free slot for s (backboardd's framebuffer geometry), or -1. Lock held. */
+ static int
+-sweet_surface_slot_take_locked(SweetSurface *s)
++sweet_surface_slot_take_locked(SweetSurface *s, bool *wantedOut)
+ {
+-	if (s->pixelFormat != sweet_slot_format || s->width != sweet_slot_width ||
+-	    s->height != sweet_slot_height || s->planeCount != 0 || s->offset != 0 ||
+-	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-	    s->allocSize > sweet_slot_size) {
++	*wantedOut = false;
++	if (!sweet_surface_matches_slot(s)) {
+ 		return -1;
+ 	}
++	*wantedOut = true;
+ 	for (uint32_t i = 0; i < sweet_slot_count; i++) {
+ 		if (sweet_slot_surface[i] == NULL) {
+ 			sweet_slot_surface[i] = s;      /* weak: cleared by s->free() */
++			sweet_slot_used++;
++			sweet_slot_allocs++;
+ 			return (int)i;
+ 		}
+ 	}
++	sweet_slot_fallbacks++;
+ 	return -1;
+ }
+ 
+@@ -902,10 +980,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	ret = sweet_surface_layout(s, props);
+ 	uint64_t creatorAddr = sweet_dict_u64(props, "IOSurfaceAddress", 0);
+ 	int slot = -1;
++	bool wantedSlot = false;
++	IOOptionBits slotCache = kIOMapCopybackCache;
+ 	if (ret == kIOReturnSuccess && creatorAddr == 0 && strcmp(name, "backboardd") == 0) {
+ 		IOLockLock(sweet_surface_lock);
+-		slot = sweet_surface_slot_take_locked(s);
++		slot = sweet_surface_slot_take_locked(s, &wantedSlot);
++		slotCache = sweet_slot_cache;
+ 		IOLockUnlock(sweet_surface_lock);
++		if (slot < 0 && wantedSlot) {
++			static uint32_t fb_logged;
++			if (fb_logged < 16 || (fb_logged++ & 63) == 0) {
++				IOLog("SWEET SURF: %s %ux%u fmt 0x%x size %u: all %u slots busy, fallback to VM (x%llu)\n",
++				    name, s->width, s->height, s->pixelFormat, s->allocSize,
++				    sweet_slot_count, sweet_slot_fallbacks);
++			}
++		}
+ 	}
+ 	if (ret == kIOReturnSuccess && creatorAddr != 0) {
+ 		/*
+@@ -927,28 +1016,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		}
+ 	} else if (ret == kIOReturnSuccess && slot >= 0) {
+ 		/*
+-		 * Galaxy S9: a framebuffer of backboardd's in a display slot, cached
+-		 * for CoreAnimation's CPU renderer; SweetFramebuffer.cpp cleans the
+-		 * rows it wrote before the display engine fetches them.
++		 * Display scan-out slot: physically contiguous splash-tail region.
++		 * S9 uses cached CPU mapping with explicit row cleans; OP6 uses
++		 * write-combine (Normal NC) to match Adreno 630's SMMU PTE attributes.
+ 		 */
+ 		s->slot = slot;
+ 		s->phys = sweet_slot_phys + (uint64_t)slot * sweet_slot_size;
+ 		s->memory = IOMemoryDescriptor::withPhysicalAddress(s->phys, s->allocSize, kIODirectionInOut);
+-		s->mapCache = kIOMapCopybackCache;
+-		s->kernelMapCache = kIOMapCopybackCache;
++		s->mapCache = slotCache;
++		s->kernelMapCache = slotCache;
+ 		uintptr_t k = s->memory != NULL ? s->kernelAddress() : 0;
+ 		if (k == 0) {
+-			ret = kIOReturnNoMemory;
++			IOLog("SWEET SURF: slot %d at 0x%llx map failed, fallback to VM\n", slot, s->phys);
++			OSSafeReleaseNULL(s->kernelMap);
++			OSSafeReleaseNULL(s->memory);
++			IOLockLock(sweet_surface_lock);
++			if (sweet_slot_surface[slot] == s) {
++				sweet_slot_surface[slot] = NULL;
++				if (sweet_slot_used > 0) {
++					sweet_slot_used--;
++				}
++			}
++			sweet_slot_fallbacks++;
++			IOLockUnlock(sweet_surface_lock);
++			s->slot = -1;
++			s->phys = 0;
++			slot = -1;
+ 		} else {
+ 			bzero((void *)k, s->allocSize);
+-			sweet_surface_clean(k, s->allocSize);
++			if (slotCache == kIOMapWriteCombineCache) {
++				__asm__ volatile ("dsb sy" ::: "memory");
++			} else {
++				sweet_surface_clean(k, s->allocSize);
++			}
+ 			s->dirtyY0 = 0;
+ 			s->dirtyY1 = s->height;
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		}
+-	} else if (ret == kIOReturnSuccess) {
++	}
++	if (ret == kIOReturnSuccess && creatorAddr == 0 && slot < 0) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 2fa5835..c6fb7c7 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -74,12 +74,19 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+ /*
+- * Galaxy S9: count physically contiguous display slots of slotSize bytes at
+- * phys for backboardd's width x height pixelFormat framebuffers (no planes).
++ * Galaxy S9 / OP6: count physically contiguous display slots of slotSize bytes
++ * at phys for backboardd's width x height pixelFormat framebuffers.
+  */
+ #define SWEET_SURFACE_MAX_SLOTS         4
++#define SWEET_SURFACE_FMT_BGRA          0x42475241U
++#define SWEET_SURFACE_FMT_B3A8          0x62336138U
+ void sweet_surface_set_display_slots(uint64_t phys, uint64_t slotSize, uint32_t count,
+     uint32_t width, uint32_t height, uint32_t pixelFormat);
++void sweet_surface_set_display_slots_ex(uint64_t phys, uint64_t slotSize, uint32_t count,
++    uint32_t width, uint32_t height, uint32_t pixelFormat, uint32_t altFormat,
++    IOOptionBits mapCache);
++void sweet_surface_slot_stats(uint32_t *totalOut, uint32_t *usedOut,
++    uint64_t *allocsOut, uint64_t *fallbacksOut);
+ 
+ /* A swap changed rows [y0, y1) of the display (y0 < 0: all of it): every slot surface must catch up. */
+ void sweet_surface_slots_dirty(int32_t y0, int32_t y1);
