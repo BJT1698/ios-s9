@@ -18,6 +18,7 @@
  * LICENSE.HackiOS): its opengl_es() and caenv handling; nothing of its iOS 16.5 patches.
  */
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -93,6 +94,16 @@ sweet_ca_init(void)
 	if (name == NULL || strcmp(name, "backboardd") != 0) {
 		return;
 	}
+	/*
+	 * launchd discards the window server's stderr: append it (ours and libsweet-gl's,
+	 * which loads into this process) to a file readable over SSH.
+	 */
+	int log = open("/private/var/tmp/sweet-gl.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (log >= 0) {
+		dup2(log, 2);
+		close(log);
+	}
+	say("sweet-ca: loaded into %s (pid %d)\n", name, getpid());
 	(void)sysctlbyname("kern.bootargs", arguments, &size, NULL, 0);
 	for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
 		char setting[128];
