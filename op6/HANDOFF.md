@@ -154,6 +154,24 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
 - **Performance / zero-copy (2026-11-14, boot-G4f.img, kernel run 43590108694 with 0112+0113, op6-mesa run 43590111044):** the screen surfaces are 'b3a8' (plane 0 = BGRA8 read by SweetFramebuffer, plane 1 unused). After fixing the 0x7e struct (sweet-drm used 40 bytes, the kernel 48) and accepting 'b3a8' plane 0 in the bridge and Mesa (patch 0003), frames are "drawn in place" at 10-19 ms instead of 47-64 ms. Colours are correct and it runs much smoother.
 - **Symbolizing a backboardd crash:** take the .ips from `/var/mobile/Library/Logs/CrashReporter/`, then run `llvm-symbolizer --obj=<dSYM DWARF file> <imageOffset>`. The dylib's `__TEXT` vmaddr is 0.
 
+## 5c. Next task for the next agent: Mesa patch 0005 (not started; the working tree was clean on 2026-11-14)
+
+- **State:**
+  - `boot-G4g-192.img`: kernel run 43592841933 with 0114 memory counters + page-table pool, ADT `op6/out/op6-gpu192.adt` (192 MiB GPU carve-out). It is the default; normal use needs about 80 MiB.
+  - Mesa from op6-mesa run 43592844370 (patches 0001-0004) is installed on the phone.
+- **Problem:** in the 32 MiB stress test (`boot-G4g-32.img`) the kernel refuses allocations cleanly and Mesa 0004 returns GL_OUT_OF_MEMORY, but backboardd still crashes once:
+  `st_glFlush -> tc_flush -> fd_draw_vbo (freedreno_draw.c:381) -> fd6_draw_vbos -> fd6_emit_3d_state -> fd6_build_bindless_state (fd6_image.cc:208) -> fd_bo_mark_for_dump(NULL)`.
+  A bound resource whose BO allocation failed is still used by a draw.
+- **Task:** write `op6/mesa/patches/0005-*.patch` (on top of Mesa 25.0.7 + 0001-0004).
+  - In fd_draw_vbo, and in the clear/blit/compute entry points, skip any draw whose bound textures/images/buffers or framebuffer surfaces have `rsc->bo == NULL`. Count it and log it once, through the 0004 log path (which reaches dmesg via sweet_drm_log).
+  - Add guards only where skipping at the entry point is impossible.
+  - Upstream behaviour must not change when no BO is NULL.
+- **Test:**
+  1. Run op6-mesa and install `lib/*` from the artifact into `/usr/local/lib` over SSH.
+  2. Boot `boot-G4g-32.img`: there must be no new `backboardd-*.ips` crash report, and `SweetGPUAllocFails > 0` is expected.
+  3. Boot `boot-G4g-192.img` again.
+- **Afterwards:** GPU IRQs (G5); wallpaper; real battery level; daemon trim; booting without the PC (flash `boot-G4g-192.img` to boot_b, after asking the user).
+
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
 - **G4:** EAGL bridge inside backboardd (`libsweet-gl.dylib` + `libsweet-ca.dylib` + kernel selector `0x7e` IOSurface import), so that CoreAnimation renders through Mesa on the Adreno 630. Read `s9/ESTUDO-2026-10-25-gpu.md` section 2.
