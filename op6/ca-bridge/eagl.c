@@ -83,6 +83,7 @@
 #include <unistd.h>
 
 #include "sweet_gl.h"
+#include "sweet_klog.h"
 
 /* IOKitLib, as far as it is used here (the iPhoneOS SDK has the framework, not its headers) */
 typedef mach_port_t io_object_t;
@@ -193,7 +194,10 @@ say(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
-	write(2, line, (size_t)n);
+	if (n > 0) {
+		write(2, line, (size_t)n);
+		sweet_klog(line, (size_t)n);    /* and into the kernel's log (dmesg), xnu patch 0111 */
+	}
 }
 
 static void
@@ -206,7 +210,13 @@ eagl_trace(const char *format, ...)
 	va_start(ap, format);
 	n = vsnprintf(line + 4, sizeof(line) - 4, format, ap) + 4;
 	va_end(ap);
-	write(2, line, n > (int)sizeof(line) - 1 ? sizeof(line) - 1 : (size_t)n);
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
+	}
+	if (n > 4) {
+		write(2, line, (size_t)n);
+		sweet_klog(line, (size_t)n);
+	}
 }
 
 static void
@@ -220,6 +230,7 @@ eagl_trace_floats(const float *values, int count)
 	}
 	line[n++] = '\n';
 	write(2, line, (size_t)n);
+	sweet_klog(line, (size_t)n);
 }
 
 static uint64_t
@@ -3785,10 +3796,55 @@ pixels_guarded(const char *call, GLenum format, GLenum type, GLsizei width, GLsi
 	return *copy;
 }
 
+/*
+ * Which uploads reach Mesa (a CPU CA::Render::Image upload crashed inside it, SIGSEGV at 0x14): a line
+ * before the call for the first 64 calls of each kind and for every (internal format, format, type)
+ * not seen before, through say() so it also reaches the kernel log and outlives a crash.
+ */
+struct upload_kind {
+	char call;                      /* 'T' glTexImage2D, 'S' glTexSubImage2D */
+	GLenum internal, format, type;
+};
+static struct upload_kind upload_kinds[64];
+static unsigned upload_kinds_seen;
+
+static void
+upload_note(char call, unsigned *calls, GLenum target, GLint level, GLint internal, GLint passed, GLint x, GLint y,
+    GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels, const void *safe)
+{
+	unsigned seen = upload_kinds_seen, number = ++*calls;
+	bool fresh = true;
+
+	for (unsigned i = 0; i < seen && i < sizeof(upload_kinds) / sizeof(upload_kinds[0]); i++) {
+		if (upload_kinds[i].call == call && upload_kinds[i].internal == (GLenum)internal &&
+		    upload_kinds[i].format == format && upload_kinds[i].type == type) {
+			fresh = false;
+			break;
+		}
+	}
+	if (fresh && seen < sizeof(upload_kinds) / sizeof(upload_kinds[0])) {
+		upload_kinds[seen] = (struct upload_kind){ call, (GLenum)internal, format, type };
+		upload_kinds_seen = seen + 1;
+	}
+	if (!fresh && number > 64) {
+		return;
+	}
+	if (call == 'T') {
+		say("sweet-gl: upload #%u%s glTexImage2D(target %#x, level %d, internal %#x (to Mesa %#x), %d x %d, border %d, "
+		    "format %#x, type %#x, pixels %s%s)\n", number, fresh ? " NEW" : "", target, level, internal, passed, width,
+		    height, border, format, type, pixels != NULL ? "yes" : "NULL", pixels != NULL && safe != pixels ? " (copied)" : "");
+	} else {
+		say("sweet-gl: upload #%u%s glTexSubImage2D(target %#x, level %d, at %d,%d, %d x %d, format %#x, type %#x, "
+		    "pixels %s%s)\n", number, fresh ? " NEW" : "", target, level, x, y, width, height, format, type,
+		    pixels != NULL ? "yes" : "NULL", pixels != NULL && safe != pixels ? " (copied)" : "");
+	}
+}
+
 static void
 my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei width, GLsizei height, GLint border,
     GLenum format, GLenum type, const void *pixels)
 {
+	static unsigned uploads;
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x970);
@@ -3813,7 +3869,9 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	void *copy;
 	const void *safe = pixels_guarded("glTexImage2D", format, type, width, height, 0, pixels, &copy,
 	    __builtin_return_address(0));
-	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, safe);
+	GLint passed = (GLint)internal_format((GLenum)internal, format);
+	upload_note('T', &uploads, target, level, internal, passed, 0, 0, width, height, border, format, type, pixels, safe);
+	glTexImage2D(target, level, passed, width, height, border, format, type, safe);
 	free(copy);
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
@@ -3828,6 +3886,7 @@ static void
 my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
     GLenum type, const void *pixels)
 {
+	static unsigned uploads;
 	struct eagl *e = context;
 
 	EAGL_ENTER(e, 0x9a0);
@@ -3843,6 +3902,7 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 	void *copy;
 	const void *safe = pixels_guarded("glTexSubImage2D", format, type, width, height, 0, pixels, &copy,
 	    __builtin_return_address(0));
+	upload_note('S', &uploads, target, level, 0, 0, x, y, width, height, 0, format, type, pixels, safe);
 	glTexSubImage2D(target, level, x, y, width, height, format, type, safe);
 	free(copy);
 	EAGL_LEAVE(e, 0x9a0);

@@ -18,6 +18,7 @@
  * LICENSE.HackiOS): its opengl_es() and caenv handling; nothing of its iOS 16.5 patches.
  */
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <stdarg.h>
@@ -26,6 +27,8 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+#include "sweet_klog.h"
 
 typedef mach_port_t io_object_t;
 typedef io_object_t io_service_t;
@@ -53,6 +56,7 @@ say(const char *format, ...)
 	}
 	if (n > 0) {
 		write(2, line, (size_t)n);
+		sweet_klog(line, (size_t)n);    /* and into the kernel's log (dmesg), xnu patch 0111 */
 	}
 }
 
@@ -96,14 +100,31 @@ sweet_ca_init(void)
 	}
 	/*
 	 * launchd discards the window server's stderr: append it (ours and libsweet-gl's,
-	 * which loads into this process) to a file readable over SSH.
+	 * which loads into this process) to a file readable over SSH. The first file that
+	 * opens wins; which one (or why none) goes to the kernel log, which every line also reaches.
 	 */
-	int log = open("/private/var/tmp/sweet-gl.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
-	if (log >= 0) {
+	static const char *const logs[] = { "/private/var/tmp/sweet-gl.log", "/var/mobile/Library/Logs/sweet-gl.log" };
+	int errors[sizeof(logs) / sizeof(logs[0])] = { 0 };
+	const char *logged = NULL;
+	for (unsigned i = 0; i < sizeof(logs) / sizeof(logs[0]) && logged == NULL; i++) {
+		int log = open(logs[i], O_WRONLY | O_CREAT | O_APPEND, 0666);
+		if (log < 0) {
+			errors[i] = errno;
+			continue;
+		}
 		dup2(log, 2);
 		close(log);
+		logged = logs[i];
 	}
-	say("sweet-ca: loaded into %s (pid %d)\n", name, getpid());
+	say("sweet-ca: loaded into %s (pid %d, uid %d)\n", name, getpid(), (int)getuid());
+	if (logged != NULL) {
+		say("sweet-ca: stderr appended to %s%s\n", logged, errors[0] != 0 ? " (the first choice failed)" : "");
+	}
+	for (unsigned i = 0; i < sizeof(logs) / sizeof(logs[0]); i++) {
+		if (errors[i] != 0) {
+			say("sweet-ca: open(%s): %s (errno %d)\n", logs[i], strerror(errors[i]), errors[i]);
+		}
+	}
 	(void)sysctlbyname("kern.bootargs", arguments, &size, NULL, 0);
 	for (const char *argument = arguments; (argument = strstr(argument, "caenv=")) != NULL; argument += 6) {
 		char setting[128];

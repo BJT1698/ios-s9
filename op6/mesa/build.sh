@@ -5,6 +5,11 @@
 # Usage (on macOS with Xcode iPhoneOS SDK, e.g. GitHub Actions macos-15):
 #   op6/mesa/build.sh OUT
 #
+# Built -O2 -g (meson debugoptimized, NDEBUG kept, nothing stripped by meson). OUT/lib/libOSMesa.8.dylib
+# loses only its debug map (strip -S: every function name, static ones too, stays, so .ips frames
+# show names); OUT/unstripped/libOSMesa.8.dylib is the linker's output as is, and
+# OUT/dSYM/libOSMesa.8.dylib.dSYM its DWARF (same UUID as both), for llvm-symbolizer / atos.
+#
 # Adapted from HackiOS tools/mk-mesa.sh (Copyright (c) 2026 OOSEX GANG, MIT License)
 # and ios-apollo userland/mesa/build.sh (Copyright (c) 2026 Leo Malik / dipa-studio, MIT).
 set -euo pipefail
@@ -61,7 +66,7 @@ needs_exe_wrapper = true
 INI
 
 meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/usr/local --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/usr/local --libdir=lib --buildtype=debugoptimized -Db_ndebug=true -Dstrip=false -Dsplit-debug=disabled \
 	-Dplatforms= -Dgallium-drivers=softpipe,freedreno -Dfreedreno-kmds=msm -Dvulkan-drivers= \
 	-Dglx=disabled -Degl=disabled -Dgbm=disabled -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled \
 	-Dgles1=disabled -Dgles2=enabled -Dopengl=true -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
@@ -70,13 +75,27 @@ meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 	-Dbuild-tests=false
 ninja -C build src/gallium/targets/osmesa/libOSMesa.8.dylib
 
-mkdir -p "$out/lib"
+mkdir -p "$out/lib" "$out/unstripped" "$out/dSYM"
+built=build/src/gallium/targets/osmesa/libOSMesa.8.dylib
 lib=$out/lib/libOSMesa.8.dylib
-xcrun strip -x -o "$lib" build/src/gallium/targets/osmesa/libOSMesa.8.dylib
+# the DWARF stays in the build's .o files: collect it now, while they are there
+rm -rf "$out/dSYM/libOSMesa.8.dylib.dSYM"
+xcrun dsymutil "$built" -o "$out/dSYM/libOSMesa.8.dylib.dSYM"
+cp "$built" "$out/unstripped/libOSMesa.8.dylib"
+xcrun install_name_tool -id /usr/local/lib/libOSMesa.8.dylib "$out/unstripped/libOSMesa.8.dylib"
+codesign -s - -f "$out/unstripped/libOSMesa.8.dylib"
+xcrun strip -S -o "$lib" "$built"
 xcrun install_name_tool -id /usr/local/lib/libOSMesa.8.dylib "$lib"
 codesign -s - -f "$lib"
+xcrun dwarfdump --uuid "$built" "$lib" "$out/dSYM/libOSMesa.8.dylib.dSYM"
+uuids=$(xcrun dwarfdump --uuid "$built" "$lib" "$out/unstripped/libOSMesa.8.dylib" "$out/dSYM/libOSMesa.8.dylib.dSYM" |
+	awk '{ print $2 }' | sort -u | wc -l)
+[ "$uuids" -eq 1 ] || { echo "build.sh: dSYM UUID does not match libOSMesa.8.dylib" >&2; exit 1; }
+dwarf=$out/dSYM/libOSMesa.8.dylib.dSYM/Contents/Resources/DWARF/libOSMesa.8.dylib
+[ "$(stat -f %z "$dwarf")" -gt 1000000 ] || { echo "build.sh: (almost) no DWARF in $dwarf" >&2; exit 1; }
 mkdir -p "$work/meta"
 cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml "$work/meta/gl.xml"
 nm -gU "$lib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$work/meta/exported-gl.txt"
-echo "build.sh: Mesa $VERSION: $lib, $(stat -f %z "$lib") bytes, $(nm -gU "$lib" | grep -c ' _gl') gl* functions," \
-	"SweetGPU named $(strings "$lib" | grep -c '^SweetGPU$') time(s)"
+echo "build.sh: Mesa $VERSION: $lib, $(stat -f %z "$lib") bytes ($(stat -f %z "$out/unstripped/libOSMesa.8.dylib") unstripped," \
+	"$(du -sk "$out/dSYM/libOSMesa.8.dylib.dSYM" | cut -f1) KiB dSYM, $(nm "$lib" | grep -c ' [tT] ') functions named)," \
+	"$(nm -gU "$lib" | grep -c ' _gl') gl* functions, SweetGPU named $(strings "$lib" | grep -c '^SweetGPU$') time(s)"

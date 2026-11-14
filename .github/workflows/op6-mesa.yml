@@ -4,6 +4,8 @@ name: op6-mesa
 # SweetGPUUserClient, softpipe fallback) and sweet-gl-test for OnePlus 6 (Milestone G3).
 # Runs on macos-26 (macos-14/15 are not acquired for this account) with Xcode's iPhoneOS SDK.
 # Also builds the G4 CoreAnimation bridge (op6/ca-bridge: libsweet-gl.dylib, libsweet-ca.dylib).
+# Artifact: lib/ (what goes to /usr/local/lib on the phone), unstripped/libOSMesa.8.dylib and
+# dSYM/libOSMesa.8.dylib.dSYM (Mesa's DWARF, -O2 -g, for symbolizing crash reports), meta/, the tests.
 on:
   workflow_dispatch:
 
@@ -38,11 +40,19 @@ jobs:
           CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK -O2 -Wall"
           $CC -dynamiclib -Iobj -Iop6/ca-bridge -install_name /usr/local/lib/libsweet-gl.dylib \
             -framework CoreFoundation -framework IOSurface -framework IOKit -lobjc \
-            -o out/lib/libsweet-gl.dylib op6/ca-bridge/eagl.c op6/ca-bridge/sweet_gl_osmesa.c out/lib/libOSMesa.8.dylib
+            -o out/lib/libsweet-gl.dylib op6/ca-bridge/eagl.c op6/ca-bridge/sweet_gl_osmesa.c op6/ca-bridge/sweet_klog.c \
+            out/lib/libOSMesa.8.dylib
           $CC -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib -framework CoreFoundation -framework IOKit \
-            -o out/lib/libsweet-ca.dylib op6/ca-bridge/sweet_ca.c
+            -Iop6/ca-bridge -o out/lib/libsweet-ca.dylib op6/ca-bridge/sweet_ca.c op6/ca-bridge/sweet_klog.c
           codesign -s - -f out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
           otool -L out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
+          # both dylibs carry sweet_klog (selector 0x7f), kept private to each
+          nm -m out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib | grep '_sweet_klog'
+          if nm -gU out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib | grep -q '_sweet_klog'; then exit 1; fi
+          # Mesa symbols: lib/ keeps every function name, unstripped/ + dSYM/ are for llvm-symbolizer / atos
+          ls -l out/lib/libOSMesa.8.dylib out/unstripped/libOSMesa.8.dylib
+          xcrun dwarfdump --uuid out/lib/libOSMesa.8.dylib out/dSYM/libOSMesa.8.dylib.dSYM
+          du -sh out/dSYM/libOSMesa.8.dylib.dSYM
           mkdir -p out/meta
           cp mesa-work/meta/gl.xml mesa-work/meta/exported-gl.txt out/meta/
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS

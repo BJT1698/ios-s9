@@ -1,0 +1,399 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 7a75719..a04d984 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -22,6 +22,25 @@
+  * plus clientMemoryForType for write-combined BO mapping). Portions of the
+  * uAPI dispatch reference oosexgang/hackios-xnu-kernel (drivers/gpu/hakios.gpu.cpp,
+  * APSL 2.0) and Mesa's drm-uapi/msm_drm.h (MIT).
++ *
++ * Activity counters (patch 0111), published on this service, at most every
++ * SWEET_GPU_STAT_EVENTS events or once a second, and on every open/close:
++ *
++ *   SweetGPUSubmits     successful GEM_SUBMITs
++ *   SweetGPUImports     IOSurfaces newly mapped into the GPU (selector 0x7e)
++ *   SweetGPUClients     GPU user clients open now
++ *   SweetGPUOpens       GPU user clients opened since boot
++ *   SweetGPULastClient  name of the process that opened the last one
++ *   SweetGPUFaults      GPU SMMU faults + SweetGPUHangs
++ *   SweetGPUHangs       failed submits (ring full) + fence waits >= 500 ms that timed out
++ *   SweetGPULogLines / SweetGPULogDropped   selector 0x7f lines printed / rate-limited
++ *
++ * Selector 0x7f (kSweetGpuLog): structureInput = text (up to 512 bytes, NUL
++ * not needed), printed as "sweet-gl[<process>]: <text>" (dmesg and the
++ * persistent log), at most SWEET_GPU_LOG_RATE lines per second per process.
++ * It works on any open user client, GPU ready or not; IOServiceOpen type
++ * kSweetGpuLogClientType ('SLOG') opens a log-only client that neither waits
++ * for the GPU nor counts as a GPU client.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+@@ -36,6 +55,7 @@
+ #include <mach/mach_time.h>
+ #include <libkern/libkern.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
+ #include "SweetSurface.h"
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -70,6 +90,30 @@ static volatile uint32_t gSurfaceFence[4096];
+ static uint32_t gSurfaceFlushed[4096];
+ static uint64_t gSurfaceWrites;
+ 
++/* ---- patch 0111: activity counters (IORegistry) ---- */
++#define SWEET_GPU_STAT_EVENTS   256u            /* publish after this many events ... */
++#define SWEET_GPU_NAME_MAX      33              /* p_name: 2 * MAXCOMLEN + 1 */
++
++class SweetGPU;
++static SweetGPU *gSweetGPUService;              /* set once in start(), never released */
++static IOLock *gSweetGPUStatLock;               /* serializes publication; never taken with gSweetGPULock held */
++static IOLock *gSweetGPULogLock;                /* selector 0x7f rate limits; nothing else taken under it */
++static uint64_t gSweetGPUSecondAbs;             /* ... or after one second (mach_absolute_time units) */
++static uint64_t gStatSubmits, gStatImports, gStatHangs, gStatOpens, gStatLogLines, gStatLogDropped;
++static uint32_t gStatClients;
++static uint64_t gStatEvents, gStatPublishedEvents, gStatPublishedAt;
++static char gStatLastClient[SWEET_GPU_NAME_MAX];        /* under gSweetGPUStatLock */
++
++#define SWEET_STAT_ADD(counter, n)      __atomic_fetch_add(&(counter), (n), __ATOMIC_RELAXED)
++#define SWEET_STAT_LOAD(counter)        __atomic_load_n(&(counter), __ATOMIC_RELAXED)
++
++static inline void
++sweet_gpu_stat_event(uint64_t *counter)
++{
++	SWEET_STAT_ADD(*counter, 1);
++	SWEET_STAT_ADD(gStatEvents, 1);
++}
++
+ class SweetGPU : public IOService {
+ 	OSDeclareDefaultStructors(SweetGPU);
+ public:
+@@ -81,6 +125,54 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetGPU, IOService);
+ 
++/*
++ * Copy the counters to the registry. Called with no lock held (setProperty takes the registry's
++ * own lock). Unforced calls return at once unless SWEET_GPU_STAT_EVENTS events or a second have
++ * passed, and never wait for another thread that is publishing.
++ */
++static void
++sweet_gpu_stat_publish(bool force, const char *client)
++{
++	SweetGPU *service = gSweetGPUService;
++	uint64_t events = SWEET_STAT_LOAD(gStatEvents), now = mach_absolute_time();
++
++	if (service == NULL || gSweetGPUStatLock == NULL) {
++		return;
++	}
++	if (!force) {
++		uint64_t published = SWEET_STAT_LOAD(gStatPublishedEvents);
++		if (events == published ||
++		    (events - published < SWEET_GPU_STAT_EVENTS &&
++		    now - SWEET_STAT_LOAD(gStatPublishedAt) < gSweetGPUSecondAbs)) {
++			return;
++		}
++		if (!IOLockTryLock(gSweetGPUStatLock)) {
++			return;
++		}
++	} else {
++		IOLockLock(gSweetGPUStatLock);
++	}
++	__atomic_store_n(&gStatPublishedEvents, events, __ATOMIC_RELAXED);
++	__atomic_store_n(&gStatPublishedAt, now, __ATOMIC_RELAXED);
++	if (client != NULL) {
++		strlcpy(gStatLastClient, client, sizeof(gStatLastClient));
++		service->setProperty("SweetGPULastClient", gStatLastClient);
++	}
++	uint64_t faults = 0, hangs = SWEET_STAT_LOAD(gStatHangs);
++	if (!sweet_gpu_get_param(0x09u, &faults)) {     /* MSM_PARAM_FAULTS: SMMU faults seen by sweet_gpu_report() */
++		faults = 0;
++	}
++	service->setProperty("SweetGPUSubmits", (unsigned long long)SWEET_STAT_LOAD(gStatSubmits), 64);
++	service->setProperty("SweetGPUImports", (unsigned long long)SWEET_STAT_LOAD(gStatImports), 64);
++	service->setProperty("SweetGPUClients", (unsigned long long)SWEET_STAT_LOAD(gStatClients), 32);
++	service->setProperty("SweetGPUOpens", (unsigned long long)SWEET_STAT_LOAD(gStatOpens), 64);
++	service->setProperty("SweetGPUFaults", (unsigned long long)(faults + hangs), 64);
++	service->setProperty("SweetGPUHangs", (unsigned long long)hangs, 64);
++	service->setProperty("SweetGPULogLines", (unsigned long long)SWEET_STAT_LOAD(gStatLogLines), 64);
++	service->setProperty("SweetGPULogDropped", (unsigned long long)SWEET_STAT_LOAD(gStatLogDropped), 64);
++	IOLockUnlock(gSweetGPUStatLock);
++}
++
+ static bool
+ sweet_gpu_board_is(const char *want)
+ {
+@@ -148,8 +240,25 @@ SweetGPU::start(IOService *provider)
+ 			return false;
+ 		}
+ 	}
++	if (gSweetGPUStatLock == NULL) {
++		gSweetGPUStatLock = IOLockAlloc();
++		if (gSweetGPUStatLock == NULL) {
++			return false;
++		}
++	}
++	if (gSweetGPULogLock == NULL) {
++		gSweetGPULogLock = IOLockAlloc();
++		if (gSweetGPULogLock == NULL) {
++			return false;
++		}
++	}
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &gSweetGPUSecondAbs);
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
+ 	setProperty("SweetGPUState", "starting");
++	if (gSweetGPUService == NULL) {
++		gSweetGPUService = this;        /* the service is never unloaded */
++		sweet_gpu_stat_publish(true, NULL);
++	}
+ 	if (fMode == 2) {
+ 		registerService();
+ 	}
+@@ -180,8 +289,22 @@ enum {
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
+ 	kSweetGpuSurface        = 0x7e,
++	kSweetGpuLog            = 0x7f,
+ };
+ 
++#define kSweetGpuLogClientType  0x534c4f47u     /* 'SLOG': IOServiceOpen type of a log-only client */
++#define SWEET_GPU_LOG_MAX       512u            /* bytes of text per kSweetGpuLog call */
++#define SWEET_GPU_LOG_RATE      200u            /* lines per second per process, the rest dropped */
++#define SWEET_GPU_LOG_PROCS     16u             /* processes rate-limited separately */
++
++struct sweet_gpu_log_rate {
++	int pid;
++	uint32_t lines;                 /* printed in this window */
++	uint32_t dropped;               /* dropped in this window */
++	uint64_t window;                /* mach_absolute_time() the window began */
++};
++static struct sweet_gpu_log_rate gLogRate[SWEET_GPU_LOG_PROCS];  /* under gSweetGPULogLock */
++
+ struct sweet_surface_request {
+ 	uint32_t surface;
+ 	uint32_t handle;
+@@ -384,6 +507,9 @@ sweet_gpu_wait_locked(uint32_t fence, uint64_t ms)
+ 		delay_for_interval(50, NSEC_PER_USEC);
+ 		IOLockLock(gSweetGPULock);
+ 	}
++	if (ms >= 500) {
++		sweet_gpu_stat_event(&gStatHangs);
++	}
+ 	if (ms >= 500 && !gSweetGPUReported) {
+ 		gSweetGPUReported = true;
+ 		sweet_gpu_report("wait timeout");
+@@ -398,6 +524,9 @@ class SweetGPUUserClient : public IOUserClient {
+ 	struct sweet_gpu_bo *fBOs;
+ 	uint32_t fNextBO;
+ 	uint32_t fNextQueue;
++	bool fLogOnly;                  /* opened with kSweetGpuLogClientType */
++	uint32_t fCounted;              /* 1 while included in gStatClients */
++	char fProcName[SWEET_GPU_NAME_MAX];
+ 
+ 	struct sweet_gpu_bo *lookupBO(uint32_t handle);
+ 	void releaseBOLocked(struct sweet_gpu_bo *b);
+@@ -405,6 +534,8 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOReturn gemInfo(struct drm_msm_gem_info *req);
+ 	IOReturn gemSubmit(struct drm_msm_gem_submit *req);
+ 	IOReturn surfaceBuffer(struct sweet_surface_request *req);
++	IOReturn kernelLog(const void *text, uint32_t size);
++	void uncount(void);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -426,6 +557,17 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 	fTask = owningTask;
+ 	fNextBO = 0;
+ 	fNextQueue = 0;
++	fCounted = 0;
++	fLogOnly = type == kSweetGpuLogClientType;
++	bzero(fProcName, sizeof(fProcName));
++	proc_selfname(fProcName, sizeof(fProcName));    /* initWithTask runs in the opener's thread */
++	if (fProcName[0] == 0) {
++		strlcpy(fProcName, "?", sizeof(fProcName));
++	}
++	if (fLogOnly) {
++		fBOs = NULL;                    /* no BOs: only kSweetGpuLog is accepted */
++		return true;
++	}
+ 	fBOs = (struct sweet_gpu_bo *)IOMallocZero(SWEET_GPU_MAX_BOS * sizeof(fBOs[0]));
+ 	return fBOs != NULL;
+ }
+@@ -436,10 +578,30 @@ SweetGPUUserClient::start(IOService *provider)
+ 	if (!IOUserClient::start(provider) || gSweetGPULock == NULL) {
+ 		return false;
+ 	}
++	if (fLogOnly) {
++		return true;
++	}
+ 	for (unsigned waited = 0; gSweetGPUState == 0 && waited < 1200; waited++) {
+ 		IOSleep(50);
+ 	}
+-	return sweet_gpu_ready() != 0;
++	if (sweet_gpu_ready() == 0) {
++		return false;
++	}
++	fCounted = 1;
++	SWEET_STAT_ADD(gStatClients, 1u);
++	SWEET_STAT_ADD(gStatOpens, 1);
++	sweet_gpu_stat_publish(true, fProcName);
++	return true;
++}
++
++/* Take this client out of SweetGPUClients, once (clientClose() and free() both call it). */
++void
++SweetGPUUserClient::uncount(void)
++{
++	if (__atomic_exchange_n(&fCounted, 0u, __ATOMIC_RELAXED) != 0) {
++		__atomic_fetch_sub(&gStatClients, 1u, __ATOMIC_RELAXED);
++		sweet_gpu_stat_publish(true, NULL);
++	}
+ }
+ 
+ struct sweet_gpu_bo *
+@@ -481,6 +643,7 @@ SweetGPUUserClient::clientClose(void)
+ 		}
+ 		IOLockUnlock(gSweetGPULock);
+ 	}
++	uncount();
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -499,6 +662,7 @@ SweetGPUUserClient::free(void)
+ 		IOFree(fBOs, SWEET_GPU_MAX_BOS * sizeof(fBOs[0]));
+ 		fBOs = NULL;
+ 	}
++	uncount();
+ 	IOUserClient::free();
+ }
+ 
+@@ -673,8 +837,10 @@ SweetGPUUserClient::gemSubmit(struct drm_msm_gem_submit *req)
+ 	if (ret == kIOReturnSuccess) {
+ 		uint32_t fence = 0;
+ 		if (sweet_gpu_submit(ib_iovas, ib_dwords, ib_count, &fence) != 0 || fence == 0) {
++			sweet_gpu_stat_event(&gStatHangs);
+ 			ret = kIOReturnTimeout;
+ 		} else {
++			sweet_gpu_stat_event(&gStatSubmits);
+ 			req->fence = fence;
+ 			if (req->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+ 				req->fence_fd = -1;
+@@ -777,10 +943,96 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 	b->fence = 0;
+ 	b->seed = surface->seed();
+ 	req->handle = slot + 1;
++	sweet_gpu_stat_event(&gStatImports);
+ 	IOLockUnlock(gSweetGPULock);
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * Selector 0x7f: one line of a user process's log into the kernel's (printf: dmesg and the
++ * persistent log). Control characters become '?', a newline a space; trailing blanks are cut.
++ * SWEET_GPU_LOG_RATE lines per second per process; what is dropped is counted and said once
++ * the next second begins. Takes no GPU lock and needs no GPU.
++ */
++IOReturn
++SweetGPUUserClient::kernelLog(const void *text, uint32_t size)
++{
++	char line[SWEET_GPU_LOG_MAX + 1];
++	const uint8_t *in = (const uint8_t *)text;
++	uint32_t n = 0, dropped = 0;
++	bool print = false;
++
++	if (in == NULL || size == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (size > SWEET_GPU_LOG_MAX) {
++		size = SWEET_GPU_LOG_MAX;
++	}
++	for (uint32_t i = 0; i < size && in[i] != 0; i++) {
++		uint8_t c = in[i];
++		if (c == '\n' || c == '\r' || c == '\t') {
++			c = ' ';
++		} else if (c < 0x20 || c == 0x7f) {
++			c = '?';
++		}
++		line[n++] = (char)c;
++	}
++	while (n > 0 && line[n - 1] == ' ') {
++		n--;
++	}
++	line[n] = 0;
++	if (n == 0) {
++		return kIOReturnSuccess;
++	}
++
++	int pid = proc_selfpid();
++	uint64_t now = mach_absolute_time();
++	if (gSweetGPULogLock == NULL) {
++		return kIOReturnNotReady;
++	}
++	IOLockLock(gSweetGPULogLock);
++	struct sweet_gpu_log_rate *rate = NULL, *oldest = &gLogRate[0];
++	for (uint32_t i = 0; i < SWEET_GPU_LOG_PROCS; i++) {
++		if (gLogRate[i].pid == pid && gLogRate[i].window != 0) {
++			rate = &gLogRate[i];
++			break;
++		}
++		if (gLogRate[i].window < oldest->window) {
++			oldest = &gLogRate[i];
++		}
++	}
++	if (rate == NULL) {
++		rate = oldest;                  /* a new process takes the longest unused slot */
++		bzero(rate, sizeof(*rate));
++		rate->pid = pid;
++		rate->window = now;
++	}
++	if (now - rate->window >= gSweetGPUSecondAbs) {
++		dropped = rate->dropped;
++		rate->window = now;
++		rate->lines = 0;
++		rate->dropped = 0;
++	}
++	if (rate->lines < SWEET_GPU_LOG_RATE) {
++		rate->lines++;
++		print = true;
++	} else {
++		rate->dropped++;
++	}
++	IOLockUnlock(gSweetGPULogLock);
++
++	if (dropped != 0) {
++		printf("sweet-gl[%s]: (%u lines dropped: more than %u a second)\n", fProcName, dropped, SWEET_GPU_LOG_RATE);
++	}
++	if (print) {
++		printf("sweet-gl[%s]: %s\n", fProcName, line);
++		sweet_gpu_stat_event(&gStatLogLines);
++	} else {
++		sweet_gpu_stat_event(&gStatLogDropped);
++	}
++	return kIOReturnSuccess;
++}
++
+ extern "C" bool
+ sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
+ {
+@@ -848,6 +1100,14 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t zero = 0;
+ 
++	if (selector == kSweetGpuLog) {         /* before the GPU and size checks: logs need no GPU */
++		ret = kernelLog(args->structureInput, args->structureInputSize);
++		sweet_gpu_stat_publish(false, NULL);
++		return ret;
++	}
++	if (fLogOnly) {
++		return kIOReturnNotPermitted;
++	}
+ 	if (!sweet_gpu_ready()) {
+ 		return kIOReturnNotReady;
+ 	}
+@@ -937,6 +1197,7 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		}
+ 		memcpy(args->structureOutput, &r, args->structureOutputSize);
+ 	}
++	sweet_gpu_stat_publish(false, NULL);    /* no lock held here */
+ 	return ret;
+ }
+ 

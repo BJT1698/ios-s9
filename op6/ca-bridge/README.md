@@ -9,6 +9,8 @@ Milestone **G4** userland bridge that switches `backboardd`'s CoreAnimation rend
 - `libsweet-ca.dylib` (`sweet_ca.c`):
   Injected into `backboardd` via the kernel boot-arg `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd`. Hooks `CA::WindowServer::Server::context()` and `CARenderOGLNewContext` so `backboardd` creates a `CA::OGL::EAGLContext` instead of falling back to the software rasterizer.
 
+- `sweet_klog.c` / `sweet_klog.h` (in both dylibs): every log line also goes to the kernel log through SweetGPU selector `0x7f` (xnu patch 0111, log-only client type `'SLOG'`): `dmesg | grep sweet-gl`.
+
 ## License & Attribution
 
 Adapted from `aTechGeekDev/ios-apollo` (`userland/ca-bridge/`, MIT License) and `oosexgang/hackios-xnu-kernel` (`userland/src/`, MIT License; see `LICENSE.HackiOS`).
