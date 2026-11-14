@@ -158,13 +158,13 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
 
 - **State:**
   - `boot-G4g-192.img`: kernel run 43592841933 with 0114 memory counters + page-table pool, ADT `op6/out/op6-gpu192.adt` (192 MiB GPU carve-out). It is the default; normal use needs about 80 MiB.
-  - Mesa from `op6-mesa` run `43597009184` (patches `0001`-`0005`) is installed in `/usr/local/lib` on the phone.
+  - Mesa from `op6-mesa` run `43598167134` (patches `0001`-`0005`) is installed in `/usr/local/lib` on the phone.
 - **Done (`op6/mesa/patches/0005-freedreno-skip-null-bo-draws.patch`):**
   - Skips `fd_draw_vbo`, `fd_clear`, `fd_clear_render_target`, `fd_clear_depth_stencil`, `fd_launch_grid`, `fd_blit`, and `fd_resource_copy_region` when any bound resource/surface has `rsc->bo == NULL` (logged once via `mesa_loge` + `sweet_drm_log`).
-  - Guards `fd6_build_bindless_state` (`fd6_image.cc`) and `fd6_clear` (`subpass->lrz` in `fd6_draw.cc`) against `NULL` BOs.
+  - Guards `upload_shader_variant` (`ir3_gallium.c`), `draw_vbos` (`fd6_draw.cc` shader BOs), `fd6_build_bindless_state` (`fd6_image.cc`), and `fd6_clear` (`subpass->lrz` in `fd6_draw.cc`) against `NULL` BOs.
   - Adds OOM scratch fallback + incomplete-submit drop in `freedreno_ringbuffer_sp` when `fd_bo_new_ring()` / `fd_bo_map()` fails.
 - **Verified:**
-  - `boot-G4g-32.img` (~90s): `backboardd` and `SpringBoard` alive, 0 new `backboardd-*.ips` crashes, `SweetGPUAllocFails = 49`, `SweetGPUFaults = 0`, `SweetGPUHangs = 0`, `SweetGPUSubmits = 24`.
+  - `boot-G4g-32.img` (120s): `backboardd` and `SpringBoard` alive, 0 new `backboardd-*.ips` crashes, `SweetGPUAllocFails = 95`, `SweetGPUFaults = 0`, `SweetGPUHangs = 0`, `SweetGPUSubmits = 41`.
   - `boot-G4g-192.img` restored and verified.
 - **Next:** GPU IRQs (G5); wallpaper; real battery level; daemon trim; booting without the PC (flash `boot-G4g-192.img` to boot_b, after asking the user).
 
