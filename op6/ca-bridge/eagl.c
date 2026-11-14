@@ -375,6 +375,15 @@ static uint32_t slot_calls[SLOTS];
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
 /*
+ * A surface that is only shown (texImageIOSurface) is copied into a texture of the library's
+ * even when the GPU could read its memory: applications draw into such surfaces with the
+ * processor and often move no seed, and the kernel cleans a surface's lines from the caches
+ * for the GPU only when its seed moves (xnu 0109 gemSubmit), so the GPU could see old pixels.
+ * The display's picture (attachImage, the mirror) does not need this. Boot-arg glshareshown=1:
+ * the GPU reads shown surfaces in place as well (a test).
+ */
+static int share_shown = 0;
+/*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
  * submission, as it waited for the frame's last draw). Drawn into the surface's memory directly,
@@ -4586,7 +4595,7 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
-	if (!surface_shared(e, image)) {
+	if (!share_shown || !surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
 	}
@@ -5162,6 +5171,7 @@ install(void)
 			}
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		share_shown = strstr(arguments, "glshareshown=1") != NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {

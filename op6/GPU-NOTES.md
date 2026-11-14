@@ -280,3 +280,68 @@ write went elsewhere.
   **Risks:** a log-only open on a kernel *without* 0111 becomes a normal client whose start() waits up to 60 s for the GPU (sweet_ca waits for SweetGPU anyway) and then 0x7f fails -> the bridge stops klogging; per-line IOConnectCall cost (~µs) while gltrace is on; libOSMesa with symbols is larger (only the debug map is stripped).
 - 2026-11-14 **G4 works on device** (kernel run 43583724699 with 0110 sweetinject + 0111 counters/klog, Mesa/bridge run 43583728286 with symbols + dSYM, boot-G4c/G4d.img). backboardd started at boot renders CoreAnimation through libsweet-gl -> Mesa freedreno FD630: `SweetGPULastClient = backboardd`, home screen, Spotlight blur, Control Center, Settings drawn correctly (user video). Crash at 64 MiB carve-out (boot-G4c): symbolized with the dSYM = `my_glTexImage2D -> st_TexImage -> fd_resource_create -> fd_bo_new -> fd_bo_heap_alloc` returns NULL (GPU memory exhausted) then `fd_bo_ref(NULL)` (Mesa does not check). With `--gpu-dma 0xa0000000,0x08000000` (128 MiB, boot-G4d.img): 5+ min of use, 7447 submits, 0 faults, 0 hangs, no backboardd/SpringBoard crash. Frame time 38-63 ms (~16-26 fps, same feel as the CPU path): every frame is rendered off-screen and "1 picture copied out, 0 drawn in place" — the final copy to the display is the bottleneck.
 - Next: (1) draw in place / zero-copy into the AppleCLCD framebuffer surface (or import the display IOSurface with selector 0x7e) instead of copying the picture out each frame; (2) GPU memory: make GEM_NEW failure clean (sweet-drm/Mesa NULL check) and add BO eviction or a larger GPU VA/page-table pool (driver pool = 64 page-table pages ~ 128 MiB); (3) IRQs instead of polling (G5).
+- 2026-11-14 **G4e: zero-copy present — why SweetGPUImports = 0, and the fix (written, not yet built or run).**
+  **Root cause (from code + G4d log): the import was never asked for.** Selector 0x7e's request struct differs
+  between kernel and userland. Kernel (0109 `struct sweet_surface_request`): `surface u32, handle u32, size u64,
+  offset u64, rowBytes, width, height, pixelFormat, planes, pad` = 48 bytes. sweet-drm (`op6/mesa/sweet-drm/xf86drm.h`
+  `struct sweet_drm_surface`): same but `offset` is **u32** = 40 bytes. The kernel accepts any size <= its union and
+  copies its 48-byte answer back truncated to 40, so Mesa's describe call (`osmesa_surface_resource()` ->
+  `sweet_drm_surface()`, handle 0xffffffff) reads everything after `offset` 4 bytes late: `row_bytes` = 0 (high half of
+  the u64 offset), `width` = 3328 (bpr), `height` = 828, `pixel_format` = 1792 (the height), `planes` = 0x42475241
+  ('BGRA'). `pixel_format != 'BGRA' || planes != 0` -> NULL -> `glEGLImageTargetTexture2DOES` fails (GL error) ->
+  `surface_mirrored()` and `surface_shared()` fail -> every frame goes through `target_to_surface()`'s
+  `glReadPixels` (45 ms of the 38-63 ms frame: "45678 copying out"). `drmPrimeFDToHandle()` (the real import) is
+  never reached, which is exactly `SweetGPUImports = 0` and "0 IOSurfaces were the textures' memory, 119 had to be
+  copied". Nothing in the kernel logged 0x7e, so the log could not show it.
+  **Where the display surfaces live:** on the OnePlus 6 there are no display slots (`SWEET FB: zero-copy unavailable
+  (splash 0x9d400000 1080x2280)`), so backboardd's 828x1792 'BGRA' surfaces (bpr 3328, 5,963,776 bytes) are
+  `IOBufferMemoryDescriptor`s of ordinary XNU RAM (wired 16K pages, anywhere in 0x80000000..0x27d800000). 0109's
+  import path already walks the descriptor (`getPhysicalSegment` per 4K) and installs 4K PTEs at GPU VA 0x20000000+
+  (1.5 GiB window, own free list); the GPU context bank's TCR2 PASize = 36 bits covers all of RAM; only page-table
+  pages come from the carve-out pool (`GPU_PT_PAGES` = 512 = 2 MiB, reserved at bring-up), no BO pages. freedreno's
+  `resource_from_handle` pitch check passes (3328 = 52 x 64, a630 pitchalign 64 B).
+  **Changes:**
+  - Kernel `xnu/patches/0112-op6-gpu-import-fix-klog.patch` (SweetGPU.cpp only): 0x7e accepts the 48-byte layout and
+    the old 40-byte layout (answered in kind: a 0112 kernel fixes even the G4d libOSMesa), anything else refused and
+    logged; every result logged (all for the first 96 lines, then 1/256 successes, 1/16 refusals):
+    `SWEET GPU: import backboardd surface N describe: 828x1792 fmt 0x42475241 bpr 3328 planes 0 size 5963776 -> ok (...)`,
+    `SWEET GPU: import backboardd surface N import: ... -> handle H iova 0x20000000, 1456 pages from pa 0x..., mapped`,
+    `... import: already handle H at iova ...`, or `-> REFUSED, <why> (page +0x.. pa 0x..)` (no such IOSurface / no
+    memory behind it / larger than 64 MiB / BO table full / GPU VA for surfaces used up / a page with no usable
+    physical address / GPU page-table pool exhausted). New ioreg counters `SweetGPUImportFails`, `SweetGPUImportedKB`
+    (surface memory mapped into the GPU now; drops on GEM_CLOSE). Present side: `SWEET GPU: present of surface N:
+    GPU fence F not done after 50 ms, frame skipped (k times)` (1/64).
+  - `op6/mesa/sweet-drm/xf86drm.h`: `struct sweet_drm_surface` = the kernel's 48 bytes (u64 offset + pad), with a
+    static assert. Works with 0109+ kernels.
+  - `op6/ca-bridge/sweet_gl_osmesa.c`: one line on first use (`IOSurfaces as GPU memory: glEGLImageTargetTexture2DOES
+    found, renderer FD630: will be tried (selector 0x7e)`), then each `IOSurface N as GPU texture memory (EGLImage):
+    ok | REFUSED, copied instead, GL error 0x..` (first 32, then 1/256 ok, 1/16 refused). Kernel "describe ok" with no
+    "import" line + bridge REFUSED = Mesa refused (format/planes or freedreno pitch/size).
+  - `op6/ca-bridge/eagl.c`: surfaces that are only *shown* (texImageIOSurface) stay copied by default: apps write them
+    with the CPU without moving the seed, and the kernel cleans a surface for the GPU only when its seed moves, so
+    zero-copy there could show stale pixels. Boot-arg `glshareshown=1` enables it (test). The display path
+    (attachImage -> `surface_mirrored()`: CA draws into a Mesa texture, the GPU blits it into the imported surface,
+    "drawn in place") is the one this fixes; it was already written that way (HackiOS/apollo: direct rendering into
+    the surface lost parts of frames with framebuffer fetch).
+  - Fallbacks unchanged and automatic: any kernel refusal or Mesa NULL -> GL error -> copy path as in G4d; boot-args
+    `glcopy=1` (no sharing at all) or `glblit=0`.
+  **Expected on device:** `ioreg -l -c SweetGPU | grep SweetGPU`: `SweetGPUImports` > 0 and growing slowly with
+  re-attachments (~50 per 1600 frames in G4d), `SweetGPUImportFails` = 0, `SweetGPUImportedKB` ~ 5824-17472 (1-3
+  display surfaces); `dmesg | grep -e 'SWEET GPU: import' -e 'sweet-gl'`: describe ok + import mapped lines for surfaces
+  2/3, `-attachImage: texture T is IOSurface 2 ('BGRA' 828 x 1792, 3328 bytes a row): a texture, copied into its memory
+  by the GPU`, frame lines `0 pictures copied out, 1 drawn in place`, "copying out" ~0, frame time ~8-15 ms (G4d: 56 ms
+  of which 45 copying out); summary `N IOSurfaces were the textures' memory` > 0; `SweetGPUFaults` = 0. Per-frame CPU
+  left: the kernel present (828x1792 -> 1080x2280 scale, own thread, unchanged) plus a clean+invalidate of the 5.7 MiB
+  surface at the submit after each seed change (0109 `sweet_gpu_to_memory`, ~1 ms) and after the fence at present.
+  **Test plan:** rebuild the kernel (xnu workflow; it copies all `xnu/patches/*.patch`, 0112 included) -> boot-G4e.img
+  with the same ADT `op6/out/op6-gpu128.adt` and the same boot-args as G4d. Step 1: kernel only, G4d userland libs
+  (exercises the 40-byte compat path). Step 2: op6-mesa run (new xf86drm.h + bridge logs), install `lib/*` to
+  `/usr/local/lib`, restart backboardd. If imports are refused, the REFUSED reason line says which layer; if pictures
+  are wrong (tearing / stale rows), compare with `glcopy=1`.
+  **Stretch goal (GPU scaled blit into the panel at 0x9d400000) not done:** the panel framebuffer's stride is 4320
+  bytes (1080 x 4), not a multiple of 64, so freedreno's `resource_from_handle` refuses it as a render target
+  (pitchalign 64 B on a630); it would need a 64-aligned scan-out buffer (display engine stride change) or a kernel-side
+  GPU blit path. The bridge's `scan_frame()` (xnu 0159 flip frames) only applies to >= 1000x2000 canvases.
+  **Risks:** first time the GPU writes RAM outside the carve-out (SMMU faults would show as SweetGPUFaults and
+  `SWEET GPU` fault lines; a wrong PTE could hang the GPU -> backboardd restart); unmaps wait up to 200 ms for the
+  BO's fence before the surface pages are released.

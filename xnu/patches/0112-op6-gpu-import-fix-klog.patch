@@ -1,0 +1,345 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index a04d984..b225a9d 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -28,6 +28,9 @@
+  *
+  *   SweetGPUSubmits     successful GEM_SUBMITs
+  *   SweetGPUImports     IOSurfaces newly mapped into the GPU (selector 0x7e)
++ *   SweetGPUImportFails selector 0x7e imports refused (each one also in the log, patch 0112)
++ *   SweetGPUImportedKB  KiB of IOSurface memory mapped into the GPU now (the surfaces' own
++ *                       pages: no carve-out pages are used for them, only page-table pages)
+  *   SweetGPUClients     GPU user clients open now
+  *   SweetGPUOpens       GPU user clients opened since boot
+  *   SweetGPULastClient  name of the process that opened the last one
+@@ -56,6 +59,7 @@
+ #include <libkern/libkern.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
++#include <stdarg.h>
+ #include "SweetSurface.h"
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -100,6 +104,7 @@ static IOLock *gSweetGPUStatLock;               /* serializes publication; never
+ static IOLock *gSweetGPULogLock;                /* selector 0x7f rate limits; nothing else taken under it */
+ static uint64_t gSweetGPUSecondAbs;             /* ... or after one second (mach_absolute_time units) */
+ static uint64_t gStatSubmits, gStatImports, gStatHangs, gStatOpens, gStatLogLines, gStatLogDropped;
++static uint64_t gStatImportFails, gStatImportedBytes, gStatImportLogs;  /* 0112 */
+ static uint32_t gStatClients;
+ static uint64_t gStatEvents, gStatPublishedEvents, gStatPublishedAt;
+ static char gStatLastClient[SWEET_GPU_NAME_MAX];        /* under gSweetGPUStatLock */
+@@ -164,6 +169,8 @@ sweet_gpu_stat_publish(bool force, const char *client)
+ 	}
+ 	service->setProperty("SweetGPUSubmits", (unsigned long long)SWEET_STAT_LOAD(gStatSubmits), 64);
+ 	service->setProperty("SweetGPUImports", (unsigned long long)SWEET_STAT_LOAD(gStatImports), 64);
++	service->setProperty("SweetGPUImportFails", (unsigned long long)SWEET_STAT_LOAD(gStatImportFails), 64);
++	service->setProperty("SweetGPUImportedKB", (unsigned long long)(SWEET_STAT_LOAD(gStatImportedBytes) >> 10), 64);
+ 	service->setProperty("SweetGPUClients", (unsigned long long)SWEET_STAT_LOAD(gStatClients), 32);
+ 	service->setProperty("SweetGPUOpens", (unsigned long long)SWEET_STAT_LOAD(gStatOpens), 64);
+ 	service->setProperty("SweetGPUFaults", (unsigned long long)(faults + hangs), 64);
+@@ -305,6 +312,11 @@ struct sweet_gpu_log_rate {
+ };
+ static struct sweet_gpu_log_rate gLogRate[SWEET_GPU_LOG_PROCS];  /* under gSweetGPULogLock */
+ 
++/*
++ * Selector 0x7e (kSweetGpuSurface): structureInput/Output = this, 48 bytes. handle =
++ * 0xffffffff only describes the surface; any other value imports it (maps the surface's own
++ * physical pages into the GPU) and returns the BO handle.
++ */
+ struct sweet_surface_request {
+ 	uint32_t surface;
+ 	uint32_t handle;
+@@ -318,6 +330,30 @@ struct sweet_surface_request {
+ 	uint32_t pad;
+ };
+ 
++/*
++ * 0112: the layout sweet-drm (op6/mesa/sweet-drm/xf86drm.h, struct sweet_drm_surface) used up
++ * to G4d, 40 bytes: offset is 32 bits there. Answered in that layout, so an older libOSMesa
++ * works too. Before 0112 the kernel wrote its 48-byte layout over this one: rowBytes landed in
++ * width, width in height, height in pixel_format and pixelFormat in planes, so Mesa saw a
++ * surface of pixel format 1792 with 'BGRA' planes and never asked for the import
++ * (SweetGPUImports = 0, "0 drawn in place").
++ */
++struct sweet_surface_request_v0 {
++	uint32_t surface;
++	uint32_t handle;
++	uint64_t size;
++	uint32_t offset;
++	uint32_t rowBytes;
++	uint32_t width;
++	uint32_t height;
++	uint32_t pixelFormat;
++	uint32_t planes;
++};
++#define SWEET_GPU_DESCRIBE_ONLY         0xffffffffu
++#define SWEET_GPU_IMPORT_MAX            (64u << 20)     /* no surface of ours is bigger (828x1792x4 = 5.7 MiB) */
++#define SWEET_GPU_IMPORT_LOG_ALL        96u             /* every 0x7e result is logged up to this many lines, */
++#define SWEET_GPU_IMPORT_LOG_EVERY      256u            /* ... then one in this many (failures: one in 16) */
++
+ struct msm_timespec {
+ 	int64_t tv_sec;
+ 	int64_t tv_nsec;
+@@ -625,6 +661,7 @@ SweetGPUUserClient::releaseBOLocked(struct sweet_gpu_bo *b)
+ 	}
+ 	if (b->surface != NULL) {
+ 		sweet_gpu_surf_unmap(b->iova, b->size);
++		__atomic_fetch_sub(&gStatImportedBytes, (uint64_t)b->size, __ATOMIC_RELAXED);
+ 		b->surface->release();
+ 	} else {
+ 		sweet_gpu_bo_free(b->pa, b->iova, b->size);
+@@ -870,12 +907,47 @@ SweetGPUUserClient::gemSubmit(struct drm_msm_gem_submit *req)
+ 	return ret;
+ }
+ 
++/*
++ * One line per selector 0x7e result (0112): "SWEET GPU: import <process> surface N ...". All of
++ * them for the first SWEET_GPU_IMPORT_LOG_ALL lines, then one success in SWEET_GPU_IMPORT_LOG_EVERY
++ * and one failure in 16 (the counters have the rest). Called with no lock held.
++ */
++static void
++sweet_gpu_import_log(const char *proc, bool failed, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
++static void
++sweet_gpu_import_log(const char *proc, bool failed, const char *fmt, ...)
++{
++	uint64_t n = SWEET_STAT_ADD(gStatImportLogs, 1);
++	char line[192];
++	va_list ap;
++
++	if (n >= SWEET_GPU_IMPORT_LOG_ALL &&
++	    (n % (failed ? 16u : SWEET_GPU_IMPORT_LOG_EVERY)) != 0) {
++		return;
++	}
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	IOLog("SWEET GPU: import %s %s (#%llu, imports %llu, refused %llu, %llu KB mapped)\n", proc, line, n + 1,
++	    SWEET_STAT_LOAD(gStatImports), SWEET_STAT_LOAD(gStatImportFails), SWEET_STAT_LOAD(gStatImportedBytes) >> 10);
++}
++
+ IOReturn
+ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ {
+-	SweetSurface *surface = sweet_surface_copy(req->surface);
+-	if (surface == NULL || surface->memory == NULL || surface->allocSize == 0) {
+-		OSSafeReleaseNULL(surface);
++	const bool describe = req->handle == SWEET_GPU_DESCRIBE_ONLY;
++	const uint32_t id = req->surface;
++	SweetSurface *surface = sweet_surface_copy(id);
++	const char *why = NULL;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t iova = 0, firstPA = 0, badPA = 0;
++	uint32_t size = 0, slot = SWEET_GPU_MAX_BOS, badOff = 0;
++	bool reused = false;
++
++	if (surface == NULL) {
++		sweet_gpu_stat_event(&gStatImportFails);
++		sweet_gpu_import_log(fProcName, true, "surface %u %s: REFUSED, no such IOSurface", id,
++		    describe ? "describe" : "import");
+ 		return kIOReturnNotFound;
+ 	}
+ 	req->size = surface->allocSize;
+@@ -885,22 +957,39 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 	req->height = surface->height;
+ 	req->pixelFormat = surface->pixelFormat;
+ 	req->planes = surface->planeCount;
+-	if (req->handle == 0xffffffffu) {
++	req->pad = 0;
++	if (surface->memory == NULL || surface->allocSize == 0) {
++		why = "no memory behind it";
++		ret = kIOReturnNotFound;
++	} else if (surface->memory->getLength() < surface->allocSize) {
++		why = "its memory is shorter than its size";
++		ret = kIOReturnBadArgument;
++	} else if (surface->allocSize > SWEET_GPU_IMPORT_MAX) {
++		why = "larger than 64 MiB";
++		ret = kIOReturnNoMemory;
++	}
++	if (why != NULL || describe) {
++		if (why != NULL) {
++			sweet_gpu_stat_event(&gStatImportFails);
++		}
++		sweet_gpu_import_log(fProcName, why != NULL, "surface %u %s: %ux%u fmt 0x%x bpr %u planes %u size %u -> %s%s",
++		    id, describe ? "describe" : "import", surface->width, surface->height, surface->pixelFormat,
++		    surface->bytesPerRow, surface->planeCount, surface->allocSize, why != NULL ? "REFUSED, " : "ok",
++		    why != NULL ? why : "");
+ 		surface->release();
+-		return kIOReturnSuccess;
++		return ret;
+ 	}
+ 
+ 	IOLockLock(gSweetGPULock);
+ 	for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
+ 		if (fBOs[i].mem != NULL && fBOs[i].surface == surface) {
+ 			req->handle = i + 1;
+-			IOLockUnlock(gSweetGPULock);
+-			surface->release();
+-			return kIOReturnSuccess;
++			iova = fBOs[i].iova;
++			reused = true;
++			break;
+ 		}
+ 	}
+-	uint32_t slot = SWEET_GPU_MAX_BOS;
+-	for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
++	for (uint32_t i = 0; !reused && i < SWEET_GPU_MAX_BOS; i++) {
+ 		uint32_t idx = (fNextBO + i) % SWEET_GPU_MAX_BOS;
+ 		if (fBOs[idx].mem == NULL) {
+ 			slot = idx;
+@@ -908,44 +997,81 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 			break;
+ 		}
+ 	}
+-	if (slot >= SWEET_GPU_MAX_BOS) {
+-		IOLockUnlock(gSweetGPULock);
+-		surface->release();
+-		return kIOReturnNoResources;
++	if (!reused && slot >= SWEET_GPU_MAX_BOS) {
++		why = "BO table full";
++		ret = kIOReturnNoResources;
+ 	}
+-	uint32_t size = (surface->allocSize + 0xfffu) & ~0xfffu;
+-	uint64_t iova = sweet_gpu_surf_alloc_va(size);
+-	if (iova == 0) {
+-		IOLockUnlock(gSweetGPULock);
+-		surface->release();
+-		return kIOReturnNoMemory;
++	if (!reused && why == NULL) {
++		size = (surface->allocSize + 0xfffu) & ~0xfffu;
++		iova = sweet_gpu_surf_alloc_va(size);
++		if (iova == 0) {
++			why = "GPU VA for surfaces used up";
++			ret = kIOReturnNoMemory;
++		}
+ 	}
+-	for (uint32_t off = 0; off < size; off += 4096u) {
++	/*
++	 * The surface's own pages (an IOBufferMemoryDescriptor of XNU's RAM on the OnePlus 6: no
++	 * display slots there, 16K pages anywhere in 0x80000000..0x27d800000, within the context
++	 * bank's 36-bit output range), one 4K GPU page at a time. Only page-table pages come from the
++	 * carve-out's pool (GPU_PT_PAGES); no BO pages are used.
++	 */
++	for (uint32_t off = 0; !reused && why == NULL && off < size; off += 4096u) {
+ 		IOByteCount segLen = 0;
+ 		addr64_t phys = surface->memory->getPhysicalSegment(off, &segLen, kIOMemoryMapperNone);
+-		if (phys == 0 || !sweet_gpu_surf_map_page(iova + off, phys)) {
+-			sweet_gpu_surf_unmap(iova, size);
+-			IOLockUnlock(gSweetGPULock);
+-			surface->release();
+-			return kIOReturnNoMemory;
++		if (off == 0) {
++			firstPA = phys;
++		}
++		if (phys == 0 || (phys & 0xfffu) != 0 || phys >= (1ull << 36)) {
++			why = "a page with no usable physical address";
++			badOff = off;
++			badPA = phys;
++			ret = kIOReturnVMError;
++		} else if (!sweet_gpu_surf_map_page(iova + off, phys)) {
++			why = "GPU page-table pool exhausted";
++			badOff = off;
++			badPA = phys;
++			ret = kIOReturnNoMemory;
++		}
++		if (why != NULL) {
++			sweet_gpu_surf_unmap(iova, size);       /* (also gives the VA back) */
+ 		}
+ 	}
+-	sweet_gpu_surf_tlb_inv();
+-	sweet_gpu_to_memory(surface);
+-	surface->memory->retain();
+-	struct sweet_gpu_bo *b = &fBOs[slot];
+-	b->mem = surface->memory;
+-	b->surface = surface;   /* takes our retain */
+-	b->pa = 0;
+-	b->iova = iova;
+-	b->size = size;
+-	b->flags = 0;
+-	b->fence = 0;
+-	b->seed = surface->seed();
+-	req->handle = slot + 1;
+-	sweet_gpu_stat_event(&gStatImports);
++	if (!reused && why == NULL) {
++		sweet_gpu_surf_tlb_inv();
++		sweet_gpu_to_memory(surface);   /* the CPU's dirty lines (the kernel's bzero at create) out first */
++		surface->memory->retain();
++		struct sweet_gpu_bo *b = &fBOs[slot];
++		b->mem = surface->memory;
++		b->surface = surface;   /* takes our retain */
++		b->pa = 0;
++		b->iova = iova;
++		b->size = size;
++		b->flags = 0;
++		b->fence = 0;
++		b->seed = surface->seed();
++		req->handle = slot + 1;
++		SWEET_STAT_ADD(gStatImportedBytes, (uint64_t)size);
++		sweet_gpu_stat_event(&gStatImports);
++	} else if (why != NULL) {
++		sweet_gpu_stat_event(&gStatImportFails);
++	}
+ 	IOLockUnlock(gSweetGPULock);
+-	return kIOReturnSuccess;
++
++	if (why != NULL) {
++		sweet_gpu_import_log(fProcName, true, "surface %u import: %ux%u fmt 0x%x size %u -> REFUSED, %s "
++		    "(page +0x%x pa 0x%llx)", id, surface->width, surface->height, surface->pixelFormat, surface->allocSize,
++		    why, badOff, badPA);
++		surface->release();
++	} else if (reused) {
++		sweet_gpu_import_log(fProcName, false, "surface %u import: already handle %u at iova 0x%llx", id,
++		    req->handle, iova);
++		surface->release();
++	} else {
++		sweet_gpu_import_log(fProcName, false, "surface %u import: %ux%u fmt 0x%x bpr %u size %u -> handle %u "
++		    "iova 0x%llx, %u pages from pa 0x%llx, mapped", id, surface->width, surface->height,
++		    surface->pixelFormat, surface->bytesPerRow, surface->allocSize, req->handle, iova, size >> 12, firstPA);
++	}
++	return ret;
+ }
+ 
+ /*
+@@ -1051,6 +1177,11 @@ sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size)
+ 		bool ok = sweet_gpu_wait_locked(fence, 50);
+ 		IOLockUnlock(gSweetGPULock);
+ 		if (!ok) {
++			static uint32_t late;
++			if ((late++ % 64) == 0) {
++				IOLog("SWEET GPU: present of surface %u: GPU fence %u not done after 50 ms, frame skipped (%u times)\n",
++				    id, fence, late);
++			}
+ 			return false;
+ 		}
+ 	}
+@@ -1184,7 +1315,30 @@ SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		break;
+ 	}
+ 	case kSweetGpuSurface:
+-		ret = surfaceBuffer(&r.surface);
++		if (size == sizeof(struct sweet_surface_request_v0)) {
++			/* (the 40-byte layout of sweet-drm up to G4d: see struct sweet_surface_request_v0) */
++			struct sweet_surface_request_v0 v0;
++			memcpy(&v0, &r, sizeof(v0));
++			bzero(&r.surface, sizeof(r.surface));
++			r.surface.surface = v0.surface;
++			r.surface.handle = v0.handle;
++			ret = surfaceBuffer(&r.surface);
++			v0.handle = r.surface.handle;
++			v0.size = r.surface.size;
++			v0.offset = (uint32_t)r.surface.offset;
++			v0.rowBytes = r.surface.rowBytes;
++			v0.width = r.surface.width;
++			v0.height = r.surface.height;
++			v0.pixelFormat = r.surface.pixelFormat;
++			v0.planes = r.surface.planes;
++			memcpy(&r, &v0, sizeof(v0));
++		} else if (size == sizeof(struct sweet_surface_request)) {
++			ret = surfaceBuffer(&r.surface);
++		} else {
++			sweet_gpu_stat_event(&gStatImportFails);
++			sweet_gpu_import_log(fProcName, true, "request of %zu bytes: REFUSED, neither 40 nor 48", size);
++			ret = kIOReturnBadArgument;
++		}
+ 		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;

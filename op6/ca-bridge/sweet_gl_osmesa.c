@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "sweet_gl.h"
+#include "sweet_klog.h"
 
 /* GL/osmesa.h of Mesa */
 #define OSMESA_RGBA                     0x1908
@@ -105,6 +106,9 @@ sweet_gl_surface_texture(struct sweet_gl *gl, uint32_t surface)
 		asked = 1;
 		image_target = (void (*)(unsigned, void *))OSMesaGetProcAddress("glEGLImageTargetTexture2DOES");
 		software = renderer == NULL || strstr(renderer, "softpipe") != NULL || strstr(renderer, "llvmpipe") != NULL;
+		sweet_klogf("sweet-gl: IOSurfaces as GPU memory: glEGLImageTargetTexture2DOES %s, renderer %s: %s\n",
+		    image_target != NULL ? "found" : "MISSING", renderer != NULL ? renderer : "(none)",
+		    image_target != NULL && !software ? "will be tried (selector 0x7e)" : "not tried, every picture copied");
 	}
 	if (image_target == NULL || software) {
 		return 0;
@@ -112,5 +116,19 @@ sweet_gl_surface_texture(struct sweet_gl *gl, uint32_t surface)
 	while (glGetError() != 0) {
 	}
 	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
-	return glGetError() == 0;
+	unsigned error = glGetError();
+	/*
+	 * Every result into the log for the first 32, then one in 256 (one in 16 refused): with the
+	 * kernel's "SWEET GPU: import" lines (xnu 0112) this tells where a surface stopped. A
+	 * refusal after the kernel's "describe ... ok" and no "import" line is Mesa's
+	 * (osmesa_surface_resource: not 'BGRA' / planes, or freedreno's pitch or size checks).
+	 */
+	static unsigned tried, refused;
+	tried++;
+	refused += error != 0;
+	if (tried <= 32 || (error != 0 ? refused % 16 == 0 : tried % 256 == 0)) {
+		sweet_klogf("sweet-gl: IOSurface %u as GPU texture memory (EGLImage): %s, GL error %#x (%u tried, %u refused)\n",
+		    surface, error == 0 ? "ok, its memory is the texture" : "REFUSED, copied instead", error, tried, refused);
+	}
+	return error == 0;
 }

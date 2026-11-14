@@ -53,14 +53,27 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
 void *sweet_drm_map(int fd, uint32_t handle, uint64_t size);
 void sweet_drm_unmap(int fd, uint32_t handle, void *address);
 
-/* IOSurface import descriptor (selector 0x7e, for G4) */
+/*
+ * IOSurface import descriptor (selector 0x7e): the kernel's struct sweet_surface_request
+ * (xnu/patches/0109, 0112), 48 bytes, offset 64-bit. Up to G4d this was 40 bytes with a 32-bit
+ * offset and the kernel's answer was read shifted by 4 bytes from row_bytes on (pixel_format
+ * came back as the height), so Mesa refused every surface and never imported one; 0112 kernels
+ * also answer the old 40-byte layout in kind.
+ */
 struct sweet_drm_surface {
 	uint32_t surface;
-	uint32_t handle;
+	uint32_t handle;                /* 0xffffffff: describe only; otherwise import, the BO handle out */
 	uint64_t size;
-	uint32_t offset, row_bytes;
+	uint64_t offset;
+	uint32_t row_bytes;
 	uint32_t width, height, pixel_format, planes;
+	uint32_t pad;
 };
+#ifdef __cplusplus
+static_assert(sizeof(struct sweet_drm_surface) == 48, "selector 0x7e takes 48 bytes");
+#else
+_Static_assert(sizeof(struct sweet_drm_surface) == 48, "selector 0x7e takes 48 bytes");
+#endif
 int sweet_drm_surface(int fd, struct sweet_drm_surface *surface);
 
 #endif
