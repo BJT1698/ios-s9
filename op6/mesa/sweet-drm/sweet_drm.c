@@ -39,6 +39,7 @@ extern kern_return_t IOConnectUnmapMemory64(io_connect_t connect, uint32_t memor
 
 #define kIOMapAnywhere          0x00000001
 #define kIOReturnNoMemory       ((kern_return_t)0xe00002bd)
+#define kIOReturnNoResources    ((kern_return_t)0xe00002be)
 #define kIOReturnBadArgument    ((kern_return_t)0xe00002c2)
 #define kIOReturnUnsupported    ((kern_return_t)0xe00002c7)
 #define kIOReturnBusy           ((kern_return_t)0xe00002d5)
@@ -88,7 +89,8 @@ call(unsigned number, void *data, size_t size)
 	switch (result) {
 	case 0:
 		return 0;
-	case kIOReturnNoMemory:
+	case kIOReturnNoMemory:         /* GEM_NEW: carve-out or GPU page-table pool exhausted */
+	case kIOReturnNoResources:      /* GEM_NEW: this client's BO table (1024 handles) is full */
 		return ENOMEM;
 	case kIOReturnBadArgument:
 		return EINVAL;
@@ -118,25 +120,37 @@ drmIoctl(int fd, unsigned long request, void *arg)
 	return 0;
 }
 
+/* Like libdrm: -errno returned and errno set (Mesa logs strerror(errno) after a failure). */
+static int
+command(unsigned long index, void *data, unsigned long size)
+{
+	int error = call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+
+	if (error != 0) {
+		errno = error;
+	}
+	return -error;
+}
+
 int
 drmCommandRead(int fd, unsigned long index, void *data, unsigned long size)
 {
 	(void)fd;
-	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+	return command(index, data, size);
 }
 
 int
 drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size)
 {
 	(void)fd;
-	return -call((unsigned)(DRM_COMMAND_BASE + index), (void *)(uintptr_t)data, size);
+	return command(index, (void *)(uintptr_t)data, size);
 }
 
 int
 drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size)
 {
 	(void)fd;
-	return -call((unsigned)(DRM_COMMAND_BASE + index), data, size);
+	return command(index, data, size);
 }
 
 /*

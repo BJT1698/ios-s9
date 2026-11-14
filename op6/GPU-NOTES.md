@@ -405,3 +405,70 @@ write went elsewhere.
   future consumer of 'b3a8' opacity (a real display engine plane, screenshots that composite plane 1) would see transparent
   pixels; refused attaches now get empty storage (draws land in a texture nobody shows instead of failing).
 - 2026-11-14 **G4 zero-copy works on device (boot-G4f.img: kernel run 43590108694 with 0112 + 0113; op6-mesa run 43590111044 with the 48-byte 0x7e struct, Mesa 0003 'b3a8' plane-0 support and the eagl.c sharing fix).** Kernel imports backboardd's 'b3a8' screen surface (828x1792, p0 +0x0 bpr 3328, p1 +0x5b0000 bpr 832, 1820 pages mapped from the surface's own RAM, e.g. pa 0x11bd04000 -> iova 0x21620000); bridge `IOSurface 20 as GPU texture memory (EGLImage): ok`; frames "0 pictures copied out, 1 drawn in place", **10-19 ms per frame (was 47-64 ms)**, SweetGPUImports 18, ImportFails 0, Faults 0, Hangs 0. User: colours correct, much smoother.
+- 2026-11-14 **G4g: GPU memory - counters, full page-table pool, clean out-of-memory (written, not yet built or run).**
+  **Facts from the code (before this change):** the page-table pool was already 512 pages (2 MiB, 0109), not 64 (0108):
+  the "~128 MiB" limit in the earlier Next line is stale. Pool pages are never freed (pt_unmap only clears PTEs; tables
+  are reused when the same VA is mapped again), BO VA = 0x10000000 + carve-out page index (bounded by the carve-out) and
+  surface VA is first-fit from 0x20000000 (1.5 GiB window), so the worst case is bounded: 1 L1 + 2 L2 + 1 L3
+  (SQE/ring/scratch) + 1 L3 per 2 MiB of carve-out + 768 L3 for the surface window. With 512 pages a surface VA
+  high-water mark above ~820 MiB could exhaust it; with 128 MiB it was never the cause. **The G4c crash at 64 MiB was the
+  carve-out itself running out** (GEM_NEW -> kIOReturnNoMemory -> ENOMEM -> fd_bo_new NULL inside fd_bo_heap_alloc ->
+  fd_bo_ref(NULL)). GEM_NEW already left no partial state (bitmap untouched on failure, IOMemoryDescriptor failure frees).
+  **Changes:**
+  - Kernel `xnu/patches/0114-op6-gpu-memory-counters-pt-pool.patch` (bsd/dev/sweet_gpu.c + SweetGPU.cpp, after 0113):
+    - pool = the worst case above, computed from the carve-out size at bring-up, still from the carve-out (the context
+      bank walks tables non-cacheable, TCR IRGN0/ORGN0 = 0; the carve-out's Normal-NC view needs no cache maintenance per
+      PTE write, cacheable kernel memory would): 192 MiB -> 868 pages (3.4 MiB), 128 MiB -> 836, 16 MiB -> 780. pt_new()
+      can no longer fail; bring-up logs `SWEET GPU: GPU page-table pool: N pages (K KiB) for a M MiB carve-out + 1536 MiB
+      surface VA`. Cost vs 0109: +1.4 MiB of carve-out at 192 MiB.
+    - sweet_gpu_bo_alloc() returns a reason (GPU not ready/size, carve-out full, carve-out fragmented = enough free pages
+      but no contiguous 16K run, page-table pool exhausted); first fit unchanged; new sweet_gpu_mem_stats().
+    - GEM_NEW failure: still kIOReturnNoMemory (BO table full: kIOReturnNoResources), now counted and logged (first 16,
+      then 1 in 64) under the GPU lock: `SWEET GPU: GEM_NEW <proc> <bytes> bytes flags 0x.. REFUSED (#n): <reason>;
+      carve-out used U KiB, free F KiB, largest free L KiB of T KiB; page tables P/C; B live BOs` followed by one
+      `SWEET GPU:   holder <proc>: N BOs X KiB of carve-out, M imports Y KiB of surfaces` per open client (top consumers;
+      up to 16 clients tracked). No eviction.
+    - ioreg (0111 throttled publish; carve-out/pool values read only if the GPU lock is free at that instant, IOLockTryLock,
+      else the previous values stay): `SweetGPUCarveUsedKB`, `SweetGPUCarveFreeKB`, `SweetGPUCarveLargestFreeKB`,
+      `SweetGPUPTPagesUsed`, `SweetGPUPTPagesFree`, `SweetGPUAllocFails`, `SweetGPUBOs` (live GEM_NEW BOs, imports not
+      counted: those are `SweetGPUImportedKB`). Import/zero-copy path unchanged (only per-client accounting added).
+  - `op6/mesa/sweet-drm/sweet_drm.c`: kIOReturnNoResources -> ENOMEM as well; drmCommandRead/Write/WriteRead now also
+    set errno (like libdrm), so Mesa's messages show the real error.
+  - Mesa `op6/mesa/patches/0004-freedreno-gpu-oom.patch` (after 0001-0003, Mesa MIT): fd_bo_heap_alloc() gives the range
+    back and returns NULL when its block cannot be allocated (was fd_bo_ref(NULL), freedreno_bo_heap.c:241); bo_new() on a
+    refused GEM_NEW calls fd_device_purge() (bo_cache + ring_cache) and retries exactly once, then returns NULL with a
+    rate-limited `mesa_loge` + kernel log line `sweet-gl[<proc>]: mesa: GPU memory exhausted: N-byte BO (flags 0x..)
+    failed: Cannot allocate memory, also after purging the BO caches (failure #n): GL_OUT_OF_MEMORY`;
+    fd_bo_cache_cleanup(time 0) is no longer skipped when the previous cleanup also had time 0 (upstream bug that made a
+    second fd_device_purge() a no-op); realloc_bo() allocates the new BO before dropping the old one and returns false
+    (fd_resource_create -> NULL -> st raises GL_OUT_OF_MEMORY in glTexImage2D); a DISCARD_WHOLE_RESOURCE map whose busy
+    BO cannot be replaced keeps the old BO and synchronizes like a normal map; fd_bo_new() no longer names a NULL BO in
+    !NDEBUG builds.
+  - `op6/tools/mkadt-op6.py`: `--gpu-dma 0xa0000000,0x0c000000` (the whole free window below the span, ends at the
+    ramoops keep-out 0xac000000) was already accepted; now also refuses sizes < 8 MiB or not 64 KiB aligned.
+  **Verified here (not on device):** 0114 `git apply --check` on the tree rebuilt from 0107..0113 (`--include` the two
+  files); sweet_gpu.c and SweetGPU.cpp `clang -fsyntax-only -Wall` clean with stub headers; Mesa 0001-0004 apply with
+  `patch` on the sha256-checked mesa-25.0.7 tarball; freedreno_bo.c (also with the `__APPLE__` branch), freedreno_bo_heap.c,
+  freedreno_bo_cache.c, freedreno_resource.c and sweet_drm.c `-fsyntax-only` clean (generated register/format headers).
+  **Expected on device (192 MiB):** at idle after boot `SweetGPUCarveUsedKB` 0, `SweetGPUCarveFreeKB` =
+  `SweetGPUCarveLargestFreeKB` ~ 192,000 (192 MiB minus firmware/ring/GMU buffers and the 3.4 MiB pool),
+  `SweetGPUPTPagesUsed` 3 (L1, L2, SQE L3) + `SweetGPUPTPagesFree` 865 (sum always 868), `SweetGPUAllocFails` 0,
+  `SweetGPUBOs` 0. With backboardd running: CarveUsedKB in the tens of MiB (G4d needed > 64 MiB peak), PTPagesUsed ~ 3 +
+  (highest BO address - 0x10000000)/2 MiB + (surface VA high-water)/2 MiB, CarveLargestFreeKB close to CarveFreeKB
+  (fragmentation shows as a gap between the two).
+  **Test plan:** (1) xnu run with 0114 -> boot-G4g.img; ADT `mkadt-op6.py ... --gpu-fw ../gpu-fw --gpu-dma
+  0xa0000000,0x0c000000` (op6/out/op6-gpu192.adt); boot-args as G4f. `dmesg | grep 'page-table pool'`; `ioreg -l -c
+  SweetGPU | grep SweetGPU` at idle and while using the UI. (2) op6-mesa run (0004 + sweet-drm), install `lib/*`, restart
+  backboardd. (3) Out-of-memory path on purpose: boot the same kernel with a small ADT (`--gpu-dma 0xa0000000,0x02000000`,
+  32 MiB) and open Control Center / app switcher / Settings: expected `SweetGPUAllocFails` > 0, the GEM_NEW REFUSED +
+  holder lines, the `mesa: GPU memory exhausted` line, missing/black layers at worst, **no backboardd SIGSEGV** in
+  /var/mobile/Library/Logs/CrashReporter. (4) Stress at 192 MiB: sweet-gl-test has no texture-stress mode yet (it only
+  takes `-o` and a frame count; s9/ios-tools was outside this change) - add one that allocates 1024x1024 RGBA textures
+  (4 MiB each) with glTexImage2D until GL_OUT_OF_MEMORY, frees them, repeats 10x, and checks CarveUsedKB returns to the
+  start value; meanwhile the UI apps above for fragmentation (CarveLargestFreeKB vs CarveFreeKB).
+  **Risks:** 1.4 MiB more carve-out for tables (pays for a pool that can never run out); the 192 MiB window is outside
+  the XNU span, so XNU loses nothing, but nothing else may use [0xa0000000,0xac000000) any more; Mesa: callers outside the patched paths still do not check
+  fd_bo_new() (fd6 LRZ, VSC streams, tess, border colours, query resize, autotune) - with the purge+retry they fail far
+  less often but would still crash on NULL; purging on every refusal frees cached BOs that would have been reused (only
+  when memory is already exhausted); kernel GEM_CLOSE of a busy purged BO waits up to 200 ms for its fence (existing
+  releaseBOLocked behaviour) inside the allocating thread.

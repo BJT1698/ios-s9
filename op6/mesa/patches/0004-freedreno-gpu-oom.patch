@@ -1,0 +1,214 @@
+freedreno: survive GPU memory exhaustion (OnePlus 6 / SweetGPU)
+
+With a 64 MiB SweetGPU carve-out backboardd died in glTexImage2D:
+st_TexImage -> fd_resource_create -> realloc_bo -> fd_bo_new -> bo_new ->
+fd_bo_heap_alloc, whose heap block fd_bo_new() returned NULL (GEM_NEW
+refused), then fd_bo_ref(NULL) -> SIGSEGV at 0x14.
+
+- fd_bo_heap_alloc(): a block that cannot be allocated gives its range
+  back and returns NULL (bo_new() then tries a dedicated BO).
+- bo_new(): when the kernel refuses GEM_NEW, purge the BO caches
+  (fd_device_purge()) and retry exactly once; still failing -> NULL,
+  logged (mesa_loge + kernel log via sweet_drm_log on Apple), rate-limited.
+- fd_bo_cache_cleanup(): time 0 (purge) is never skipped (upstream
+  skipped it when the previous cleanup also had time 0).
+- realloc_bo(): allocate the new BO before dropping the old one and
+  report failure; resource creation then fails (state tracker raises
+  GL_OUT_OF_MEMORY) and a DISCARD_WHOLE_RESOURCE map whose BO cannot be
+  replaced keeps the old BO and synchronizes like a normal map.
+- fd_bo_new(): do not name a NULL BO in !NDEBUG builds.
+
+Applies after 0001-0003. Mesa is MIT licensed; this patch is too.
+
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index cfca4d0..085f3a9 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -142,8 +142,31 @@ bo_new(struct fd_device *dev, uint32_t size, uint32_t flags,
+       return bo;
+ 
+    bo = dev->funcs->bo_new(dev, size, flags);
+-   if (!bo)
+-      return NULL;
++   if (!bo) {
++      /* Out of GPU memory (SweetGPU: GEM_NEW -> ENOMEM when the carve-out or the
++       * GPU page-table pool is exhausted). The BO caches may hold idle buffers
++       * the kernel still counts as used: free them all and try exactly once
++       * more. table_lock is not held here (fd_bo_fini_common() takes it).
++       */
++      int err = errno;
++      fd_device_purge(dev);
++      bo = dev->funcs->bo_new(dev, size, flags);
++      if (!bo) {
++         static unsigned failures;
++         unsigned n = p_atomic_inc_return(&failures);
++         if (n <= 32 || (n % 64) == 0) {
++            mesa_loge("GPU memory exhausted: %u-byte BO (flags 0x%x) failed: %s, "
++                      "also after purging the BO caches (failure #%u)",
++                      size, flags, strerror(err), n);
++#ifdef __APPLE__
++            sweet_drm_log("mesa: GPU memory exhausted: %u-byte BO (flags 0x%x) failed: %s, "
++                          "also after purging the BO caches (failure #%u): GL_OUT_OF_MEMORY",
++                          size, flags, strerror(err), n);
++#endif
++         }
++         return NULL;
++      }
++   }
+ 
+    simple_mtx_lock(&table_lock);
+    /* add ourself into the handle table: */
+diff --git a/src/freedreno/drm/freedreno_bo_cache.c b/src/freedreno/drm/freedreno_bo_cache.c
+index a656267..de71390 100644
+--- a/src/freedreno/drm/freedreno_bo_cache.c
++++ b/src/freedreno/drm/freedreno_bo_cache.c
+@@ -127,7 +127,11 @@ fd_bo_cache_cleanup(struct fd_bo_cache *cache, time_t time)
+ {
+    int i, cnt = 0;
+ 
+-   if (cache->time == time)
++   /* time == 0 is a purge (fd_device_purge()): never skipped. Upstream returned here
++    * whenever the last cleanup had the same time, so a purge right after another
++    * purge (or before the first timed cleanup, cache->time == 0) did nothing.
++    */
++   if (time && cache->time == time)
+       return;
+ 
+    struct list_head freelist;
+diff --git a/src/freedreno/drm/freedreno_bo_heap.c b/src/freedreno/drm/freedreno_bo_heap.c
+index 5ec17bc..a8e9a15 100644
+--- a/src/freedreno/drm/freedreno_bo_heap.c
++++ b/src/freedreno/drm/freedreno_bo_heap.c
+@@ -221,6 +221,11 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t size, uint32_t flags)
+    }
+ 
+    struct sa_bo *s = calloc(1, sizeof(*s));
++   if (!s) {
++      util_vma_heap_free(&heap->heap, offset, size);
++      simple_mtx_unlock(&heap->lock);
++      return NULL;
++   }
+ 
+    s->heap = heap;
+    s->offset = offset;
+@@ -233,6 +238,16 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t size, uint32_t flags)
+       heap->blocks[idx] = fd_bo_new(
+             heap->dev, FD_BO_HEAP_BLOCK_SIZE, heap->flags | _FD_BO_HINT_HEAP,
+             "heap-%x-block-%u", heap->flags, idx);
++      if (!heap->blocks[idx]) {
++         /* GPU memory exhausted (GEM_NEW failed even after the BO caches were
++          * purged): give the range back and let the caller fail cleanly, instead
++          * of fd_bo_ref(NULL) below.
++          */
++         util_vma_heap_free(&heap->heap, offset, size);
++         simple_mtx_unlock(&heap->lock);
++         free(s);
++         return NULL;
++      }
+       if (heap->flags == RING_FLAGS)
+          fd_bo_mark_for_dump(heap->blocks[idx]);
+    }
+diff --git a/src/freedreno/drm/freedreno_drmif.h b/src/freedreno/drm/freedreno_drmif.h
+index 4cc3391..d181446 100644
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -267,7 +267,7 @@ fd_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags, const char *fmt,
+ {
+    struct fd_bo *bo = _fd_bo_new(dev, size, flags);
+ #ifndef NDEBUG
+-   if (fmt) {
++   if (bo && fmt) {
+       va_list ap;
+       va_start(ap, fmt);
+       _fd_bo_set_name(bo, fmt, ap);
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index 4a1dc73..d8fd70d 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -184,7 +184,10 @@ __fd_resource_wait(struct fd_context *ctx, struct fd_resource *rsc, unsigned op,
+    return ret;
+ }
+ 
+-static void
++/* Returns false when no BO could be allocated: rsc keeps the BO it had (NULL for a
++ * new resource) and nothing else changes.
++ */
++static bool
+ realloc_bo(struct fd_resource *rsc, uint32_t size)
+ {
+    struct pipe_resource *prsc = &rsc->b.b;
+@@ -203,12 +206,15 @@ realloc_bo(struct fd_resource *rsc, uint32_t size)
+     * be sure to check for PIPE_RESOURCE_FLAG_MAP_COHERENT
+     */
+ 
+-   if (rsc->bo)
+-      fd_bo_del(rsc->bo);
+-
+    struct fd_bo *bo =
+       fd_bo_new(screen->dev, size, flags, "%ux%ux%u@%u:%x", prsc->width0,
+                 prsc->height0, prsc->depth0, rsc->layout.cpp, prsc->bind);
++   if (!bo)
++      return false;
++
++   if (rsc->bo)
++      fd_bo_del(rsc->bo);
++
+    fd_resource_set_bo(rsc, bo);
+ 
+    /* Zero out the UBWC area on allocation.  This fixes intermittent failures
+@@ -224,6 +230,7 @@ realloc_bo(struct fd_resource *rsc, uint32_t size)
+ 
+    util_range_set_empty(&rsc->valid_buffer_range);
+    fd_bc_invalidate_resource(rsc, true);
++   return true;
+ }
+ 
+ static void
+@@ -735,18 +742,23 @@ fd_resource_transfer_unmap(struct pipe_context *pctx,
+    slab_free(&ctx->transfer_pool, ptrans);
+ }
+ 
+-static void
++/* Returns false when the busy BO could not be replaced (out of GPU memory): the
++ * resource is unchanged and the caller must synchronize as for a normal map.
++ */
++static bool
+ invalidate_resource(struct fd_resource *rsc, unsigned usage) assert_dt
+ {
+    bool needs_flush = pending(rsc, !!(usage & PIPE_MAP_WRITE));
+    unsigned op = translate_usage(usage);
+ 
+    if (needs_flush || resource_busy(rsc, op)) {
+-      realloc_bo(rsc, fd_bo_size(rsc->bo));
++      if (!realloc_bo(rsc, fd_bo_size(rsc->bo)))
++         return false;
+       rebind_resource(rsc);
+    } else {
+       util_range_set_empty(&rsc->valid_buffer_range);
+    }
++   return true;
+ }
+ 
+ static bool
+@@ -870,8 +882,9 @@ resource_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc,
+                      prsc, level, usage, box->width, box->height, box->x, box->y);
+    }
+ 
+-   if (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) {
+-      invalidate_resource(rsc, usage);
++   if ((usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
++       invalidate_resource(rsc, usage)) {
++      /* the resource got a fresh, idle BO */
+    } else {
+       unsigned op = translate_usage(usage);
+       bool needs_flush = pending(rsc, !!(usage & PIPE_MAP_WRITE));
+@@ -1478,8 +1491,7 @@ fd_resource_create_with_modifiers(struct pipe_screen *pscreen,
+       return NULL;
+    rsc = fd_resource(prsc);
+ 
+-   realloc_bo(rsc, size);
+-   if (!rsc->bo)
++   if (!realloc_bo(rsc, size) || !rsc->bo)
+       goto fail;
+ 
+    return prsc;

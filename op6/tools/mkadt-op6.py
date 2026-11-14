@@ -22,7 +22,9 @@ Differences from the S9 tree (see op6/XNU-PLAN.md):
     OnePlus-signed a630_zap.mbn, checked against op6/GPU-NOTES.md sec. 4
     hashes) and dma-region = <u64 pa, u64 size>, the GPU carve-out outside
     the XNU span (--gpu-dma, default 0xa0000000+16 MiB: free RAM per the OP6
-    scan, no DT reservation). The firmware is Qualcomm proprietary: the ADT
+    scan, no DT reservation; at most the whole free window 0xa0000000,0x0c000000
+    = 192 MiB, at least 8 MiB since xnu patch 0114 reserves ~3.1 MiB + size/512
+    of it for GPU page tables). The firmware is Qualcomm proprietary: the ADT
     (op6/out/, git-ignored) carries it, git never does.
 
 Usage:  mkadt-op6.py OUT.adt [--scale2] [--mem-top 0xADDR] [--phys-base 0xADDR]
@@ -145,8 +147,9 @@ GPU_DMA = (0xa0000000, 0x1000000)   # below dram-base, in the scan's free [0xa00
 def gpu_node(fw_dir, dma, phys_base, top, ph):
     """/sweet-gpu: firmware blobs + carve-out (sweet_gpu.c setup())."""
     pa, size = dma
-    if pa & 0xffff or not 0x100000 <= size <= 0x10000000:
-        raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: 64 KiB aligned, 1..256 MiB')
+    if pa & 0xffff or size & 0xffff or not 0x800000 <= size <= 0x10000000:
+        raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: 64 KiB aligned, 8..256 MiB '
+                         '(xnu 0114 takes ~3.1 MiB + size/512 for GPU page tables)')
     if pa < 0xa0000000 or pa + size > 0xac000000:
         raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: must stay inside the free [0xa0000000,0xac000000)')
     if pa < top and pa + size > phys_base:

@@ -1,0 +1,418 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 93b8ebf..f120461 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -82,6 +82,12 @@ int sweet_gpu_submit(const uint64_t *ib_iovas, const uint32_t *ib_dwords, uint32
+ uint32_t sweet_gpu_last_fence(void);
+ int sweet_gpu_fence_done(uint32_t fence);
+ void sweet_gpu_report(const char *why);
++struct sweet_gpu_mem_stats {
++	uint32_t carve_kb, carve_used_kb, carve_free_kb, carve_largest_free_kb;
++	uint32_t pt_used, pt_total;
++};
++void sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st);
++const char *sweet_gpu_bo_error(int err);
+ 
+ #define LOG(...)		printf("SWEET GPU: " __VA_ARGS__)
+ 
+@@ -338,7 +344,21 @@ static struct {
+ #define MAGIC			0xC0FFEE01u
+ #define SID_GPU			0u
+ #define RING_DW			8192u
+-#define GPU_PT_PAGES		512u
++/*
++ * GPU page-table pool (patch 0114): every table the GPU context can ever need is reserved at
++ * bring-up, so pt_new() cannot fail afterwards (tables are never freed, only reused when the
++ * same VA is mapped again). io-pgtable stage 1, 4K granule, 39-bit VA, walk starts at L1:
++ *   1 L1 + 2 L2 (VA 0..2 GiB: SQE/ring/scratch, BOs at 0x10000000, surfaces 0x20000000..0x80000000)
++ *   + 1 L3 (SQE/ring/scratch, all inside 0x01000000..0x011fffff)
++ *   + 1 L3 per 2 MiB of BO window (BO VA = VA_BO_BASE + page index: at most the carve-out size)
++ *   + 1 L3 per 2 MiB of surface VA window (VA_SURF_SIZE / 2 MiB = 768)
++ * 192 MiB carve-out: 4 + 96 + 768 = 868 pages (3.4 MiB); 128 MiB: 836; 16 MiB: 780.
++ * (0108 had 64 pages, 0109 512.) The pool stays in the carve-out: the context bank walks
++ * tables non-cacheable (TCR IRGN0/ORGN0 = 0), and the carve-out's Normal-NC mapping needs
++ * no cache maintenance per PTE write, unlike cacheable kernel memory.
++ */
++#define GPU_PT_FIXED		4u
++#define GPU_PT_L3_SPAN		0x200000u
+ #define RB_CNTL_VAL		(12u | (2u << 8) | (1u << 27))
+ 
+ /* zap / SCM */
+@@ -691,6 +711,14 @@ struct pt {
+ };
+ static struct pt gmu_pt, gpu_pt;
+ 
++/* Size of the GPU context's page-table pool, see GPU_PT_FIXED. */
++static uint32_t
++gpu_pt_pages(void)
++{
++	return GPU_PT_FIXED + (g.dma_size + GPU_PT_L3_SPAN - 1u) / GPU_PT_L3_SPAN +
++	       (uint32_t)(VA_SURF_SIZE / GPU_PT_L3_SPAN);
++}
++
+ static uint64_t
+ pt_new(struct pt *t)
+ {
+@@ -1663,7 +1691,7 @@ cp_prepare(void)
+ 	}
+ 	if (!(sqe = dma_get(9 * 1024 * 4, &pa_sqe)) || words * 4 > 9 * 1024 * 4 ||
+ 	    !(ring = dma_get(RING_DW * 4, &pa_ring)) || !(scratch = dma_get(4096, &pa_scratch)) ||
+-	    !dma_get(GPU_PT_PAGES * 4096, &gpu_pt.pool_pa)) {
++	    !dma_get(gpu_pt_pages() * 4096, &gpu_pt.pool_pa)) {
+ 		LOG("carve-out too small\n");
+ 		return 0;
+ 	}
+@@ -1680,7 +1708,9 @@ cp_prepare(void)
+ 		return 0;
+ 	}
+ 	gpu_pt.used = 0;
+-	gpu_pt.cap = GPU_PT_PAGES;
++	gpu_pt.cap = gpu_pt_pages();
++	LOG("GPU page-table pool: %u pages (%u KiB) for a %u MiB carve-out + %u MiB surface VA\n",
++	    gpu_pt.cap, gpu_pt.cap * 4u, g.dma_size >> 20, (uint32_t)(VA_SURF_SIZE >> 20));
+ 	gpu_pt.root_pa = pt_new(&gpu_pt);
+ 	if (!pt_map(&gpu_pt, VA_SQE, pa_sqe, 9 * 1024 * 4, PTE_RW | PTE_RDONLY) ||
+ 	    !pt_map(&gpu_pt, VA_RING, pa_ring, RING_DW * 4, PTE_RW) ||
+@@ -2106,20 +2136,46 @@ bmap_clr(uint32_t p)
+ 	bo_bmap[p >> 6] &= ~(1ull << (p & 63));
+ }
+ 
++/* sweet_gpu_bo_alloc() failures (patch 0114); nothing is left allocated or mapped after any of them. */
++#define BO_ERR_ARGS		(-1)	/* GPU not ready, size 0 or > 256 MiB */
++#define BO_ERR_FULL		(-2)	/* fewer free carve-out pages than asked for */
++#define BO_ERR_FRAGMENTED	(-3)	/* enough free pages, but no contiguous 16K-aligned run */
++#define BO_ERR_PT		(-4)	/* GPU page-table pool exhausted (cannot happen with 0114's pool) */
++
++const char *
++sweet_gpu_bo_error(int err)
++{
++	switch (err) {
++	case BO_ERR_ARGS:
++		return "GPU not ready or size refused";
++	case BO_ERR_FULL:
++		return "carve-out full";
++	case BO_ERR_FRAGMENTED:
++		return "carve-out fragmented (no contiguous run)";
++	case BO_ERR_PT:
++		return "GPU page-table pool exhausted";
++	default:
++		return "?";
++	}
++}
++
+ /*
+  * Allocate a BO from the carve-out bitmap (16K-aligned for XNU's 16K VM
+  * device pager, mapped with 4K PTEs in the GPU SMMU at VA_BO_BASE + p*4K).
++ * First fit from the bottom; every BO is a whole number of 4-page (16K) groups
++ * starting on a group boundary, so the bitmap only ever holds whole groups.
++ * Called with gSweetGPULock held. Returns 0 or a BO_ERR_* code.
+  */
+ int
+ sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out, uint32_t *actual_size_out)
+ {
+ 	if (!gpu_ready || size == 0 || size > 0x10000000u) {
+-		return -1;
++		return BO_ERR_ARGS;
+ 	}
+ 	uint32_t actual = (size + 0x3fffu) & ~0x3fffu;
+ 	uint32_t npages = actual / 4096u;
+ 	if (npages > bo_total_pages - bo_used_pages) {
+-		return -1;
++		return BO_ERR_FULL;
+ 	}
+ 	for (uint32_t p = 0; p + npages <= bo_total_pages; p += 4) {
+ 		uint32_t k = 0;
+@@ -2137,7 +2193,7 @@ sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *io
+ 		if (!pt_map(&gpu_pt, iova, pa, actual, attr)) {
+ 			pt_unmap(&gpu_pt, iova, actual);
+ 			cb_tlb_inv(gcbbase);
+-			return -1;
++			return BO_ERR_PT;
+ 		}
+ 		cb_tlb_inv(gcbbase);
+ 		for (uint32_t i = 0; i < npages; i++) {
+@@ -2149,7 +2205,36 @@ sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *io
+ 		*actual_size_out = actual;
+ 		return 0;
+ 	}
+-	return -1;
++	return BO_ERR_FRAGMENTED;
++}
++
++/*
++ * Carve-out and page-table pool usage for the ioreg counters (patch 0114). Called with
++ * gSweetGPULock held (the bitmap and counters only change under it). Largest free = the
++ * longest run of free 16K groups, i.e. the biggest GEM_NEW that can succeed now.
++ */
++void
++sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st)
++{
++	uint32_t run = 0, best = 0;
++
++	bzero(st, sizeof(*st));
++	if (!gpu_ready) {
++		return;
++	}
++	for (uint32_t p = 0; p + 4u <= bo_total_pages; p += 4u) {
++		if (bmap_test(p)) {
++			run = 0;
++		} else if (++run > best) {
++			best = run;
++		}
++	}
++	st->carve_kb = bo_total_pages * 4u;
++	st->carve_used_kb = bo_used_pages * 4u;
++	st->carve_free_kb = (bo_total_pages - bo_used_pages) * 4u;
++	st->carve_largest_free_kb = best * 16u;
++	st->pt_used = gpu_pt.used;
++	st->pt_total = gpu_pt.cap;
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index f578d03..1d564fc 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -38,6 +38,15 @@
+  *   SweetGPUHangs       failed submits (ring full) + fence waits >= 500 ms that timed out
+  *   SweetGPULogLines / SweetGPULogDropped   selector 0x7f lines printed / rate-limited
+  *
++ * GPU memory counters (patch 0114), same publication (the carve-out numbers are read only when
++ * the GPU lock is free at that moment, else the previous values stay):
++ *
++ *   SweetGPUCarveUsedKB / SweetGPUCarveFreeKB  BO carve-out (after firmware, rings, page tables)
++ *   SweetGPUCarveLargestFreeKB  longest free contiguous run = biggest GEM_NEW possible now
++ *   SweetGPUPTPagesUsed / SweetGPUPTPagesFree  GPU page-table pool (reserved whole at bring-up)
++ *   SweetGPUAllocFails  GEM_NEW refusals (reason + top consumers in the log, rate-limited)
++ *   SweetGPUBOs         live GEM_NEW BOs (carve-out), all clients; imports are not counted
++ *
+  * Selector 0x7f (kSweetGpuLog): structureInput = text (up to 512 bytes, NUL
+  * not needed), printed as "sweet-gl[<process>]: <text>" (dmesg and the
+  * persistent log), at most SWEET_GPU_LOG_RATE lines per second per process.
+@@ -81,6 +90,12 @@ int sweet_gpu_submit(const uint64_t *ib_iovas, const uint32_t *ib_dwords, uint32
+ uint32_t sweet_gpu_last_fence(void);
+ int sweet_gpu_fence_done(uint32_t fence);
+ void sweet_gpu_report(const char *why);
++struct sweet_gpu_mem_stats {
++	uint32_t carve_kb, carve_used_kb, carve_free_kb, carve_largest_free_kb;
++	uint32_t pt_used, pt_total;
++};
++void sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st);          /* gSweetGPULock held */
++const char *sweet_gpu_bo_error(int err);
+ bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);
+ int sweet_bind_current_thread(int cpu);                         /* osfmk/kern/sched_prim.c */
+ void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+@@ -105,6 +120,7 @@ static IOLock *gSweetGPULogLock;                /* selector 0x7f rate limits; no
+ static uint64_t gSweetGPUSecondAbs;             /* ... or after one second (mach_absolute_time units) */
+ static uint64_t gStatSubmits, gStatImports, gStatHangs, gStatOpens, gStatLogLines, gStatLogDropped;
+ static uint64_t gStatImportFails, gStatImportedBytes, gStatImportLogs;  /* 0112 */
++static uint64_t gStatAllocFails, gStatBOs;                              /* 0114 */
+ static uint32_t gStatClients;
+ static uint64_t gStatEvents, gStatPublishedEvents, gStatPublishedAt;
+ static char gStatLastClient[SWEET_GPU_NAME_MAX];        /* under gSweetGPUStatLock */
+@@ -177,6 +193,23 @@ sweet_gpu_stat_publish(bool force, const char *client)
+ 	service->setProperty("SweetGPUHangs", (unsigned long long)hangs, 64);
+ 	service->setProperty("SweetGPULogLines", (unsigned long long)SWEET_STAT_LOAD(gStatLogLines), 64);
+ 	service->setProperty("SweetGPULogDropped", (unsigned long long)SWEET_STAT_LOAD(gStatLogDropped), 64);
++	service->setProperty("SweetGPUAllocFails", (unsigned long long)SWEET_STAT_LOAD(gStatAllocFails), 64);
++	service->setProperty("SweetGPUBOs", (unsigned long long)SWEET_STAT_LOAD(gStatBOs), 64);
++	/*
++	 * Carve-out / page-table numbers change only under gSweetGPULock. Try it, never wait: a
++	 * publisher must not stall behind a fence wait, and IOLockTryLock is also safe if a caller
++	 * ever published with the GPU lock held (it just fails).
++	 */
++	struct sweet_gpu_mem_stats ms;
++	if (gSweetGPULock != NULL && sweet_gpu_ready() && IOLockTryLock(gSweetGPULock)) {
++		sweet_gpu_mem_stats(&ms);
++		IOLockUnlock(gSweetGPULock);
++		service->setProperty("SweetGPUCarveUsedKB", (unsigned long long)ms.carve_used_kb, 32);
++		service->setProperty("SweetGPUCarveFreeKB", (unsigned long long)ms.carve_free_kb, 32);
++		service->setProperty("SweetGPUCarveLargestFreeKB", (unsigned long long)ms.carve_largest_free_kb, 32);
++		service->setProperty("SweetGPUPTPagesUsed", (unsigned long long)ms.pt_used, 32);
++		service->setProperty("SweetGPUPTPagesFree", (unsigned long long)(ms.pt_total - ms.pt_used), 32);
++	}
+ 	IOLockUnlock(gSweetGPUStatLock);
+ }
+ 
+@@ -573,6 +606,10 @@ class SweetGPUUserClient : public IOUserClient {
+ 	bool fLogOnly;                  /* opened with kSweetGpuLogClientType */
+ 	uint32_t fCounted;              /* 1 while included in gStatClients */
+ 	char fProcName[SWEET_GPU_NAME_MAX];
++	/* patch 0114, under gSweetGPULock: what this client holds (for the GEM_NEW failure log) */
++	uint64_t fCarveBytes, fImportBytes;
++	uint32_t fCarveBOs, fImports;
++	bool fListed;                   /* in gGPUClients[] */
+ 
+ 	struct sweet_gpu_bo *lookupBO(uint32_t handle);
+ 	void releaseBOLocked(struct sweet_gpu_bo *b);
+@@ -582,6 +619,8 @@ class SweetGPUUserClient : public IOUserClient {
+ 	IOReturn surfaceBuffer(struct sweet_surface_request *req);
+ 	IOReturn kernelLog(const void *text, uint32_t size);
+ 	void uncount(void);
++	void listLocked(bool add);
++	void allocFailedLocked(uint64_t size, uint32_t flags, int err);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -594,6 +633,56 @@ public:
+ };
+ OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
+ 
++/* patch 0114: open GPU clients, for the "top consumers" lines of a GEM_NEW failure (gSweetGPULock) */
++#define SWEET_GPU_LISTED        16u
++#define SWEET_GPU_FAIL_LOG_ALL  16u     /* every GEM_NEW failure logged up to this many, */
++#define SWEET_GPU_FAIL_LOG_EVERY 64u    /* ... then one in this many */
++static SweetGPUUserClient *gGPUClients[SWEET_GPU_LISTED];
++
++void
++SweetGPUUserClient::listLocked(bool add)
++{
++	for (uint32_t i = 0; i < SWEET_GPU_LISTED; i++) {
++		if (add && !fListed && gGPUClients[i] == NULL) {
++			gGPUClients[i] = this;
++			fListed = true;
++			return;
++		}
++		if (!add && gGPUClients[i] == this) {
++			gGPUClients[i] = NULL;
++			fListed = false;
++			return;
++		}
++	}
++}
++
++/*
++ * GEM_NEW refused: count it and (rate-limited) say why, how the carve-out looks and who holds
++ * what. Called with gSweetGPULock held; printf only, nothing else is taken.
++ */
++void
++SweetGPUUserClient::allocFailedLocked(uint64_t size, uint32_t flags, int err)
++{
++	uint64_t n = SWEET_STAT_ADD(gStatAllocFails, 1) + 1;
++	SWEET_STAT_ADD(gStatEvents, 1);
++	if (n > SWEET_GPU_FAIL_LOG_ALL && (n % SWEET_GPU_FAIL_LOG_EVERY) != 0) {
++		return;
++	}
++	struct sweet_gpu_mem_stats ms;
++	sweet_gpu_mem_stats(&ms);
++	printf("SWEET GPU: GEM_NEW %s %llu bytes flags 0x%x REFUSED (#%llu): %s; carve-out used %u KiB, free %u KiB, "
++	    "largest free %u KiB of %u KiB; page tables %u/%u; %llu live BOs\n", fProcName, size, flags, n,
++	    sweet_gpu_bo_error(err), ms.carve_used_kb, ms.carve_free_kb, ms.carve_largest_free_kb, ms.carve_kb,
++	    ms.pt_used, ms.pt_total, SWEET_STAT_LOAD(gStatBOs));
++	for (uint32_t i = 0; i < SWEET_GPU_LISTED; i++) {
++		SweetGPUUserClient *c = gGPUClients[i];
++		if (c != NULL && (c->fCarveBOs != 0 || c->fImports != 0)) {
++			printf("SWEET GPU:   holder %s: %u BOs %llu KiB of carve-out, %u imports %llu KiB of surfaces\n",
++			    c->fProcName, c->fCarveBOs, c->fCarveBytes >> 10, c->fImports, c->fImportBytes >> 10);
++		}
++	}
++}
++
+ bool
+ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -603,6 +692,9 @@ SweetGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 typ
+ 	fTask = owningTask;
+ 	fNextBO = 0;
+ 	fNextQueue = 0;
++	fCarveBytes = fImportBytes = 0;
++	fCarveBOs = fImports = 0;
++	fListed = false;
+ 	fCounted = 0;
+ 	fLogOnly = type == kSweetGpuLogClientType;
+ 	bzero(fProcName, sizeof(fProcName));
+@@ -633,6 +725,9 @@ SweetGPUUserClient::start(IOService *provider)
+ 	if (sweet_gpu_ready() == 0) {
+ 		return false;
+ 	}
++	IOLockLock(gSweetGPULock);
++	listLocked(true);
++	IOLockUnlock(gSweetGPULock);
+ 	fCounted = 1;
+ 	SWEET_STAT_ADD(gStatClients, 1u);
+ 	SWEET_STAT_ADD(gStatOpens, 1);
+@@ -672,9 +767,14 @@ SweetGPUUserClient::releaseBOLocked(struct sweet_gpu_bo *b)
+ 	if (b->surface != NULL) {
+ 		sweet_gpu_surf_unmap(b->iova, b->size);
+ 		__atomic_fetch_sub(&gStatImportedBytes, (uint64_t)b->size, __ATOMIC_RELAXED);
++		fImportBytes -= b->size;
++		fImports--;
+ 		b->surface->release();
+ 	} else {
+ 		sweet_gpu_bo_free(b->pa, b->iova, b->size);
++		__atomic_fetch_sub(&gStatBOs, 1ull, __ATOMIC_RELAXED);
++		fCarveBytes -= b->size;
++		fCarveBOs--;
+ 	}
+ 	b->mem->release();
+ 	bzero(b, sizeof(*b));
+@@ -688,6 +788,7 @@ SweetGPUUserClient::clientClose(void)
+ 		for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
+ 			releaseBOLocked(&fBOs[i]);
+ 		}
++		listLocked(false);
+ 		IOLockUnlock(gSweetGPULock);
+ 	}
+ 	uncount();
+@@ -704,6 +805,7 @@ SweetGPUUserClient::free(void)
+ 			for (uint32_t i = 0; i < SWEET_GPU_MAX_BOS; i++) {
+ 				releaseBOLocked(&fBOs[i]);
+ 			}
++			listLocked(false);
+ 			IOLockUnlock(gSweetGPULock);
+ 		}
+ 		IOFree(fBOs, SWEET_GPU_MAX_BOS * sizeof(fBOs[0]));
+@@ -730,14 +832,22 @@ SweetGPUUserClient::gemNew(struct drm_msm_gem_new *req)
+ 		}
+ 	}
+ 	if (slot >= SWEET_GPU_MAX_BOS) {
++		SWEET_STAT_ADD(gStatEvents, 1);
++		if (SWEET_STAT_ADD(gStatAllocFails, 1) < SWEET_GPU_FAIL_LOG_ALL) {
++			printf("SWEET GPU: GEM_NEW %s %llu bytes REFUSED: BO table full (%u handles)\n", fProcName,
++			    req->size, SWEET_GPU_MAX_BOS);
++		}
+ 		IOLockUnlock(gSweetGPULock);
+-		return kIOReturnNoResources;
++		return kIOReturnNoResources;    /* sweet-drm: ENOMEM */
+ 	}
+ 	uint64_t pa = 0, iova = 0;
+ 	uint32_t actual = 0;
+-	if (sweet_gpu_bo_alloc((uint32_t)req->size, req->flags, &pa, &iova, &actual) != 0) {
++	int err = sweet_gpu_bo_alloc((uint32_t)req->size, req->flags, &pa, &iova, &actual);
++	if (err != 0) {
++		/* sweet_gpu_bo_alloc() leaves nothing behind on failure; the slot was not touched */
++		allocFailedLocked(req->size, req->flags, err);
+ 		IOLockUnlock(gSweetGPULock);
+-		return kIOReturnNoMemory;
++		return kIOReturnNoMemory;       /* sweet-drm: ENOMEM, Mesa purges its BO cache and retries once */
+ 	}
+ 	IOMemoryDescriptor *mem = IOMemoryDescriptor::withAddressRange(
+ 	    pa, actual,
+@@ -757,6 +867,9 @@ SweetGPUUserClient::gemNew(struct drm_msm_gem_new *req)
+ 	b->flags = req->flags;
+ 	b->fence = 0;
+ 	req->handle = slot + 1;
++	fCarveBytes += actual;
++	fCarveBOs++;
++	SWEET_STAT_ADD(gStatBOs, 1);
+ 	IOLockUnlock(gSweetGPULock);
+ 	return kIOReturnSuccess;
+ }
+@@ -1044,7 +1157,7 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 	 * The surface's own pages (an IOBufferMemoryDescriptor of XNU's RAM on the OnePlus 6: no
+ 	 * display slots there, 16K pages anywhere in 0x80000000..0x27d800000, within the context
+ 	 * bank's 36-bit output range), one 4K GPU page at a time. Only page-table pages come from the
+-	 * carve-out's pool (GPU_PT_PAGES); no BO pages are used.
++	 * carve-out's pool (reserved whole for the surface VA window since 0114); no BO pages are used.
+ 	 */
+ 	for (uint32_t off = 0; !reused && why == NULL && off < size; off += 4096u) {
+ 		IOByteCount segLen = 0;
+@@ -1082,6 +1195,8 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 		b->seed = surface->seed();
+ 		req->handle = slot + 1;
+ 		SWEET_STAT_ADD(gStatImportedBytes, (uint64_t)size);
++		fImportBytes += size;
++		fImports++;
+ 		sweet_gpu_stat_event(&gStatImports);
+ 	} else if (why != NULL) {
+ 		sweet_gpu_stat_event(&gStatImportFails);
