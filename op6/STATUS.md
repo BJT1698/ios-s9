@@ -28,4 +28,6 @@ Labels: device-verified unless noted.
 
 | 2026-11-14 | GPU G4 | CoreAnimation in backboardd renders through Mesa freedreno on the Adreno 630 (0110 sweetinject, 0111 counters; 128 MiB GPU carve-out): home, blur, Control Center, Settings OK, 7447 submits 0 faults, ~16-26 fps (picture copied out each frame) |
 
-Next: G4 zero-copy present (draw in place), clean GPU OOM handling, daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
+| 2026-11-14 | GPU G4 zero-copy | backboardd's b3a8 screen surface imported into the GPU (0112/0113 + Mesa 0003): drawn in place, 10-19 ms/frame (was 47-64), colours correct, much smoother |
+
+Next: clean GPU OOM handling, IRQs (G5), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.

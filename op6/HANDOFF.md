@@ -151,7 +151,7 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - boot-args as D, plus `sweetgpu=2 sweetgpudelay=30 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd`.
 - **Userland from CI:** op6-mesa run `43583728286` (macos-26), artifact with `lib/` plus `dSYM/`. Installed on the phone in `/usr/local/lib`: `libOSMesa.8.dylib`, `libsweet-gl.dylib`, `libsweet-ca.dylib`. The earlier unverified prebuilt libs are in `/var/root/old-libs` on the phone; do not reinstall them.
 - **Memory:** 64 MiB was not enough. Mesa crashed in `fd_bo_ref(NULL)` after `fd_bo_heap_alloc` failed. With 128 MiB the phone ran 5+ minutes stable (7447 submits, 0 faults).
-- **Performance:** about 16–26 fps. Every frame is rendered off-screen and copied out ("1 picture copied out, 0 drawn in place"). Next step: zero-copy present.
+- **Performance / zero-copy (2026-11-14, boot-G4f.img, kernel run 43590108694 with 0112+0113, op6-mesa run 43590111044):** the screen surfaces are 'b3a8' (plane 0 = BGRA8 read by SweetFramebuffer, plane 1 unused). After fixing the 0x7e struct (sweet-drm used 40 bytes, the kernel 48) and accepting 'b3a8' plane 0 in the bridge and Mesa (patch 0003), frames are "drawn in place" at 10-19 ms instead of 47-64 ms. Colours are correct and it runs much smoother.
 - **Symbolizing a backboardd crash:** take the .ips from `/var/mobile/Library/Logs/CrashReporter/`, then run `llvm-symbolizer --obj=<dSYM DWARF file> <imageOffset>`. The dylib's `__TEXT` vmaddr is 0.
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
