@@ -1,11 +1,11 @@
-freedreno: skip draws with NULL BOs after GPU OOM (OnePlus 6 / SweetGPU)
+freedreno: survive NULL BOs on draws and ringbuffers after GPU OOM
 
 With a 32 MiB SweetGPU carve-out, once GPU memory is exhausted,
 fd_resource_create() / realloc_bo() fails and leaves resources with
-rsc->bo == NULL (or sub-allocations like bindless descriptor sets / LRZ
-buffers fail to allocate a BO). Subsequent draws or clears that bind
-those resources dereference rsc->bo or pass NULL to fd_bo_mark_for_dump /
-fd_bo_ref, crashing backboardd.
+rsc->bo == NULL, or sub-allocations (bindless descriptor sets, LRZ
+buffers, and command-stream ringbuffer BOs) fail to allocate a BO.
+Subsequent draws or clears that bind those resources or emit into a
+NULL ringbuffer BO crash backboardd.
 
 - freedreno_draw.c / freedreno_draw.h: add fd_oom_note_skip() (logs once
   via mesa_loge and sweet_drm_log on __APPLE__, and counts skips) and
@@ -21,9 +21,265 @@ fd_bo_ref, crashing backboardd.
   fd_bo_mark_for_dump(NULL).
 - a6xx/fd6_draw.cc: in fd6_clear(), guard subpass->lrz == NULL before
   calling fd_bo_ref().
+- drm/freedreno_ringbuffer_sp.*: when fd_bo_new_ring() / fd_bo_map()
+  fails, back the ringbuffer with a temporary CPU scratch buffer, guard
+  NULL BO relocs/refs, mark the fd_submit_sp as OOM, and drop the
+  incomplete submit before ioctl in fd_submit_sp_flush_execute() while
+  still advancing the software fence.
 
 Applies after 0001-0004. Mesa is MIT licensed; this patch is too.
 
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp.c b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+index 1b9a10a..8fa4c49 100644
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -12,8 +12,14 @@
+ 
+ #include "util/hash_table.h"
+ #include "util/libsync.h"
++#include "util/log.h"
+ #include "util/os_file.h"
+ #include "util/slab.h"
++#include "util/u_atomic.h"
++
++#ifdef __APPLE__
++#include <xf86drm.h>
++#endif
+ 
+ #include "freedreno_ringbuffer_sp.h"
+ 
+@@ -29,6 +35,27 @@
+ static pthread_cond_t  flush_cnd = PTHREAD_COND_INITIALIZER;
+ static pthread_mutex_t flush_mtx = PTHREAD_MUTEX_INITIALIZER;
+ 
++static inline void
++fd_ringbuffer_sp_mark_oom(struct fd_ringbuffer_sp *fd_ring)
++{
++   if (!(fd_ring->base.flags & _FD_RINGBUFFER_OBJECT) && fd_ring->u.submit)
++      to_fd_submit_sp(fd_ring->u.submit)->oom = true;
++}
++
++static void
++fd_ringbuffer_sp_note_oom(const char *where)
++{
++   static uint32_t logged;
++   if (!p_atomic_xchg(&logged, 1)) {
++      mesa_loge("mesa: %s: ringbuffer BO allocation failed after GPU OOM, "
++                "dropping submit", where);
++#ifdef __APPLE__
++      sweet_drm_log("mesa: %s: ringbuffer BO allocation failed after GPU OOM, "
++                    "dropping submit", where);
++#endif
++   }
++}
++
+ static void finalize_current_cmd(struct fd_ringbuffer *ring);
+ static struct fd_ringbuffer *
+ fd_ringbuffer_sp_init(struct fd_ringbuffer_sp *fd_ring, uint32_t size,
+@@ -146,6 +173,9 @@ fd_submit_suballoc_ring_bo(struct fd_submit *submit,
+       fd_ring->offset = suballoc_offset;
+    }
+ 
++   if (!fd_ring->ring_bo)
++      return;
++
+    struct fd_ringbuffer *old_suballoc_ring = fd_submit->suballoc_ring;
+ 
+    fd_submit->suballoc_ring = fd_ringbuffer_ref(&fd_ring->base);
+@@ -235,8 +265,19 @@ fd_submit_sp_flush_execute(void *job, void *gdata, int thread_index)
+    struct fd_submit *submit = job;
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(submit);
+    struct fd_pipe *pipe = submit->pipe;
++   bool oom = false;
++
++   foreach_submit (s, &fd_submit->submit_list) {
++      if (to_fd_submit_sp(s)->oom) {
++         oom = true;
++         break;
++      }
++   }
+ 
+-   fd_submit->flush_submit_list(&fd_submit->submit_list);
++   if (oom)
++      fd_ringbuffer_sp_note_oom("flush_execute");
++   else
++      fd_submit->flush_submit_list(&fd_submit->submit_list);
+ 
+    pthread_mutex_lock(&flush_mtx);
+    assert(fd_fence_before(pipe->last_submit_fence, fd_submit->base.fence));
+@@ -500,6 +541,10 @@ finalize_current_cmd(struct fd_ringbuffer *ring)
+    assert(!(ring->flags & _FD_RINGBUFFER_OBJECT));
+ 
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
++   if (!fd_ring->ring_bo) {
++      fd_ringbuffer_sp_mark_oom(fd_ring);
++      return;
++   }
+    APPEND(&fd_ring->u, cmds,
+           (struct fd_cmd_sp){
+              .ring_bo = fd_bo_ref(fd_ring->ring_bo),
+@@ -515,12 +560,26 @@ fd_ringbuffer_sp_grow(struct fd_ringbuffer *ring, uint32_t size)
+ 
+    assert(ring->flags & FD_RINGBUFFER_GROWABLE);
+ 
+-   finalize_current_cmd(ring);
++   if (fd_ring->ring_bo) {
++      finalize_current_cmd(ring);
++      fd_bo_del(fd_ring->ring_bo);
++   } else {
++      free(ring->start);
++   }
+ 
+-   fd_bo_del(fd_ring->ring_bo);
+    fd_ring->ring_bo = fd_bo_new_ring(pipe->dev, size);
++   uint8_t *base = fd_ring->ring_bo ? fd_bo_map(fd_ring->ring_bo) : NULL;
++   if (!base) {
++      if (fd_ring->ring_bo) {
++         fd_bo_del(fd_ring->ring_bo);
++         fd_ring->ring_bo = NULL;
++      }
++      fd_ringbuffer_sp_mark_oom(fd_ring);
++      fd_ringbuffer_sp_note_oom("grow");
++      base = calloc(1, MAX2(size, 64));
++   }
+ 
+-   ring->start = fd_bo_map(fd_ring->ring_bo);
++   ring->start = (void *)base;
+    ring->end = &(ring->start[size / 4]);
+    ring->cur = ring->start;
+    ring->size = size;
+@@ -543,6 +602,9 @@ fd_ringbuffer_sp_emit_bo_nonobj(struct fd_ringbuffer *ring, struct fd_bo *bo)
+ {
+    assert(!(ring->flags & _FD_RINGBUFFER_OBJECT));
+ 
++   if (!bo)
++      return;
++
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(fd_ring->u.submit);
+ 
+@@ -553,6 +615,8 @@ static void
+ fd_ringbuffer_sp_assert_attached_nonobj(struct fd_ringbuffer *ring, struct fd_bo *bo)
+ {
+ #ifndef NDEBUG
++   if (!bo)
++      return;
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(fd_ring->u.submit);
+    assert(check_append_bo(fd_submit, bo, true) != ~0);
+@@ -564,6 +628,9 @@ fd_ringbuffer_sp_emit_bo_obj(struct fd_ringbuffer *ring, struct fd_bo *bo)
+ {
+    assert(ring->flags & _FD_RINGBUFFER_OBJECT);
+ 
++   if (!bo)
++      return;
++
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
+ 
+    /* Avoid emitting duplicate BO references into the list.  Ringbuffer
+@@ -636,7 +703,10 @@ fd_ringbuffer_sp_destroy(struct fd_ringbuffer *ring)
+ {
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
+ 
+-   fd_bo_del(fd_ring->ring_bo);
++   if (fd_ring->ring_bo)
++      fd_bo_del(fd_ring->ring_bo);
++   else
++      free(ring->start);
+ 
+    if (ring->flags & _FD_RINGBUFFER_OBJECT) {
+       fd_bo_del_array(fd_ring->u.reloc_bos, fd_ring->u.nr_reloc_bos);
+@@ -707,9 +777,17 @@ fd_ringbuffer_sp_init(struct fd_ringbuffer_sp *fd_ring, uint32_t size,
+ {
+    struct fd_ringbuffer *ring = &fd_ring->base;
+ 
+-   assert(fd_ring->ring_bo);
+-
+-   uint8_t *base = fd_bo_map(fd_ring->ring_bo);
++   uint8_t *base = fd_ring->ring_bo ? fd_bo_map(fd_ring->ring_bo) : NULL;
++   if (!base) {
++      if (fd_ring->ring_bo) {
++         fd_bo_del(fd_ring->ring_bo);
++         fd_ring->ring_bo = NULL;
++      }
++      fd_ring->offset = 0;
++      fd_ringbuffer_sp_mark_oom(fd_ring);
++      fd_ringbuffer_sp_note_oom("init");
++      base = calloc(1, MAX2(size, 64));
++   }
+    ring->start = (void *)(base + fd_ring->offset);
+    ring->end = &(ring->start[size / 4]);
+    ring->cur = ring->start;
+@@ -769,11 +847,14 @@ fd_ringbuffer_sp_new_object(struct fd_pipe *pipe, uint32_t size)
+    }
+ 
+    fd_ring->u.pipe = pipe;
+-   fd_ring->ring_bo = fd_bo_ref(dev->suballoc_bo);
++   fd_ring->ring_bo = dev->suballoc_bo ? fd_bo_ref(dev->suballoc_bo) : NULL;
+    fd_ring->base.refcnt = 1;
+    fd_ring->u.last_submit_seqno = 0;
+ 
+-   dev->suballoc_offset = fd_ring->offset + size;
++   if (dev->suballoc_bo)
++      dev->suballoc_offset = fd_ring->offset + size;
++   else
++      fd_ring->offset = 0;
+ 
+    simple_mtx_unlock(&dev->suballoc_lock);
+ 
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp.h b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+index 27d1873..bacdd5c 100644
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.h
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+@@ -71,6 +71,7 @@ struct fd_submit_sp {
+    flush_submit_list_fn flush_submit_list;
+ 
+    uint32_t seqno;
++   bool oom;
+ };
+ FD_DEFINE_CAST(fd_submit, fd_submit_sp);
+ 
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h b/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h
+index 23e052e..2947ffa 100644
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h
+@@ -27,6 +27,11 @@ static void X(emit_reloc_common)(struct fd_ringbuffer *ring, uint64_t iova)
+ static void X(fd_ringbuffer_sp_emit_reloc_nonobj)(struct fd_ringbuffer *ring,
+                                                   const struct fd_reloc *reloc)
+ {
++   if (!reloc->bo) {
++      fd_ringbuffer_sp_mark_oom(to_fd_ringbuffer_sp(ring));
++      X(emit_reloc_common)(ring, 0);
++      return;
++   }
+    X(emit_reloc_common)(ring, reloc->iova);
+    fd_ringbuffer_sp_emit_bo_nonobj(ring, reloc->bo);
+ }
+@@ -34,6 +39,10 @@ static void X(fd_ringbuffer_sp_emit_reloc_nonobj)(struct fd_ringbuffer *ring,
+ static void X(fd_ringbuffer_sp_emit_reloc_obj)(struct fd_ringbuffer *ring,
+                                                const struct fd_reloc *reloc)
+ {
++   if (!reloc->bo) {
++      X(emit_reloc_common)(ring, 0);
++      return;
++   }
+    X(emit_reloc_common)(ring, reloc->iova);
+    fd_ringbuffer_sp_emit_bo_obj(ring, reloc->bo);
+ }
+@@ -54,6 +63,13 @@ static uint32_t X(fd_ringbuffer_sp_emit_reloc_ring)(
+       size = offset_bytes(target->cur, target->start);
+    }
+ 
++   if (!bo) {
++      fd_ringbuffer_sp_mark_oom(to_fd_ringbuffer_sp(ring));
++      fd_ringbuffer_sp_mark_oom(fd_target);
++      X(emit_reloc_common)(ring, 0);
++      return 0;
++   }
++
+    if (ring->flags & _FD_RINGBUFFER_OBJECT) {
+       X(fd_ringbuffer_sp_emit_reloc_obj)(ring, &(struct fd_reloc){
+                 .bo = bo,
 diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
 index f7de6d8..8cb9571 100644
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
