@@ -1,0 +1,111 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b556e0c..75fc47b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5541,6 +5541,50 @@ bad:
+ }
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Boot-arg sweetinject=/path/to/lib.dylib:procname: append
++ * DYLD_INSERT_LIBRARIES=/path/to/lib.dylib to that program's environment.
++ * It must run while exec_extract_strings() builds envv[] (process_signature()
++ * runs after exec_copyout_strings(), too late, and launchd drops DYLD_*
++ * variables for system daemons). procname is the last component of the
++ * executable path, the first string in ip_strings.
++ */
++static int
++sweet_inject_env(struct image_params *imgp, int new_ptr_size)
++{
++	char spec[192], env[224];
++	const char *path = imgp->ip_strings, *base, *slash;
++	char *colon;
++
++	if (!PE_parse_boot_arg_str("sweetinject", spec, sizeof(spec))) {
++		return 0;
++	}
++	colon = strchr(spec, ':');
++	if (colon == NULL || path == NULL) {
++		return 0;
++	}
++	*colon++ = '\0';
++	base = path;
++	while ((slash = strchr(base, '/')) != NULL) {
++		base = slash + 1;
++	}
++	if (strcmp(base, colon) != 0) {
++		return 0;
++	}
++	snprintf(env, sizeof(env), "DYLD_INSERT_LIBRARIES=%s", spec);
++	if (exec_add_user_string(imgp, CAST_USER_ADDR_T(env), UIO_SYSSPACE, TRUE) != 0 ||
++	    imgp->ip_argspace < new_ptr_size) {
++		printf("SWEET: sweetinject: no room for %s in %s\n", env, base);
++		return 0;
++	}
++	imgp->ip_argspace -= new_ptr_size;
++	imgp->ip_envc++;
++	printf("SWEET: injected %s into %s\n", env, base);
++	return 0;
++}
++#endif
++
+ /*
+  * exec_extract_strings
+  *
+@@ -5741,6 +5785,10 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	(void)sweet_inject_env(imgp, new_ptr_size);
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+@@ -7325,36 +7373,6 @@ proc_process_signature(proc_t p, os_reason_t *signature_failure_reason)
+ 	return error;
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-/*
+- * Boot-arg sweetinject=/path/to/lib.dylib:procname: add
+- * DYLD_INSERT_LIBRARIES=/path/to/lib.dylib to that process's environment
+- * on exec (e.g. sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd).
+- */
+-static void
+-sweet_inject(struct image_params *imgp, const char *procname)
+-{
+-	char spec[192], env[224];
+-	char *colon;
+-
+-	if (!PE_parse_boot_arg_str("sweetinject", spec, sizeof(spec))) {
+-		return;
+-	}
+-	colon = strchr(spec, ':');
+-	if (colon == NULL) {
+-		return;
+-	}
+-	*colon++ = '\0';
+-	if (strcmp(procname, colon) != 0) {
+-		return;
+-	}
+-	snprintf(env, sizeof(env), "DYLD_INSERT_LIBRARIES=%s", spec);
+-	if (exec_add_user_string(imgp, CAST_USER_ADDR_T(env), UIO_SYSSPACE, FALSE) == 0) {
+-		imgp->ip_envc++;
+-		printf("SWEET: injected %s into %s\n", env, procname);
+-	}
+-}
+-#endif
+ 
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+@@ -7445,7 +7463,6 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
+-			sweet_inject(imgp, p->p_name);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
