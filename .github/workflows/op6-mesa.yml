@@ -2,13 +2,14 @@ name: op6-mesa
 
 # Build Mesa 25.0.7 (libOSMesa.8.dylib: OpenGL ES 2/3, freedreno on Adreno 630 via
 # SweetGPUUserClient, softpipe fallback) and sweet-gl-test for OnePlus 6 (Milestone G3).
-# Runs on macos-15 (standard GitHub Actions macOS pool) with Xcode's iPhoneOS SDK.
+# Runs on macos-26 (macos-14/15 are not acquired for this account) with Xcode's iPhoneOS SDK.
+# Also builds the G4 CoreAnimation bridge (op6/ca-bridge: libsweet-gl.dylib, libsweet-ca.dylib).
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +31,18 @@ jobs:
           codesign -s - -f out/sweet-gl-test out/sweetgpu-test
           file out/sweet-gl-test out/lib/libOSMesa.8.dylib
           otool -L out/sweet-gl-test out/lib/libOSMesa.8.dylib
+          # G4 bridge: EAGLContext -> Mesa (libsweet-gl) and the backboardd hook (libsweet-ca)
+          mkdir -p obj
+          python3 op6/ca-bridge/mkeagl.py op6/ca-bridge/eagl_slots.txt mesa-work/meta/gl.xml \
+            mesa-work/meta/exported-gl.txt op6/ca-bridge/eagl.c > obj/eagl_gen.h
+          CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK -O2 -Wall"
+          $CC -dynamiclib -Iobj -Iop6/ca-bridge -install_name /usr/local/lib/libsweet-gl.dylib \
+            -framework CoreFoundation -framework IOSurface -lobjc \
+            -o out/lib/libsweet-gl.dylib op6/ca-bridge/eagl.c op6/ca-bridge/sweet_gl_osmesa.c out/lib/libOSMesa.8.dylib
+          $CC -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
+            -o out/lib/libsweet-ca.dylib op6/ca-bridge/sweet_ca.c
+          codesign -s - -f out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
+          otool -L out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
           mkdir -p out/meta
           cp mesa-work/meta/gl.xml mesa-work/meta/exported-gl.txt out/meta/
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS

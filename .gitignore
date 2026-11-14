@@ -24,3 +24,4 @@ s9/shim/fw_a630_gmu.h
 op6/shim/fw_a630_gmu.h
 op6/out/
 op6/dtb/
+s9/ios-tools/out-*/
