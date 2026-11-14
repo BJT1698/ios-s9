@@ -252,13 +252,9 @@ struct rwa_texture {
 
 /* the libdrm stand-in's IOSurface calls (gpu/freedreno-sweet/sweet_drm.c); struct sweet_gpu_surface_bo, first 48 bytes (ABI minor 0 layout,
  * which every kernel minor accepts: a caller may pass and accept only these) */
-struct rwa_sbo {
-   uint32_t surface_id, handle;
-   uint64_t size, iova;
-   uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
-};
-extern int sweet_drm_surface_bo(int fd, struct rwa_sbo *io);
-extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+/* OP6: the same 48-byte layout is struct sweet_drm_sbo in sweet-drm's xf86drm.h, which also declares
+ * sweet_drm_surface_bo() and sweet_drm_bo_sync(); use that one type so the prototypes agree. */
+#define rwa_sbo sweet_drm_sbo
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
