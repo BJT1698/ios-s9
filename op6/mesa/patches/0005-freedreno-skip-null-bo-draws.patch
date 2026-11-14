@@ -1,0 +1,381 @@
+freedreno: skip draws with NULL BOs after GPU OOM (OnePlus 6 / SweetGPU)
+
+With a 32 MiB SweetGPU carve-out, once GPU memory is exhausted,
+fd_resource_create() / realloc_bo() fails and leaves resources with
+rsc->bo == NULL (or sub-allocations like bindless descriptor sets / LRZ
+buffers fail to allocate a BO). Subsequent draws or clears that bind
+those resources dereference rsc->bo or pass NULL to fd_bo_mark_for_dump /
+fd_bo_ref, crashing backboardd.
+
+- freedreno_draw.c / freedreno_draw.h: add fd_oom_note_skip() (logs once
+  via mesa_loge and sweet_drm_log on __APPLE__, and counts skips) and
+  helper checks for NULL BOs on bound vertex/index/SO/indirect buffers,
+  shader UBOs/SSBOs/images/sampler views, and framebuffer surfaces.
+  Skip fd_draw_vbo(), fd_clear(), fd_clear_render_target(),
+  fd_clear_depth_stencil(), and fd_launch_grid() when any bound
+  resource has rsc->bo == NULL.
+- freedreno_blitter.c: skip fd_blit() and fd_resource_copy_region() when
+  src or dst resource has rsc->bo == NULL.
+- a6xx/fd6_image.cc: in fd6_build_bindless_state(), return NULL if
+  fd_bo_new() or fd_bo_map() fails instead of calling
+  fd_bo_mark_for_dump(NULL).
+- a6xx/fd6_draw.cc: in fd6_clear(), guard subpass->lrz == NULL before
+  calling fd_bo_ref().
+
+Applies after 0001-0004. Mesa is MIT licensed; this patch is too.
+
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+index f7de6d8..8cb9571 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -642,12 +642,14 @@ fd6_clear(struct fd_context *ctx, enum fd_buffer_mask buffers,
+        */
+       if (do_lrz_clear(ctx, buffers)) {
+          struct fd_resource *zsbuf = fd_resource(pfb->zsbuf->texture);
++         struct fd_bo *new_lrz = fd_bo_new(ctx->screen->dev,
++                                           fd_bo_size(zsbuf->lrz),
++                                           FD_BO_NOMAP, "lrz");
+ 
+          fd_bo_del(subpass->lrz);
+-         subpass->lrz = fd_bo_new(ctx->screen->dev, fd_bo_size(zsbuf->lrz),
+-                                  FD_BO_NOMAP, "lrz");
++         subpass->lrz = new_lrz;
+          fd_bo_del(zsbuf->lrz);
+-         zsbuf->lrz = fd_bo_ref(subpass->lrz);
++         zsbuf->lrz = subpass->lrz ? fd_bo_ref(subpass->lrz) : NULL;
+       }
+    }
+ 
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+index eab2a60..90637f3 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "pipe/p_state.h"
+ 
++#include "freedreno_draw.h"
+ #include "freedreno_resource.h"
+ #include "freedreno_state.h"
+ 
+@@ -203,9 +204,21 @@ fd6_build_bindless_state(struct fd_context *ctx, enum pipe_shader_type shader,
+              */
+             FD_BO_GPUREADONLY | FD_BO_CACHED_COHERENT,
+             "%s bindless", _mesa_shader_stage_to_abbrev(shader));
++      if (!set->bo) {
++         fd_oom_note_skip("bindless");
++         fd_ringbuffer_del(ring);
++         return NULL;
++      }
+       fd_bo_mark_for_dump(set->bo);
+ 
+       uint32_t *desc_buf = (uint32_t *)fd_bo_map(set->bo);
++      if (!desc_buf) {
++         fd_oom_note_skip("bindless_map");
++         fd_bo_del(set->bo);
++         set->bo = NULL;
++         fd_ringbuffer_del(ring);
++         return NULL;
++      }
+ 
+       memcpy(desc_buf, set->descriptor, sizeof(set->descriptor));
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_blitter.c b/src/gallium/drivers/freedreno/freedreno_blitter.c
+index 38d6dd1..8cc4697 100644
+--- a/src/gallium/drivers/freedreno/freedreno_blitter.c
++++ b/src/gallium/drivers/freedreno/freedreno_blitter.c
+@@ -11,6 +11,7 @@
+ 
+ #include "freedreno_blitter.h"
+ #include "freedreno_context.h"
++#include "freedreno_draw.h"
+ #include "freedreno_fence.h"
+ #include "freedreno_resource.h"
+ 
+@@ -343,6 +344,12 @@ fd_blit(struct pipe_context *pctx, const struct pipe_blit_info *blit_info)
+    if (info.render_condition_enable && !fd_render_condition_check(pctx))
+       return true;
+ 
++   if (fd_rsc_has_null_bo(info.src.resource) ||
++       fd_rsc_has_null_bo(info.dst.resource)) {
++      fd_oom_note_skip("blit");
++      return true;
++   }
++
+    if (ctx->blit && ctx->blit(ctx, &info))
+       return true;
+ 
+@@ -406,6 +413,11 @@ fd_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
+ {
+    struct fd_context *ctx = fd_context(pctx);
+ 
++   if (fd_rsc_has_null_bo(src) || fd_rsc_has_null_bo(dst)) {
++      fd_oom_note_skip("copy_region");
++      return;
++   }
++
+    /* The blitter path handles compressed formats only if src and dst format
+     * match, in other cases just fall back to sw:
+     */
+diff --git a/src/gallium/drivers/freedreno/freedreno_draw.c b/src/gallium/drivers/freedreno/freedreno_draw.c
+index b352d12..fa175b2 100644
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -9,6 +9,7 @@
+ #include "pipe/p_state.h"
+ #include "util/format/u_format.h"
+ #include "util/u_draw.h"
++#include "util/u_atomic.h"
+ #include "util/u_helpers.h"
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+@@ -23,6 +24,9 @@
+ #include "freedreno_resource.h"
+ #include "freedreno_state.h"
+ #include "freedreno_util.h"
++#ifdef __APPLE__
++#include <xf86drm.h>
++#endif
+ 
+ static bool
+ batch_references_resource(struct fd_batch *batch, struct pipe_resource *prsc)
+@@ -292,6 +296,154 @@ update_draw_stats(struct fd_context *ctx, const struct pipe_draw_info *info,
+    }
+ }
+ 
++void
++fd_oom_note_skip(const char *where)
++{
++   static unsigned skipped;
++   unsigned n = p_atomic_inc_return(&skipped);
++   if (n == 1) {
++      mesa_loge("freedreno: skipping %s with NULL BO after GPU OOM (first skip)",
++                where);
++#ifdef __APPLE__
++      sweet_drm_log("mesa: skipping %s with NULL BO after GPU OOM (first skip; "
++                    "further skips counted silently)",
++                    where);
++#endif
++   }
++}
++
++static bool
++shader_stage_has_null_bo(struct fd_context *ctx, enum pipe_shader_type s)
++{
++   u_foreach_bit (i, ctx->constbuf[s].enabled_mask) {
++      struct pipe_constant_buffer *cb = &ctx->constbuf[s].cb[i];
++      if (!cb->user_buffer && fd_rsc_has_null_bo(cb->buffer))
++         return true;
++   }
++
++   u_foreach_bit (i, ctx->tex[s].valid_textures) {
++      struct pipe_sampler_view *sv = ctx->tex[s].textures[i];
++      if (sv && fd_rsc_has_null_bo(sv->texture))
++         return true;
++   }
++
++   u_foreach_bit (i, ctx->shaderbuf[s].enabled_mask) {
++      if (fd_rsc_has_null_bo(ctx->shaderbuf[s].sb[i].buffer))
++         return true;
++   }
++
++   u_foreach_bit (i, ctx->shaderimg[s].enabled_mask) {
++      if (fd_rsc_has_null_bo(ctx->shaderimg[s].si[i].resource))
++         return true;
++   }
++
++   return false;
++}
++
++static bool
++draw_has_null_bo(struct fd_context *ctx, const struct pipe_draw_info *info,
++                 const struct pipe_draw_indirect_info *indirect)
++{
++   struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
++
++   for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
++      if (pfb->cbufs[i] && fd_rsc_has_null_bo(pfb->cbufs[i]->texture))
++         return true;
++   }
++   if (pfb->zsbuf && fd_rsc_has_null_bo(pfb->zsbuf->texture))
++      return true;
++
++   if (info->index_size && !info->has_user_indices &&
++       fd_rsc_has_null_bo(info->index.resource))
++      return true;
++
++   if (indirect) {
++      if (fd_rsc_has_null_bo(indirect->buffer) ||
++          fd_rsc_has_null_bo(indirect->indirect_draw_count))
++         return true;
++      if (indirect->count_from_stream_output) {
++         struct fd_stream_output_target *so =
++            fd_stream_output_target(indirect->count_from_stream_output);
++         if (fd_rsc_has_null_bo(so->offset_buf))
++            return true;
++      }
++   }
++
++   u_foreach_bit (i, ctx->vtx.vertexbuf.enabled_mask) {
++      struct pipe_vertex_buffer *vb = &ctx->vtx.vertexbuf.vb[i];
++      if (!vb->is_user_buffer && fd_rsc_has_null_bo(vb->buffer.resource))
++         return true;
++   }
++
++   for (unsigned i = 0; i < ctx->streamout.num_targets; i++) {
++      struct fd_stream_output_target *target =
++         fd_stream_output_target(ctx->streamout.targets[i]);
++      if (target && (fd_rsc_has_null_bo(target->base.buffer) ||
++                     fd_rsc_has_null_bo(target->offset_buf)))
++         return true;
++   }
++
++   u_foreach_bit (s, ctx->bound_shader_stages) {
++      if (shader_stage_has_null_bo(ctx, s))
++         return true;
++   }
++
++   list_for_each_entry (struct fd_acc_query, aq, &ctx->acc_active_queries, node) {
++      if (fd_rsc_has_null_bo(aq->prsc))
++         return true;
++   }
++
++   return false;
++}
++
++static bool
++clear_has_null_bo(struct fd_context *ctx, unsigned buffers)
++{
++   struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
++
++   if (buffers & PIPE_CLEAR_COLOR) {
++      for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
++         if ((buffers & (PIPE_CLEAR_COLOR0 << i)) && pfb->cbufs[i] &&
++             fd_rsc_has_null_bo(pfb->cbufs[i]->texture))
++            return true;
++      }
++   }
++
++   if ((buffers & (PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL)) && pfb->zsbuf &&
++       fd_rsc_has_null_bo(pfb->zsbuf->texture))
++      return true;
++
++   list_for_each_entry (struct fd_acc_query, aq, &ctx->acc_active_queries, node) {
++      if (fd_rsc_has_null_bo(aq->prsc))
++         return true;
++   }
++
++   return false;
++}
++
++static bool
++launch_grid_has_null_bo(struct fd_context *ctx,
++                        const struct pipe_grid_info *info)
++{
++   if (shader_stage_has_null_bo(ctx, PIPE_SHADER_COMPUTE))
++      return true;
++
++   u_foreach_bit (i, ctx->global_bindings.enabled_mask) {
++      if (fd_rsc_has_null_bo(ctx->global_bindings.buf[i]))
++         return true;
++   }
++
++   if (fd_rsc_has_null_bo(info->indirect))
++      return true;
++
++   list_for_each_entry (struct fd_acc_query, aq, &ctx->acc_active_queries, node) {
++      if (fd_rsc_has_null_bo(aq->prsc))
++         return true;
++   }
++
++   return false;
++}
++
+ static void
+ fd_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+             unsigned drawid_offset,
+@@ -315,6 +467,11 @@ fd_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
+    if (!fd_render_condition_check(pctx))
+       return;
+ 
++   if (draw_has_null_bo(ctx, info, indirect)) {
++      fd_oom_note_skip("draw_vbo");
++      return;
++   }
++
+    /* Upload a user index buffer. */
+    struct pipe_resource *indexbuf = NULL;
+    unsigned index_offset = 0;
+@@ -471,6 +628,11 @@ fd_clear(struct pipe_context *pctx, unsigned buffers,
+    if (!fd_render_condition_check(pctx))
+       return;
+ 
++   if (clear_has_null_bo(ctx, buffers)) {
++      fd_oom_note_skip("clear");
++      return;
++   }
++
+    struct fd_batch *batch = fd_context_batch(ctx);
+ 
+    batch_clear_tracking(batch, buffers);
+@@ -534,6 +696,11 @@ fd_clear_render_target(struct pipe_context *pctx, struct pipe_surface *ps,
+    if (render_condition_enabled && !fd_render_condition_check(pctx))
+       return;
+ 
++   if (ps && fd_rsc_has_null_bo(ps->texture)) {
++      fd_oom_note_skip("clear_render_target");
++      return;
++   }
++
+    fd_blitter_clear_render_target(pctx, ps, color, x, y, w, h,
+                                   render_condition_enabled);
+ }
+@@ -547,6 +714,11 @@ fd_clear_depth_stencil(struct pipe_context *pctx, struct pipe_surface *ps,
+    if (render_condition_enabled && !fd_render_condition_check(pctx))
+       return;
+ 
++   if (ps && fd_rsc_has_null_bo(ps->texture)) {
++      fd_oom_note_skip("clear_depth_stencil");
++      return;
++   }
++
+    fd_blitter_clear_depth_stencil(pctx, ps, buffers,
+                                   depth, stencil, x, y, w, h,
+                                   render_condition_enabled);
+@@ -564,6 +736,11 @@ fd_launch_grid(struct pipe_context *pctx,
+    if (!fd_render_condition_check(pctx))
+       return;
+ 
++   if (launch_grid_has_null_bo(ctx, info)) {
++      fd_oom_note_skip("launch_grid");
++      return;
++   }
++
+    batch = fd_context_batch_nondraw(ctx);
+    fd_batch_reference(&save_batch, ctx->batch);
+    fd_batch_reference(&ctx->batch, batch);
+diff --git a/src/gallium/drivers/freedreno/freedreno_draw.h b/src/gallium/drivers/freedreno/freedreno_draw.h
+index 8c5b9b0..eb6d4d3 100644
+--- a/src/gallium/drivers/freedreno/freedreno_draw.h
++++ b/src/gallium/drivers/freedreno/freedreno_draw.h
+@@ -21,6 +21,20 @@ struct fd_ringbuffer;
+ 
+ void fd_draw_init(struct pipe_context *pctx);
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++void fd_oom_note_skip(const char *where);
++#ifdef __cplusplus
++}
++#endif
++
++static inline bool
++fd_rsc_has_null_bo(struct pipe_resource *prsc)
++{
++   return prsc && !fd_resource(prsc)->bo;
++}
++
+ #ifndef __cplusplus
+ static inline void
+ fd_draw(struct fd_batch *batch, struct fd_ringbuffer *ring,
