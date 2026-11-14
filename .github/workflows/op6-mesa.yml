@@ -39,7 +39,7 @@ jobs:
           $CC -dynamiclib -Iobj -Iop6/ca-bridge -install_name /usr/local/lib/libsweet-gl.dylib \
             -framework CoreFoundation -framework IOSurface -framework IOKit -lobjc \
             -o out/lib/libsweet-gl.dylib op6/ca-bridge/eagl.c op6/ca-bridge/sweet_gl_osmesa.c out/lib/libOSMesa.8.dylib
-          $CC -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
+          $CC -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib -framework CoreFoundation -framework IOKit \
             -o out/lib/libsweet-ca.dylib op6/ca-bridge/sweet_ca.c
           codesign -s - -f out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
           otool -L out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
