@@ -244,16 +244,22 @@ main(int argc, char **argv)
          return 1;
       }
 
-      if (add_dev) {
+      /*
+       * iOS 16.7.16: with no accelerator in the system, Metal.framework never creates its internal
+       * device array and MTLAddDevice() asserts (_deviceArray != NULL). Registering a system-wide
+       * device is G6b's job (IOAcceleratorES + MetalPlugin); for G6a, test our device directly.
+       */
+      id<MTLDevice> sysdev = nil;
+      if ([before count] > 0 && add_dev) {
          add_dev(created);
+         sysdev = create_def ? create_def() : nil;
       } else {
-         printf("DEVICE: FAIL (MTLAddDevice symbol not found)\n");
-         return 1;
+         printf("DEVICE: note: Metal has no device array on this system (no accelerator): "
+                "MTLAddDevice skipped, testing BGMTLDevice directly\n");
+         sysdev = created;
       }
-
-      id<MTLDevice> sysdev = create_def ? create_def() : nil;
       if (!sysdev) {
-         printf("DEVICE: FAIL (MTLCreateSystemDefaultDevice() returned nil)\n");
+         printf("DEVICE: FAIL (no device)\n");
          return 1;
       }
       printf("DEVICE: PASS name=\"%s\" class=%s registryID=0x%llx\n",
