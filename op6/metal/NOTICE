@@ -1,0 +1,39 @@
+# op6/metal third-party notices
+
+The Metal runtime and AIR-to-ir3 compiler path in `op6/metal/` and `op6/mesa/` are derived from
+Chlorophyll (`@787338f`, MIT), which in turn builds upon the `metal` branch of hackios-xnu-userland
+(`@29eef72`, `tools/mesa/`, MIT, Copyright (c) 2026 OOSEX GANG / Darwin on redwood contributors).
+
+## Upstream Attribution
+
+1. **OOSEX GANG / hackios-xnu-userland (`@29eef72`, MIT)**
+   - `op6/mesa/air/` base AIR -> NIR frontend (`air_bitcode.*`, `air_layout.c`, `air_metallib.c`,
+     `air_module.*`, `air_print.c`, `air_private.h`, `air_to_nir.c`, `air_intrinsics.c`, `nir_air.h`,
+     `air2nir.c`, `meson.build`) and base `air_metal.c` / `air_metal.h`
+   - Mesa patches (`air-frontend`, `air-ir3`, `ir3-round-default`, `ir3-shift-split`,
+     `ir3-ssbo-subdword`)
+   - License text: `LICENSE.hackios-userland`; per-file SPDX/copyright headers are preserved verbatim.
+
+2. **Chlorophyll (`@787338f`, MIT)**
+   - `op6/metal/src/bgmtl.m` Metal runtime (`BGMTLDevice`, command queues/buffers, compute/render/blit
+     encoders, Metal library / AIR dispatch)
+   - Chlorophyll extensions in `op6/mesa/air/air_metal.c` / `air_metal.h` (render passes, SBO cache,
+     IOSurface/KMS handle import, two-word iOS inline sampler state, refused-draw handling,
+     cache-sync hooks)
+   - Mesa patches (`fd6-fb-barrier-reorder`, `fd-bo-cache-skip-busy`, `fd-bo-cache-keep`)
+   - Probe structure and Metal test shaders (`bg_kernels.metal`, `bg_render.metal`,
+     `bgmtl_probe.m`, `bgmtl_render_probe.m`, combined and adapted as `op6/metal/test/op6-mtl-probe.m`
+     and `op6/metal/test/op6_probe.metal`).
+
+3. **OP6 / Enchilada Adaptations (milestone G6a)**
+   - `op6/mesa/sweet-drm/`: added `sweet_drm_info`, `sweet_drm_surface_bo`, `sweet_drm_bo_sync`
+     (`GEM_CPU_PREP` 0x44 + EL0 `dc civac` + `dsb sy`), and `sweet_drm_take_wait_error` against
+     OP6 `SweetGPUUserClient`.
+   - `op6/mesa/air/air_metal.c`: enabled `'b3a8'` planar IOSurface import (`planes == 2`, plane 0
+     pitch/offset) and updated OP6 diagnostics.
+   - `op6/metal/src/bgmtl.m`: removed Bergamota-specific paths and compositor hooks; added runtime
+     `NSClassFromString` / `respondsToSelector:` / `instancesRespondToSelector:` guards with
+     missing-SPI logging and `"MTLB"` library parsing fallback for iOS 16.7.16 (20H392)
+     `Metal.framework` compatibility.
+   - `op6/mesa/patches/`: dropped `fd-bo-new-purge-retry.patch` in favor of OP6's existing
+     `0004-freedreno-gpu-oom.patch` and `0005-freedreno-skip-null-bo-draws.patch`.

@@ -88,4 +88,31 @@ int sweet_drm_surface(int fd, struct sweet_drm_surface *surface);
 /* A line into the kernel's log ("sweet-gl[<process>]: <text>", selector 0x7f of xnu 0111); quietly nothing without it. */
 void sweet_drm_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
+/*
+ * Chlorophyll / op6-metal adapters (visibility("default") so libbgair.dylib exports them
+ * despite libfreedreno_drm building with -fvisibility=hidden).
+ */
+struct sweet_drm_gpu_info {
+	uint32_t abi_version, flags, gpu_id, chip_id;
+	uint64_t va_start, va_size;
+	uint32_t last_fence, abi_minor;
+};
+_Static_assert(sizeof(struct sweet_drm_gpu_info) == 40, "sweet_drm_gpu_info must match bg_gpu_info (40 bytes)");
+
+struct sweet_drm_sbo {
+	uint32_t surface_id, handle;
+	uint64_t size, iova;
+	uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
+};
+_Static_assert(sizeof(struct sweet_drm_sbo) == 48, "sweet_drm_sbo must match rwa_sbo (48 bytes)");
+
+__attribute__((visibility("default")))
+int sweet_drm_info(int fd, struct sweet_drm_gpu_info *out);
+__attribute__((visibility("default")))
+int sweet_drm_surface_bo(int fd, struct sweet_drm_sbo *io);
+__attribute__((visibility("default")))
+int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+__attribute__((visibility("default")))
+void sweet_drm_take_wait_error(char *buf, size_t size);
+
 #endif

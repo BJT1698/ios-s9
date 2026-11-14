@@ -518,3 +518,31 @@ write went elsewhere.
     5. **Rollback:** drop `sweetfbscale=1` from `--cmdline` (pure boot-arg gate, no ADT/userdata changes needed).
   - **Verified locally (host):** `git apply --check` clean against reconstructed `xnu-8796.141.3` + `0000..0115`; `clang++ --target=arm64-apple-darwin -fsyntax-only -Wall -Wextra` clean (0 errors, 0 warnings) on `SweetSurface.cpp`, `SweetFramebuffer.cpp`, `SweetGPU.cpp` with stub headers. Not yet built in XNU CI or tested on device.
 - 2026-11-14 **Display scan-out + QSEED3 in XNU verified on device (patch 0116 by Antigravity 0989ceb, reviewed by Claude; kernel run 43644774722; boot-G5-scale.img = boot-G5-cpumax args + `sweetfbscale=1`).** kern.sweetfb_flips 184 vs copies 6 (only before the 3 contiguous slots were taken), fence_waits 181, fence_timeouts 0, slots 3/3 used. User: image correct, much smoother, wakes correctly after auto-lock. **New default: boot-G5-scale.img.** Rollback: drop sweetfbscale=1 (boot-G5-cpumax.img).
+- **Metal G6a (`metal-g6a`, Chlorophyll `@787338f` port — host-verified only; CI build + device SSH test pending):**
+  - **Scope:** Proof-of-concept Metal stack for SSH CLI verification only: `MTLCreateSystemDefaultDevice()` non-nil inside `op6-mtl-probe` (via in-process `MTLAddDevice()` after `MTLCopyAllDevices()`), one compute kernel (`probe_compute` into shared `MTLBuffer`) and one `256x256` `BGRA8Unorm` clear + RGB triangle render pass (`probe_vertex`/`probe_fragment`) executed on Adreno 630 and verified on CPU. `backboardd`, CoreAnimation, and `IOAcceleratorES` remain completely untouched (no plugin bundle, no injector).
+  - **Mesa / AIR integration (`op6/mesa/`):**
+    - Imported AIR -> NIR frontend and Metal-Gallium driver bridge into `op6/mesa/air/` (`air_metal.c` updated for OP6 `sweetgpu=2` message and `'b3a8'` `planes <= 2` in `rwa_texture_from_surface`).
+    - Added numbered patches `0006-air-frontend.patch` through `0014-freedreno-kms-handle-size.patch`: AIR frontend (`0006`), `libbgair.dylib` + `idep_xmlconfig` (`0007`), `ir3` round-to-nearest-even (`0008`), negative-constant shift-split fix (`0009`), sub-dword SSBO lowering (`0010`), `fd6` FB-fetch barrier with batch reordering (`0011`), BO cache skip-busy (`0012`) and 15s keep (`0013`), and passing `whandle->size` for `WINSYS_HANDLE_TYPE_KMS` imports (`0014`). Omitted `fd-bo-new-purge-retry.patch` because OP6 `0004-freedreno-gpu-oom.patch` and `0005-freedreno-skip-null-bo-draws.patch` already provide purge+retry OOM and NULL-BO safety.
+    - Updated `op6/mesa/build.sh` to copy `op6/mesa/air` into `src/compiler/air` and build + package `out/lib/libbgair.dylib` (alongside `libOSMesa.8.dylib`), `out/unstripped/libbgair.dylib`, and `out/dSYM/libbgair.dylib.dSYM` with `/usr/local/lib/libbgair.dylib` install_name, ad-hoc codesign, and UUID verification.
+  - **`sweet-drm` adapters (`op6/mesa/sweet-drm/sweet_drm.c`, `xf86drm.h`):**
+    - Added `__attribute__((visibility("default")))` exports (necessary because `libfreedreno_drm` builds with `gnu_symbol_visibility : 'hidden'`) for `sweet_drm_info` (reads `SweetGPUState` `"on"`/`"failed"`/`"starting"`/`"off"` from IORegistry `SweetGPU` before `drmOpenWithType`, plus `MSM_PARAM_*` when connected), `sweet_drm_surface_bo` (selector `0x7e` IOSurface import + `MSM_INFO_GET_IOVA`), `sweet_drm_bo_sync` (selector `0x44` `GEM_CPU_PREP` wait + tracked `sweet_drm_map` EL0 `dc civac` + `dsb sy` flush), and `sweet_drm_take_wait_error` (captures failing `0x47`/`0x44` selector status for `bg_fence_wait` retries).
+  - **Metal runtime & probe (`op6/metal/`):**
+    - `op6/metal/src/bgmtl.m` + `bgmtl.h`: Cleaned Bergamota paths/compositor dump hacks (`/private/var/tmp/bgmtl*`, `BGMTL_BB`), replaced trace/sync switches with `OP6MTL_TRACE` / `OP6MTL_SYNC`, added `bg_check_spi()` diagnostics and runtime `instancesRespondToSelector:` / `respondsToSelector:` guards on `_MTLCommandQueue`, `_MTLCommandBuffer`, `_MTLCommandEncoder`, `_MTLComputePipelineState`, `_MTLRenderPipelineState`, `_MTLSamplerState`, `_MTLDepthStencilState`, `_MTLDevice`, and `_MTLFunction bitcodeData` for iOS 16.7.16 (`20H392`) compatibility. Built as `/usr/local/lib/libbgmtl.dylib`.
+    - `op6/metal/test/op6-mtl-probe.m` + `op6_probe.metal` -> `bin/op6-mtl-probe` + `bin/op6_probe.metallib` (compiled for `-mios-version-min=16.0` with `xcrun --sdk iphoneos metal` + `metallib`).
+  - **Licences:** Preserved MIT per-file headers and added `op6/metal/LICENSE.hackios-userland` and `op6/metal/NOTICE` crediting OOSEX GANG (`hackios-xnu-userland @ 29eef72`, MIT) and Chlorophyll (`@787338f`, MIT).
+  - **CI & SSH install paths (`.github/workflows/op6-mesa.yml`):**
+    - Artifact `op6-mesa` now also includes `lib/libbgair.dylib`, `lib/libbgmtl.dylib`, `unstripped/libbgair.dylib`, `dSYM/libbgair.dylib.dSYM`, `bin/op6-mtl-probe`, and `bin/op6_probe.metallib`.
+    - Over SSH: copy `lib/libbgair.dylib` and `lib/libbgmtl.dylib` to `/usr/local/lib/`, and `bin/op6-mtl-probe` + `bin/op6_probe.metallib` to `/var/root/`. Run `/var/root/op6-mtl-probe` (optionally `OP6MTL_TRACE=1 OP6MTL_SYNC=1 /var/root/op6-mtl-probe` for verbose tracing).
+    - Expected output:
+      ```
+      devices before registration: 0
+      DEVICE: PASS name="FD630 (OP6)" class=BGMTLDevice registryID=0x...
+      LIBRARY: PASS loaded /var/root/op6_probe.metallib
+      COMPUTE: PASS (272 words checked, 0 mismatches, first4=[0x1357a5a5, 0x1357a5b5, 0x1357a5c5, 0x1357a5d5])
+        px(2,2)     BGRA=(128,  0,  0,255) [expect clear ~(128,0,0,255)]
+        px(253,253) BGRA=(128,  0,  0,255) [expect clear ~(128,0,0,255)]
+        px(128,128) BGRA=(...,...,...,255) [expect tri center ~(128,64,64,255)]
+        ...
+      RENDER: PASS
+      ```
+      (Exits 0; no reboot or `backboardd` restart required.)

@@ -49,10 +49,30 @@ jobs:
           # both dylibs carry sweet_klog (selector 0x7f), kept private to each
           nm -m out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib | grep '_sweet_klog'
           if nm -gU out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib | grep -q '_sweet_klog'; then exit 1; fi
+          # G6a Metal runtime (libbgmtl) + op6-mtl-probe + op6_probe.metallib
+          mkdir -p out/bin
+          MTL_CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations"
+          $MTL_CC -dynamiclib -Iop6/mesa/air -install_name /usr/local/lib/libbgmtl.dylib \
+            -framework Foundation -framework Metal -framework IOSurface -lobjc \
+            -o out/lib/libbgmtl.dylib op6/metal/src/bgmtl.m out/lib/libbgair.dylib
+          $MTL_CC -Iop6/metal/src -o out/bin/op6-mtl-probe op6/metal/test/op6-mtl-probe.m \
+            out/lib/libbgmtl.dylib out/lib/libbgair.dylib \
+            -framework Foundation -framework Metal -lobjc \
+            -Wl,-rpath,@executable_path/../lib -Wl,-rpath,/usr/local/lib
+          if ! xcrun --sdk iphoneos -f metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain || true
+          fi
+          xcrun --sdk iphoneos metal -mios-version-min=16.0 -c op6/metal/test/op6_probe.metal -o obj/op6_probe.air
+          xcrun --sdk iphoneos metallib obj/op6_probe.air -o out/bin/op6_probe.metallib
+          codesign -s - -f out/lib/libbgmtl.dylib out/bin/op6-mtl-probe
+          file out/lib/libbgair.dylib out/lib/libbgmtl.dylib out/bin/op6-mtl-probe out/bin/op6_probe.metallib
+          otool -L out/lib/libbgair.dylib out/lib/libbgmtl.dylib out/bin/op6-mtl-probe
+          nm -gU out/lib/libbgair.dylib | grep '_sweet_drm_'
+          nm -gU out/lib/libbgmtl.dylib | grep '_bgmtl_'
           # Mesa symbols: lib/ keeps every function name, unstripped/ + dSYM/ are for llvm-symbolizer / atos
-          ls -l out/lib/libOSMesa.8.dylib out/unstripped/libOSMesa.8.dylib
-          xcrun dwarfdump --uuid out/lib/libOSMesa.8.dylib out/dSYM/libOSMesa.8.dylib.dSYM
-          du -sh out/dSYM/libOSMesa.8.dylib.dSYM
+          ls -l out/lib/libOSMesa.8.dylib out/unstripped/libOSMesa.8.dylib out/lib/libbgair.dylib out/unstripped/libbgair.dylib
+          xcrun dwarfdump --uuid out/lib/libOSMesa.8.dylib out/dSYM/libOSMesa.8.dylib.dSYM out/lib/libbgair.dylib out/dSYM/libbgair.dylib.dSYM
+          du -sh out/dSYM/libOSMesa.8.dylib.dSYM out/dSYM/libbgair.dylib.dSYM
           mkdir -p out/meta
           cp mesa-work/meta/gl.xml mesa-work/meta/exported-gl.txt out/meta/
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS

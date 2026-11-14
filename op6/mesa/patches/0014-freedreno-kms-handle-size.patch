@@ -1,0 +1,18 @@
+freedreno: pass whandle->size when importing WINSYS_HANDLE_TYPE_KMS BOs
+
+air_metal.c imports IOSurfaces via WINSYS_HANDLE_TYPE_KMS with whandle.size
+populated from sweet_drm_surface_bo(). Passing whandle->size (0 when unset, as
+existing callers leave it) ensures fd_bo_init_common()'s assert(bo->size) and
+any subsequent fd_bo_size()/fd_bo_map() see the imported buffer size.
+
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -840,7 +840,7 @@ fd_screen_bo_from_handle(struct pipe_screen *pscreen,
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       bo = fd_bo_from_name(screen->dev, whandle->handle);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+-      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
++      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
+    } else {
