@@ -37,7 +37,7 @@ jobs:
             mesa-work/meta/exported-gl.txt op6/ca-bridge/eagl.c > obj/eagl_gen.h
           CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK -O2 -Wall"
           $CC -dynamiclib -Iobj -Iop6/ca-bridge -install_name /usr/local/lib/libsweet-gl.dylib \
-            -framework CoreFoundation -framework IOSurface -lobjc \
+            -framework CoreFoundation -framework IOSurface -framework IOKit -lobjc \
             -o out/lib/libsweet-gl.dylib op6/ca-bridge/eagl.c op6/ca-bridge/sweet_gl_osmesa.c out/lib/libOSMesa.8.dylib
           $CC -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
             -o out/lib/libsweet-ca.dylib op6/ca-bridge/sweet_ca.c
