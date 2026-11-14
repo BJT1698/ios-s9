@@ -1,11 +1,12 @@
-freedreno: survive NULL BOs on draws and ringbuffers after GPU OOM
+freedreno: survive NULL BOs on draws, shaders and ringbuffers after GPU OOM
 
 With a 32 MiB SweetGPU carve-out, once GPU memory is exhausted,
 fd_resource_create() / realloc_bo() fails and leaves resources with
 rsc->bo == NULL, or sub-allocations (bindless descriptor sets, LRZ
-buffers, and command-stream ringbuffer BOs) fail to allocate a BO.
-Subsequent draws or clears that bind those resources or emit into a
-NULL ringbuffer BO crash backboardd.
+buffers, shader variant BOs, and command-stream ringbuffer BOs) fail to
+allocate a BO. Subsequent draws or clears that bind those resources,
+compile/upload shaders, or emit into a NULL ringbuffer BO crash
+backboardd.
 
 - freedreno_draw.c / freedreno_draw.h: add fd_oom_note_skip() (logs once
   via mesa_loge and sweet_drm_log on __APPLE__, and counts skips) and
@@ -16,10 +17,13 @@ NULL ringbuffer BO crash backboardd.
   resource has rsc->bo == NULL.
 - freedreno_blitter.c: skip fd_blit() and fd_resource_copy_region() when
   src or dst resource has rsc->bo == NULL.
+- ir3/ir3_gallium.c: in upload_shader_variant(), return early if
+  fd_bo_new() returns NULL instead of calling fd_bo_mark_for_dump(NULL).
 - a6xx/fd6_image.cc: in fd6_build_bindless_state(), return NULL if
   fd_bo_new() or fd_bo_map() fails instead of calling
   fd_bo_mark_for_dump(NULL).
-- a6xx/fd6_draw.cc: in fd6_clear(), guard subpass->lrz == NULL before
+- a6xx/fd6_draw.cc: skip fd6_draw_vbos() when a shader variant has
+  bo == NULL, and in fd6_clear() guard subpass->lrz == NULL before
   calling fd_bo_ref().
 - drm/freedreno_ringbuffer_sp.*: when fd_bo_new_ring() / fd_bo_map()
   fails, back the ringbuffer with a temporary CPU scratch buffer, guard
@@ -281,10 +285,46 @@ index 23e052e..2947ffa 100644
        X(fd_ringbuffer_sp_emit_reloc_obj)(ring, &(struct fd_reloc){
                  .bo = bo,
 diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
-index f7de6d8..8cb9571 100644
+index f7de6d8..00f80ba 100644
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
 +++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
-@@ -642,12 +642,14 @@ fd6_clear(struct fd_context *ctx, enum fd_buffer_mask buffers,
+@@ -15,6 +15,7 @@
+ #include "util/u_string.h"
+ 
+ #include "freedreno_blitter.h"
++#include "freedreno_draw.h"
+ #include "freedreno_resource.h"
+ #include "freedreno_state.h"
+ 
+@@ -265,6 +266,13 @@ flush_streamout(struct fd_context *ctx, struct fd6_emit *emit)
+    if (!emit->streamout_mask)
+       return;
+ 
++   if ((emit.vs && !emit.vs->bo) || (emit.hs && !emit.hs->bo) ||
++       (emit.ds && !emit.ds->bo) || (emit.gs && !emit.gs->bo) ||
++       (emit.fs && !emit.fs->bo)) {
++      fd_oom_note_skip("fd6_draw_vbos(shader_bo)");
++      return;
++   }
++
+    struct fd_ringbuffer *ring = ctx->batch->draw;
+ 
+    for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
+@@ -361,6 +369,13 @@ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+       ctx->stats.fs_regs += ir3_shader_halfregs(emit.fs);
+    }
+ 
++   if ((emit.vs && !emit.vs->bo) || (emit.hs && !emit.hs->bo) ||
++       (emit.ds && !emit.ds->bo) || (emit.gs && !emit.gs->bo) ||
++       (emit.fs && !emit.fs->bo)) {
++      fd_oom_note_skip("fd6_draw_vbos(shader_bo)");
++      return;
++   }
++
+    struct fd_ringbuffer *ring = ctx->batch->draw;
+ 
+    struct CP_DRAW_INDX_OFFSET_0 draw0 = {
+@@ -642,12 +657,14 @@ fd6_clear(struct fd_context *ctx, enum fd_buffer_mask buffers,
         */
        if (do_lrz_clear(ctx, buffers)) {
           struct fd_resource *zsbuf = fd_resource(pfb->zsbuf->texture);
@@ -635,3 +675,16 @@ index 8c5b9b0..eb6d4d3 100644
  #ifndef __cplusplus
  static inline void
  fd_draw(struct fd_batch *batch, struct fd_ringbuffer *ring,
+diff --git a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+index 3bb188b..b58d642 100644
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -93,6 +93,8 @@ upload_shader_variant(struct ir3_shader_variant *v)
+    v->bo =
+       fd_bo_new(compiler->dev, v->info.size, FD_BO_NOMAP,
+                 "%s:%s", ir3_shader_stage(v), v->name);
++   if (!v->bo)
++      return;
+ 
+    /* Always include shaders in kernel crash dumps. */
+    fd_bo_mark_for_dump(v->bo);
