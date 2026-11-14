@@ -1,0 +1,72 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index b225a9d..f578d03 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -353,6 +353,16 @@ struct sweet_surface_request_v0 {
+ #define SWEET_GPU_IMPORT_MAX            (64u << 20)     /* no surface of ours is bigger (828x1792x4 = 5.7 MiB) */
+ #define SWEET_GPU_IMPORT_LOG_ALL        96u             /* every 0x7e result is logged up to this many lines, */
+ #define SWEET_GPU_IMPORT_LOG_EVERY      256u            /* ... then one in this many (failures: one in 16) */
++/*
++ * 0113: pad of the 48-byte answer. SWEET_GPU_PLANE0 = the surface has planes and offset/rowBytes
++ * are its first plane's, a plane of 32-bit pixels (one element per pixel) as wide and as tall as
++ * the surface: 'b3a8', which CoreAnimation's GPU renderer creates for the screen and which this
++ * system's bridge draws into as 'BGRA' and SweetFramebuffer shows from plane 0 (0109
++ * AppleCLCD::present); its second plane (8-bit opacity) is read by nobody here. 0 = offset and
++ * rowBytes are the surface's own (every kernel before 0113, and surfaces without such a plane).
++ * The 40-byte layout has no pad and is answered as before.
++ */
++#define SWEET_GPU_PLANE0                0x504c3042u     /* 'PL0B' */
+ 
+ struct msm_timespec {
+ 	int64_t tv_sec;
+@@ -918,7 +928,7 @@ static void
+ sweet_gpu_import_log(const char *proc, bool failed, const char *fmt, ...)
+ {
+ 	uint64_t n = SWEET_STAT_ADD(gStatImportLogs, 1);
+-	char line[192];
++	char line[256];
+ 	va_list ap;
+ 
+ 	if (n >= SWEET_GPU_IMPORT_LOG_ALL &&
+@@ -958,6 +968,27 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 	req->pixelFormat = surface->pixelFormat;
+ 	req->planes = surface->planeCount;
+ 	req->pad = 0;
++	char planes[96] = "";
++	if (surface->planeCount > 0) {
++		const struct sweet_surface_plane *p0 = &surface->planes[0];
++		uint64_t end0 = (uint64_t)p0->offset + (uint64_t)p0->bytesPerRow * p0->height;
++		if (p0->bytesPerElement == 4 && p0->elementWidth == 1 && p0->elementHeight == 1 &&
++		    p0->width == surface->width && p0->height == surface->height &&
++		    p0->bytesPerRow >= surface->width * 4u && end0 <= surface->allocSize) {
++			req->offset = p0->offset;
++			req->rowBytes = p0->bytesPerRow;
++			req->pad = SWEET_GPU_PLANE0;
++		}
++		for (uint32_t i = 0, used = 0; i < surface->planeCount && i < 2 && used < sizeof(planes); i++) {
++			const struct sweet_surface_plane *p = &surface->planes[i];
++			int n = snprintf(planes + used, sizeof(planes) - used, ", p%u +0x%x bpr %u bpe %u %ux%u", i, p->offset,
++			    p->bytesPerRow, p->bytesPerElement, p->width, p->height);
++			if (n < 0) {
++				break;
++			}
++			used += (uint32_t)n;
++		}
++	}
+ 	if (surface->memory == NULL || surface->allocSize == 0) {
+ 		why = "no memory behind it";
+ 		ret = kIOReturnNotFound;
+@@ -972,10 +1003,10 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *req)
+ 		if (why != NULL) {
+ 			sweet_gpu_stat_event(&gStatImportFails);
+ 		}
+-		sweet_gpu_import_log(fProcName, why != NULL, "surface %u %s: %ux%u fmt 0x%x bpr %u planes %u size %u -> %s%s",
++		sweet_gpu_import_log(fProcName, why != NULL, "surface %u %s: %ux%u fmt 0x%x bpr %u planes %u%s size %u -> %s%s%s",
+ 		    id, describe ? "describe" : "import", surface->width, surface->height, surface->pixelFormat,
+-		    surface->bytesPerRow, surface->planeCount, surface->allocSize, why != NULL ? "REFUSED, " : "ok",
+-		    why != NULL ? why : "");
++		    surface->bytesPerRow, surface->planeCount, planes, surface->allocSize, why != NULL ? "REFUSED, " : "ok",
++		    why != NULL ? why : "", req->pad == SWEET_GPU_PLANE0 ? " (plane 0 described)" : "");
+ 		surface->release();
+ 		return ret;
+ 	}

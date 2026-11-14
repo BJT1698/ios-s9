@@ -345,3 +345,62 @@ write went elsewhere.
   **Risks:** first time the GPU writes RAM outside the carve-out (SMMU faults would show as SweetGPUFaults and
   `SWEET GPU` fault lines; a wrong PTE could hang the GPU -> backboardd restart); unmaps wait up to 200 ms for the
   BO's fence before the surface pages are released.
+- 2026-11-14 **G4f: 'b3a8' display surfaces drawn in place (written, not yet built or run).**
+  **Root cause (G4e log + code): the display surfaces are 'b3a8', and every layer refused 'b3a8'.** G4e (kernel 0112,
+  48-byte struct) still has `SweetGPUImports = 0`, no `SWEET GPU: import` line and no bridge `IOSurface N as GPU texture
+  memory` line after the 0112 fix, because the import was never even tried for the screen: backboardd's frame surfaces are
+  `IOSurface 2/3 ('b3a8' 828 x 1792, 3328 bytes a row)` (G4e 219.36 s / 219.44 s), not 'BGRA'. Three rejects in a row:
+  1. `op6/ca-bridge/eagl.c` `surface_mirrored()` and `surface_shared()` returned false for `image->deep` ('b3a8') before
+     calling `sweet_gl_surface_texture()` -> no EGLImage, no 0x7e, silent -> `target_to_surface()` glReadPixels every frame
+     ("1 picture copied out, 0 drawn in place", ~45 ms of 50-57 ms). (Same in ios-apollo's bridge: it never zero-copied 'b3a8' either.)
+  2. Mesa `osmesa_surface_resource()` (op6/mesa/patches/0001) accepted only `pixel_format == 'BGRA' && planes == 0`.
+  3. Kernel 0x7e describe reported the surface-level offset/rowBytes only (no plane-0 geometry).
+  Separately, `-attachImage: ... an IOSurface of 'b3a8': not done` (G4e 146.92 s, 146.99 s; textures 229/234) came from the
+  `deep` test asking IOSurface.framework's per-plane accessors (plane 0 bpe == 4, plane width/height == surface's), which
+  our kernel's lock result does not reliably feed (image_base() already avoids them: apollo boot 36 "0 bytes a row"); the
+  texture then had no storage and CoreAnimation's draws into its FBO failed: `glDrawElements: error 0x506` x2.
+  **'b3a8' layout here [V = from code/logs, I = inferred]:** Apple's kCVPixelFormatType_30RGBLE_8A_BiPlanar (plane 0 RGB
+  10:10:10 in 32-bit words, plane 1 8-bit alpha), but on this system plane 0 is **BGRA8**: the bridge draws it as a
+  blue-first 8-bit texture and SweetFramebuffer (0109 `AppleCLCD::present`/`presentScaled`) reads only `planes[0]`
+  (offset, bytesPerRow, bpe 4, 1x1 elements) and copies 4-byte pixels to the BGRA panel [V]; plane 1 is never read by the
+  scan-out [V] and stays as the kernel's bzero left it (opacity 0) - no consumer here needs it. Sizes for 828x1792
+  (SWEET SURF create, size 7454720): plane 0 = 3328 x 1792 = 5963776 at +0 [V: bpr 3328 logged, sizes add up exactly],
+  plane 1 = 832 x 1792 = 1490944 at +0x5b0000 (bpr 828 rounded to 64, 1 byte/pixel) [I; 0113's describe line prints it].
+  **Changes:**
+  - `op6/ca-bridge/eagl.c`: new `share_refused()` (one list of reasons for mirror/shared); 'b3a8' (deep) is allowed in both
+    -> the display path becomes: CA draws into its own texture, the GPU blits into an EGLImage texture over plane 0 of the
+    imported surface (`surface_mirrored`, "drawn in place"); glblit=0 renders into plane 0 directly. `deep` is now decided
+    from the surface's own numbers only (`'b3a8'`, bpr >= 4 x width, bpr x height <= alloc size). Refused attaches give the
+    texture BGRA storage of the surface's size (no more 0x506) and forget a stale image of that texture. `refusal()` says
+    every reason once per surface + format + path (`sweet-gl: IOSurface N ('fmt' W x H, B bytes a row, P planes, S bytes)
+    mirror|shared|shown|attach: not in place, <why>`; per format only for reasons common to all such surfaces: fmt-0
+    opacity-first pictures, shown-surface policy). Copy fallback unchanged and automatic.
+  - Mesa `op6/mesa/patches/0003-osmesa-planar-b3a8.patch` (after 0001): accepts 'b3a8' with 2 planes as a
+    B8G8R8A8 texture of plane 0 (offset/row_bytes from the kernel; whole surface is the BO); checks rows inside the
+    surface and 64-byte pitch; every refusal said once a surface in the kernel log via `sweet_drm_log()` (selector 0x7f):
+    `sweet-gl[backboardd]: mesa: IOSurface N not taken as GPU memory: <why> (fmt.. planes.. WxH, bpr at +off, size, ...)`.
+  - `op6/mesa/sweet-drm/`: `SWEET_DRM_PLANE0`, `SWEET_DRM_FORMAT_*`, `sweet_drm_log()`.
+  - Kernel `xnu/patches/0113-op6-gpu-import-planar-b3a8.patch` (SweetGPU.cpp only, optional): for a planar surface whose
+    plane 0 is 4 bytes/pixel, 1x1 elements, the surface's size, rows inside the allocation, the 48-byte 0x7e answer gives
+    plane 0's offset/rowBytes and `pad = 'PL0B'` (0x504c3042); else unchanged. Old userland ignores pad; the 40-byte layout
+    is answered as before. The describe log line gains `, p0 +0x0 bpr 3328 bpe 4 828x1792, p1 +0x5b0000 bpr 832 bpe 1 ...
+    (plane 0 described)`. The import still maps the surface's own pages (all planes, 1820 x 4K for 7454720 B); no
+    carve-out BO pages.
+  **Rebuild:** op6-mesa (libOSMesa with 0003 + sweet-drm, libsweet-gl with the new eagl.c) is required; the kernel with
+  0113 is optional (without it Mesa uses the surface offset 0 / bpr 3328, which is plane 0 for IOSurface.framework's layout,
+  the same assumption the copy path and image_base() already make).
+  **Expected on device:** bridge `-attachImage: texture T is IOSurface 2 ('b3a8' 828 x 1792, 3328 bytes a row): a texture,
+  copied into its memory by the GPU` (and 3), `IOSurface 2 as GPU texture memory (EGLImage): ok`; kernel `SWEET GPU: import
+  backboardd surface 2 describe: 828x1792 fmt 0x62336138 ... -> ok` then `import: ... -> handle H iova 0x2..., 1820 pages ...
+  mapped`; frame lines `0 pictures copied out, 1 drawn in place`, "copying out" ~0, frame time ~8-15 ms; `ioreg -l -c
+  SweetGPU`: `SweetGPUImports` >= 2, `SweetGPUImportFails` 0, `SweetGPUImportedKB` ~14560 (2 x 7280), `SweetGPUFaults` 0;
+  no `glDrawElements: error 0x506`; any remaining 'not done' now has its reason + plane dump.
+  **Test plan:** (1) op6-mesa run, install `lib/*` to /usr/local/lib on the G4e kernel, restart backboardd; check the lines
+  above (`dmesg | grep -e 'SWEET GPU: import' -e 'sweet-gl'`). (2) Kernel with 0113 -> boot-G4f.img, same ADT/boot-args:
+  describe line shows the planes and "(plane 0 described)". (3) Compare picture with `glcopy=1` (tearing/stale rows, colours:
+  red/blue swapped would mean plane 0 is not BGRA). (4) Snapshot-heavy UI (app switcher, Control Center) for 'not done' lines.
+  **Risks:** the GPU now writes backboardd's screen surfaces directly (SMMU faults -> SweetGPUFaults; a wrong offset/pitch ->
+  garbled screen: fall back with glcopy=1); per frame the kernel cleans the 7.1 MiB surface at the submit after each seed
+  change (~1-2 ms) and after the fence at present; plane 1 is not written (opacity 0) - harmless for our scan-out, but any
+  future consumer of 'b3a8' opacity (a real display engine plane, screenshots that composite plane 1) would see transparent
+  pixels; refused attaches now get empty storage (draws land in a texture nobody shows instead of failing).

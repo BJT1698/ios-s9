@@ -67,13 +67,25 @@ struct sweet_drm_surface {
 	uint64_t offset;
 	uint32_t row_bytes;
 	uint32_t width, height, pixel_format, planes;
-	uint32_t pad;
+	uint32_t pad;                   /* out: 0, or SWEET_DRM_PLANE0 (xnu 0113) */
 };
+/*
+ * pad == SWEET_DRM_PLANE0 (kernels with xnu 0113): the surface has planes and offset/row_bytes
+ * are its first plane's, 32-bit pixels as wide and as tall as the surface ('b3a8': the bridge
+ * draws that plane as 'BGRA' and the kernel's framebuffer shows it so). 0: offset/row_bytes are
+ * the surface's own (older kernels; for 'b3a8' surfaces made by IOSurface.framework plane 0
+ * starts there with those rows).
+ */
+#define SWEET_DRM_PLANE0                0x504c3042u     /* 'PL0B' */
+#define SWEET_DRM_FORMAT_BGRA           0x42475241u     /* 'BGRA' */
+#define SWEET_DRM_FORMAT_B3A8           0x62336138u     /* 'b3a8': plane 0 32-bit pixels, plane 1 8-bit opacity */
 #ifdef __cplusplus
 static_assert(sizeof(struct sweet_drm_surface) == 48, "selector 0x7e takes 48 bytes");
 #else
 _Static_assert(sizeof(struct sweet_drm_surface) == 48, "selector 0x7e takes 48 bytes");
 #endif
 int sweet_drm_surface(int fd, struct sweet_drm_surface *surface);
+/* A line into the kernel's log ("sweet-gl[<process>]: <text>", selector 0x7f of xnu 0111); quietly nothing without it. */
+void sweet_drm_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 #endif

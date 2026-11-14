@@ -676,6 +676,90 @@ bytes_a_pixel(GLenum format, GLenum type)
 }
 
 /*
+ * Why a surface is not drawn or read in place, said once for each surface, pixel format and
+ * reason (the last 64 kept) -- or once for each pixel format and reason, for reasons that hold
+ * for every surface of that kind (`every`: the many small pictures applications hand over). A
+ * copy every frame is otherwise silent. Returns whether it was said now. `how`: "mirror"
+ * (attachImage, the GPU copies the frame into the surface), "shared" (the texture is the
+ * surface's memory), "shown" (texImageIOSurface), "attach" (not taken at all).
+ */
+static bool refusal_of(IOSurfaceRef surface, const char *how, const char *why, bool every);
+
+static bool
+refusal(IOSurfaceRef surface, const char *how, const char *why)
+{
+	return refusal_of(surface, how, why, false);
+}
+
+static bool
+refusal_of(IOSurfaceRef surface, const char *how, const char *why, bool every)
+{
+	static struct {
+		uint32_t id, format;
+		char how[8], why[56];
+	} said[64];
+	static unsigned next;
+	uint32_t id = every ? 0 : IOSurfaceGetID(surface), format = IOSurfaceGetPixelFormat(surface);
+
+	for (unsigned i = 0; i < sizeof(said) / sizeof(said[0]); i++) {
+		if (said[i].id == id && said[i].format == format && strncmp(said[i].how, how, sizeof(said[i].how)) == 0 &&
+		    strncmp(said[i].why, why, sizeof(said[i].why) - 1) == 0) {
+			return false;
+		}
+	}
+	unsigned at = next++ % (sizeof(said) / sizeof(said[0]));
+	said[at].id = id;
+	said[at].format = format;
+	snprintf(said[at].how, sizeof(said[at].how), "%s", how);
+	snprintf(said[at].why, sizeof(said[at].why), "%s", why);
+	say("sweet-gl: IOSurface %u ('%.4s' %zu x %zu, %zu bytes a row, %zu planes, %zu bytes) %s: not in place, %s%s\n",
+	    IOSurfaceGetID(surface),
+	    (const char *)&(uint32_t){ __builtin_bswap32(format) }, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+	    IOSurfaceGetBytesPerRow(surface), IOSurfaceGetPlaneCount(surface), IOSurfaceGetAllocSize(surface), how, why,
+	    every ? " (said once for this pixel format)" : "");
+	return true;
+}
+
+/*
+ * What keeps an image's surface from being the GPU's memory (NULL: nothing here; the library
+ * may still refuse). mirror: as the surface the GPU copies a frame into (surface_mirrored());
+ * otherwise as the texture itself (surface_shared()). A 'b3a8' surface (image->deep) is its first
+ * plane, 32-bit blue-first pixels from the surface's start in the surface's rows (image_base()),
+ * which libOSMesa takes as such (op6/mesa/patches/0003) and the kernel's framebuffer shows.
+ */
+static const char *
+share_refused(const struct image *image, bool mirror)
+{
+	IOSurfaceRef surface = image->surface;
+
+	if (!share_surfaces) {
+		return "boot-arg glcopy=1";
+	}
+	if (mirror && !blit_targets) {
+		return "boot-arg glblit=0 (the texture is to be the surface itself)";
+	}
+	if (mirror && !image->target) {
+		return "not drawn into";
+	}
+	if (!mirror && image->invert) {
+		return "drawn or shown upside down (a copy turns it)";
+	}
+	if (image->alpha_first) {
+		return "no pixel format: opacity-first memory (no GPU format reads it as it is)";
+	}
+	if (image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE) {
+		return "not 32-bit blue-first pixels";
+	}
+	if (image->plane != 0) {
+		return "a plane other than the first";
+	}
+	if ((size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
+		return "the texture is not the whole surface";
+	}
+	return NULL;
+}
+
+/*
  * For a surface drawn into (blit_targets): a second texture that is the surface's memory, for the
  * frame to be copied into by the GPU; the texture CoreAnimation draws into stays the library's own.
  * The texture that is bound is bound again after.
@@ -684,11 +768,11 @@ static bool
 surface_mirrored(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
+	const char *why = share_refused(image, true);
 	GLint bound = 0;
 
-	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first || image->deep ||
-	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
-	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
+	if (why != NULL) {
+		refusal_of(surface, "mirror", why, image->alpha_first);
 		return false;
 	}
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
@@ -698,6 +782,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 		glDeleteTextures(1, &image->mirror);
 		image->mirror = 0;
+		refusal(surface, "mirror", "the GPU library refused it (see its 'mesa:' and the kernel's 'SWEET GPU: import' lines)");
 		return false;
 	}
 	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
@@ -713,12 +798,13 @@ static bool
 surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
+	const char *why = share_refused(image, false);
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->deep || image->format != GL_BGRA ||
-	    image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
-	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !sweet_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	if (why == NULL && !sweet_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+		why = "the GPU library refused it (see its 'mesa:' and the kernel's 'SWEET GPU: import' lines)";
+	}
+	if (why != NULL) {
+		refusal_of(surface, "shared", why, image->alpha_first);
 		e->refused++;
 		return false;
 	}
@@ -4595,6 +4681,9 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	began = now_us();
+	if (!share_shown) {
+		refusal_of(surface, "shown", "copied by policy (the GPU could see stale pixels: boot-arg glshareshown=1 to try)", true);
+	}
 	if (!share_shown || !surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */
 		surface_to_texture(e, image);
@@ -4615,6 +4704,8 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	uint32_t pixels;
 	uint64_t began;
 	bool plain, deep;
+	size_t wide, high, row;
+	const char *why = NULL;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -4624,6 +4715,9 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
+	wide = IOSurfaceGetWidth(surface);
+	high = IOSurfaceGetHeight(surface);
+	row = IOSurfaceGetBytesPerRow(surface);
 	plain = (pixels == 'BGRA' || pixels == 0) && IOSurfaceGetBytesPerElement(surface) == 4 &&
 	    IOSurfaceGetPlaneCount(surface) == 0;
 	/*
@@ -4634,17 +4728,59 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	 * other, and the frame goes into the first plane as those bytes: the one who reads that
 	 * plane is the kernel's framebuffer, which takes it as 'BGRA' (xnu 0115). The opacity plane
 	 * is left alone (the screen has no use for it).
+	 *
+	 * Only the surface's own numbers are asked: its first plane starts at the surface's start in
+	 * the surface's rows (xnu 0046 lays it out so; 0113 tells libOSMesa the same), and
+	 * IOSurface.framework's plane accessors are not to be trusted with our kernel (see
+	 * image_base()). Asking them (plane 0 4 bytes an element, as wide and tall as the surface)
+	 * refused some of the 'b3a8' surfaces CoreAnimation draws into (G4e: "an IOSurface of 'b3a8':
+	 * not done", then glDrawElements 0x506 into the texture it had no storage for).
 	 */
-	deep = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2 && IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4 &&
-	    IOSurfaceGetWidthOfPlane(surface, 0) == IOSurfaceGetWidth(surface) &&
-	    IOSurfaceGetHeightOfPlane(surface, 0) == IOSurfaceGetHeight(surface);
+	deep = pixels == 'b3a8' && wide > 0 && high > 0 && row >= wide * 4 &&
+	    row % 4 == 0 && row * high <= IOSurfaceGetAllocSize(surface);
 	if (IOSurfaceGetPlaneCount(surface) > 0 && attached < 4) {
 		say_planes(surface);
 	}
-	if (target != GL_TEXTURE_2D || texture == 0 || !(plain || deep) ||
-	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
-		say("sweet-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
-		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
+	if (target != GL_TEXTURE_2D) {
+		why = "a target other than GL_TEXTURE_2D";
+	} else if (texture == 0) {
+		why = "no texture bound";
+	} else if (pixels == 'b3a8' && !deep) {
+		why = "'b3a8' whose first plane is not 32-bit rows of the surface's size inside it";
+	} else if (!(plain || deep)) {
+		why = pixels == 'BGRA' || pixels == 0 ? "not 4 bytes a pixel in one plane" : "a pixel format drawn here only as 'BGRA' or 'b3a8'";
+	} else if ((image = image_new(e, (GLuint)texture, surface)) == NULL) {
+		why = "no room for more textures with IOSurfaces";
+	}
+	if (why != NULL) {
+		if (refusal(surface, "attach", why)) {
+			say("sweet-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
+			    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
+			if (IOSurfaceGetPlaneCount(surface) > 0) {
+				say_planes(surface);
+			}
+		}
+		/*
+		 * CoreAnimation draws into the texture all the same: give it storage of the surface's size,
+		 * so its framebuffer is complete and those draws are not errors (0x506 in G4e). What is
+		 * drawn stays in the texture; the surface is not changed. (A surface the texture had before is
+		 * no longer its own: forgotten, so no frame is copied into it.)
+		 */
+		if (target == GL_TEXTURE_2D && texture != 0 && image_of(e, (GLuint)texture) != NULL &&
+		    image_of(e, (GLuint)texture)->surface != surface) {
+			image_forget(e, (GLuint)texture);
+		}
+		if (target == GL_TEXTURE_2D && texture != 0 && wide > 0 && high > 0 && wide <= 8192 && high <= 8192) {
+			GLint unpack = 0;
+
+			group_forget(e, (GLuint)texture);
+			glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
+			if (unpack == 0) {
+				glTexImage2D(GL_TEXTURE_2D, 0, (GLint)GL_BGRA, (GLsizei)wide, (GLsizei)high, 0, GL_BGRA, GL_UNSIGNED_BYTE,
+				    NULL);
+			}
+		}
+		eagl_leave(e, 0x970);
 		return NO;
 	}
 	image->target = true;

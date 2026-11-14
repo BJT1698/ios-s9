@@ -11,6 +11,8 @@
  * (Copyright (c) 2026 Leo Malik / dipa-studio, MIT License).
  */
 #include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <mach/mach.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +48,7 @@ extern kern_return_t IOConnectUnmapMemory64(io_connect_t connect, uint32_t memor
 #define SWEET_GPU_SERVICE       "SweetGPU"
 #define SWEET_GPU_SURFACE       0x7e
 #define SWEET_GPU_DESCRIBE      0xffffffffu
+#define SWEET_GPU_LOG           0x7f
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -211,6 +214,32 @@ sweet_drm_surface(int fd, struct sweet_drm_surface *surface)
 		return -1;
 	}
 	return 0;
+}
+
+void
+sweet_drm_log(const char *format, ...)
+{
+	static int unsupported;
+	char line[512];
+	va_list ap;
+	int n;
+
+	if (connection == 0 || unsupported) {
+		return;
+	}
+	va_start(ap, format);
+	n = vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if ((size_t)n >= sizeof(line)) {
+		n = (int)sizeof(line) - 1;
+	}
+	/* (a kernel without 0111 answers kIOReturnUnsupported: then never again) */
+	if (IOConnectCallStructMethod(connection, SWEET_GPU_LOG, line, (size_t)n, NULL, NULL) == kIOReturnUnsupported) {
+		unsupported = 1;
+	}
 }
 
 int

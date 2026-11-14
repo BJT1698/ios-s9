@@ -121,7 +121,8 @@ sweet_gl_surface_texture(struct sweet_gl *gl, uint32_t surface)
 	 * Every result into the log for the first 32, then one in 256 (one in 16 refused): with the
 	 * kernel's "SWEET GPU: import" lines (xnu 0112) this tells where a surface stopped. A
 	 * refusal after the kernel's "describe ... ok" and no "import" line is Mesa's
-	 * (osmesa_surface_resource: not 'BGRA' / planes, or freedreno's pitch or size checks).
+	 * (osmesa_surface_resource: neither 'BGRA' nor 'b3a8', rows, or freedreno's checks), which
+	 * Mesa says once a surface itself: "sweet-gl[...]: mesa: IOSurface N not taken ..." (op6/mesa/patches/0003).
 	 */
 	static unsigned tried, refused;
 	tried++;

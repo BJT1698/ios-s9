@@ -1,0 +1,97 @@
+Mesa 25.0.7 (after 0001): an IOSurface of CoreAnimation's 'b3a8' kind (two planes: 32-bit
+pixels, then 8-bit opacity) is a texture of its first plane's memory, as a 'BGRA' surface of
+one plane is: CoreAnimation's GPU renderer makes the screen 'b3a8', the bridge draws that plane
+as 'BGRA' and the kernel's framebuffer shows it so (xnu 0109). With xnu 0113 the kernel says
+where the first plane is (pad = SWEET_DRM_PLANE0); older kernels give the surface's own
+offset and rows, which is where IOSurface.framework puts plane 0. Each refusal is said once a
+surface in the kernel's log (sweet_drm_log, selector 0x7f). ios-op6, MIT.
+
+diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+index 18695fd..fd58e04 100644
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -71,10 +71,39 @@ osmesa_create_gpu_screen(void)
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
+ 
++#ifdef GALLIUM_FREEDRENO
++/*
++ * Why a surface is not the texture's memory, into the kernel's log (sweet-drm, selector 0x7f):
++ * once for each surface and reason among the last 32, so a refusal is said once, not each frame.
++ */
++static void
++osmesa_surface_refused(uint32_t surface, const char *why, const struct sweet_drm_surface *s)
++{
++   static struct { uint32_t surface; const char *why; } said[32];
++   static unsigned next;
++
++   for (unsigned i = 0; i < ARRAY_SIZE(said); i++) {
++      if (said[i].surface == surface && said[i].why == why)
++         return;
++   }
++   said[next % ARRAY_SIZE(said)].surface = surface;
++   said[next % ARRAY_SIZE(said)].why = why;
++   next++;
++   sweet_drm_log("mesa: IOSurface %u not taken as GPU memory: %s (fmt 0x%x planes %u, %ux%u, %u bytes a row at +%llu, "
++                 "%llu bytes, %s)", surface, why, s->pixel_format, s->planes, s->width, s->height, s->row_bytes,
++                 (unsigned long long)s->offset, (unsigned long long)s->size,
++                 s->pad == SWEET_DRM_PLANE0 ? "plane 0 by the kernel" : "the surface's own rows");
++}
++#endif
++
+ /*
+  * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
+  * the kernel's GPU driver makes a buffer of the surface. NULL: the screen is not the GPU's, or
+- * the surface is not one plane of 32-bit pixels, blue first, in rows the GPU can address.
++ * the surface is not 32-bit pixels, blue first, in rows the GPU can address: a 'BGRA' surface
++ * of one plane, or the first plane of a 'b3a8' one (CoreAnimation's GPU renderer makes the
++ * screen 'b3a8'; this system's bridge draws that plane as 'BGRA', the kernel's framebuffer
++ * shows it so, and the second plane, 8-bit opacity, is left as it is: the buffer covers the
++ * whole surface, the texture only the first plane).
+  */
+ struct pipe_resource *
+ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+@@ -89,11 +118,29 @@ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+       .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+    };
+    struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
++   struct pipe_resource *resource;
+ 
+-   if (gpu_fd < 0 || sweet_drm_surface(gpu_fd, &s) != 0)
++   if (gpu_fd < 0)
++      return NULL;
++   if (sweet_drm_surface(gpu_fd, &s) != 0) {
++      osmesa_surface_refused(surface, "the kernel does not describe it", &s);
++      return NULL;
++   }
++   if (!(s.pixel_format == SWEET_DRM_FORMAT_BGRA && s.planes == 0) &&
++       !(s.pixel_format == SWEET_DRM_FORMAT_B3A8 && s.planes == 2)) {
++      osmesa_surface_refused(surface, "neither 'BGRA' of one plane nor 'b3a8' of two", &s);
+       return NULL;
+-   if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0)
++   }
++   if (s.width == 0 || s.height == 0 || s.row_bytes < (uint64_t)s.width * 4 ||
++       s.offset + (uint64_t)s.row_bytes * s.height > s.size) {
++      osmesa_surface_refused(surface, "its rows are not inside it", &s);
++      return NULL;
++   }
++   if (s.row_bytes % 64 != 0) {
++      /* (fd_resource_from_handle: a6xx rows are 64-byte aligned) */
++      osmesa_surface_refused(surface, "rows not a multiple of 64 bytes", &s);
+       return NULL;
++   }
+    /* (the surface comes in as Linux's buffers come in by file descriptor: see sweet-drm) */
+    templ.width0 = s.width;
+    templ.height0 = s.height;
+@@ -101,7 +148,10 @@ osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
+    handle.stride = s.row_bytes;
+    handle.offset = s.offset;
+    handle.size = s.size;
+-   return screen->resource_from_handle(screen, &templ, &handle, 0);
++   resource = screen->resource_from_handle(screen, &templ, &handle, 0);
++   if (!resource)
++      osmesa_surface_refused(surface, "freedreno refused the buffer (the kernel's import: see 'SWEET GPU: import')", &s);
++   return resource;
+ #else
+    return NULL;
+ #endif
