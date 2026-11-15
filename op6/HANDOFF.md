@@ -168,6 +168,15 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - `boot-G4g-192.img` restored and verified.
 - **Next:** GPU IRQs (G5); wallpaper; real battery level; daemon trim; booting without the PC (flash `boot-G4g-192.img` to boot_b, after asking the user).
 
+## 5d. App extensions & wallpaper (`amfi-0119`, host-verified only)
+
+- **Problem:** widgets and wallpaper are black (`ioreg -l | grep -c AppleMobileFileIntegrity` = 0). `ExtensionFoundation` queries `AppleMobileFileIntegrity` selector `6` (trust-cache query) before reading the signed extension point cache, and `installd` waits 5 s per bundle when `/chosen/mac-address-wifi0` is missing.
+- **Fixes (ported from `ios-flame`, MIT):**
+  - `xnu/patches/0119-op6-amfi-trust-query.patch` (mirrored in `op6/xnu-patches/`): adds `iokit/Kernel/arm/SweetAMFI.cpp`, publishing `AppleMobileFileIntegrity` + `AppleMobileFileIntegrityUserClient` where selector `6` answers `kIOReturnSuccess` (trusted) and other selectors log once and return `kIOReturnUnsupported`. Boot-arg `sweetamfi=0` disables it.
+  - `op6/tools/mkadt-op6.py`: emits `/chosen/mac-address-{wifi0,bluetooth0,ethernet0}` (`02:4f:50:36:00:01..03`, 6-byte data, default on).
+  - `op6/phone-tools/`: ports `lsreg.m` (+ `lsreg-ents.plist`), `oslog.m` (+ `oslog-ents.plist`), `exq.m`, and `build.sh`, built into `out/bin/` by `.github/workflows/op6-mesa.yml`.
+- **On-device procedure (after CI `xnu` + `op6-mesa` builds):** rebuild ADT with `mkadt-op6.py` + kernel with `0119`, boot the image, install `lsreg`/`oslog`/`exq` to `/var/local/bin/`, run `lsreg -r` once (LaunchServices database persists on `userdata`), check `exq` (expect hundreds of extension records and `com.apple.posterkit.provider` providers instead of ~0-1), then reboot so `PosterBoard` / `chronod` pick up the rebuilt database.
+
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
 - **G4:** EAGL bridge inside backboardd (`libsweet-gl.dylib` + `libsweet-ca.dylib` + kernel selector `0x7e` IOSurface import), so that CoreAnimation renders through Mesa on the Adreno 630. Read `s9/ESTUDO-2026-10-25-gpu.md` section 2.

@@ -223,6 +223,15 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # MobileGestalt's WiFi/Bluetooth/Ethernet addresses: without them each
+        # WifiAddress answer waits 5 s for an IONetworkController (sdio, wlan,
+        # marconi-wifi) that never comes, and the old-style UniqueDeviceID needs
+        # it: installd then takes 5 s per bundle, LaunchServices never finishes
+        # registering extensions, and PosterBoard (no poster providers) asserts:
+        # black wallpaper. Locally administered addresses ('OP6'), not the phone's.
+        ('mac-address-wifi0', bytes([0x02, 0x4f, 0x50, 0x36, 0x00, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x4f, 0x50, 0x36, 0x00, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x4f, 0x50, 0x36, 0x00, 0x03])),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel

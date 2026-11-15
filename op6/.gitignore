@@ -1,2 +1,3 @@
 # generated firmware headers (Qualcomm proprietary; tools/gpu-fw-embed*.py)
 shim/fw_a630_*.h
+phone-tools/out/

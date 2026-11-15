@@ -78,6 +78,15 @@ jobs:
           du -sh out/dSYM/libOSMesa.8.dylib.dSYM out/dSYM/libbgair.dylib.dSYM
           mkdir -p out/meta
           cp mesa-work/meta/gl.xml mesa-work/meta/exported-gl.txt out/meta/
+      - name: Build phone-tools (lsreg, oslog, exq)
+        run: |
+          set -eux
+          bash op6/phone-tools/build.sh out/bin
+          file out/bin/lsreg out/bin/oslog out/bin/exq
+          otool -L out/bin/lsreg out/bin/oslog out/bin/exq
+      - name: Checksum artifact
+        run: |
+          set -eux
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:

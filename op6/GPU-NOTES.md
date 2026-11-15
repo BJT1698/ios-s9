@@ -635,3 +635,19 @@ Goal G6b makes `MTLCreateSystemDefaultDevice()` return our `CHLDevice` (`BGMTLDe
   - `kern.sweet_next_boot`: `0` = normal boot, `1` = recovery, `2` = bootloader/fastboot.
   - Plain `reboot` (without changing `kern.sweet_next_boot`) resets via PSCI `SYSTEM_RESET`; `halt` / `shutdown -h now` powers off via PSCI `SYSTEM_OFF`.
 - **Verified locally (host):** `git apply --check` clean against reconstructed `xnu-8796.141.3` + `0000..0117`; `clang`/`clang++ --target=arm64-apple-darwin -fsyntax-only -Wall -Wextra -Werror` clean (0 errors, 0 warnings) on `sweet_spmi.c`, `SweetPlatformExpert.cpp`, and the `panic_init()` snippet with XNU stub headers (both with and without `-DARM64_BOARD_CONFIG_SWEET`). Not yet built in XNU CI or tested on device.
+
+## 2026-11-15 — App Extensions & Wallpaper: AMFI Trust Query (`0119`) + `/chosen` MACs + `op6/phone-tools` (branch `amfi-0119`, host-verified only — not yet built/tested on device)
+
+- **Problem (device-verified):** widgets and wallpaper stay black under Metal G6b; no `.appex` extension launches and `ioreg -l | grep -c AppleMobileFileIntegrity` = `0`. Two causes (matching `ios-flame`):
+  1. `ExtensionFoundation` (`+[NSDictionary _EX_dictionaryWithSignedURL:]`) queries `IOService` `"AppleMobileFileIntegrity"` user client selector `6` (trust-cache query for a cdhash) before reading the signed extension point cache; without it sandboxed `lsd` gets no cache, `MobileInstallation` rejects every `.appex`, and `LaunchServices` registers ~no extensions.
+  2. `installd` waits 5 s per bundle because `MobileGestalt` reads `IODeviceTree:/chosen` `mac-address-wifi0` (otherwise waiting 5 s for an `IONetworkController`).
+- **Changes (ported from `ios-flame`, MIT):**
+  - **Kernel (`xnu/patches/0119-op6-amfi-trust-query.patch`, mirrored in `op6/xnu-patches/`):** adds `iokit/Kernel/arm/SweetAMFI.cpp` (compiled via `iokit/conf/files.arm64` and matched on `IOResources` in `iokit/KernelConfigTables.cpp` right after `SweetGPU`). `AppleMobileFileIntegrity` sets `IOUserClientClass = "AppleMobileFileIntegrityUserClient"`, registers the service, and answers selector `6` with `kIOReturnSuccess` (logging once per selector; other selectors `< 32` log once and return `kIOReturnUnsupported`). Boot-arg `sweetamfi=0` disables the service (`probe()` returns `NULL`). No clash with `0025`/`0035` (`sweet_amfi.c` / `SweetEntitlements.cpp` define no `AppleMobileFileIntegrity` IOKit class).
+  - **ADT (`op6/tools/mkadt-op6.py`):** emits `/chosen/mac-address-wifi0` (`02:4f:50:36:00:01`), `mac-address-bluetooth0` (`02:4f:50:36:00:02`), and `mac-address-ethernet0` (`02:4f:50:36:00:03`) as 6-byte locally administered addresses by default.
+  - **Phone tools (`op6/phone-tools/` + `.github/workflows/op6-mesa.yml`):** ports `lsreg.m` (+ `lsreg-ents.plist`), `oslog.m` (+ `oslog-ents.plist`), `exq.m`, and `build.sh`; `op6-mesa.yml` builds and ad-hoc signs them with entitlements (`codesign`) into `out/bin/` in the `op6-mesa` artifact.
+- **On-device procedure (once `xnu` with `0119` and `op6-mesa` are built by CI):**
+  1. Rebuild the ADT with `op6/tools/mkadt-op6.py` (includes `/chosen/mac-address-*`), package the `0119` kernel payload, and boot the device (keep `sweetmetal=1`, `sweetgpu=2`; add `sweetamfi=0` only to disable).
+  2. Install `lsreg`, `oslog`, `exq` from `op6-mesa` `bin/` into `/var/local/bin/` on the phone (`chmod 755`).
+  3. Run `lsreg -r` once over SSH to rebuild the LaunchServices databases (the rebuilt database persists on `userdata`).
+  4. Run `exq` (and `EXQ_POINTS=1 exq`) to verify LaunchServices extension record count and `com.apple.posterkit.provider` results (expect hundreds of extension records, vs ~0-1 before).
+  5. Reboot so `PosterBoard` / `chronod` / `SpringBoard` start with the populated extension database (and `PosterBoard` + poster `.appex` plugins can use Metal via `/var/local/op6-mtl-clients`).
