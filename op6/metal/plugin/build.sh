@@ -36,7 +36,7 @@ rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE"
 
 # shellcheck disable=SC2086
-"$CC" -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+$CC -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
    -bundle -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations \
    -I"$HERE/../../mesa/air" \
    $RENAME \
