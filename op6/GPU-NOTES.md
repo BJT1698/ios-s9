@@ -651,3 +651,13 @@ Goal G6b makes `MTLCreateSystemDefaultDevice()` return our `CHLDevice` (`BGMTLDe
   3. Run `lsreg -r` once over SSH to rebuild the LaunchServices databases (the rebuilt database persists on `userdata`).
   4. Run `exq` (and `EXQ_POINTS=1 exq`) to verify LaunchServices extension record count and `com.apple.posterkit.provider` results (expect hundreds of extension records, vs ~0-1 before).
   5. Reboot so `PosterBoard` / `chronod` / `SpringBoard` start with the populated extension database (and `PosterBoard` + poster `.appex` plugins can use Metal via `/var/local/op6-mtl-clients`).
+
+## 2026-11-15 — High GPU BO Pool Above XNU Span (`xnu/patches/0120-op6-gpu-bo-pool-high.patch`, branch `gpu-pool-0120`, host-verified only)
+
+- **Problem (measured on device 2026-11-15):** With Metal active across processes, the 192 MiB low GPU carve-out (`--gpu-dma 0xa0000000,0x0c000000`, below the XNU span `[0xae000000, 0x180000000)`) exhausts and fragments (`GEM_NEW backboardd 3145728 bytes ... REFUSED (#5120): carve-out fragmented ... used 178592 KiB, free 14400 KiB, largest free 2048 KiB`), stuttering the compositor and starving widgets.
+- **What (`xnu/patches/0120-op6-gpu-bo-pool-high.patch` + `op6/xnu-patches/` mirror + `op6/tools/mkadt-op6.py`):**
+  - Optional `/sweet-gpu` ADT property `bo-dma` (`u64 PA, u64 SIZE`; default `0x180000000,0x40000000` = 1 GiB in free RAM `[0x180000000, 0x27c000000)` above the XNU span). When present, all `GEM_NEW` user BOs allocate from `bo-dma` (mapped Normal-NC via `ml_io_map_unmappable` + `kIOWriteCombineCache` for user tasks); GMU memory, firmware, rings, and SMMU page tables stay in low `dma-region`.
+  - GPU BO IOVA window moves to `0x80000000+` (`2 * bo_size` when low `dma-region` fits the scaled L2/L3 page-table pool, else `1 * bo_size`), managed by a coalescing `va_pool` shared with surface VA (`VA_SURF_BASE..0x80000000`).
+  - Dynamic 16 KiB-unit bitmap (`kalloc_data`) + `va_pool` free list (`kalloc_data`) with best-fit contiguous scan and non-contiguous 16 KiB segment fallback (`pt_map` page-by-page on GPU side, `IOMemoryDescriptor::withAddressRanges` on CPU side; 16 KiB minimum granularity required by XNU `populateDevicePager`). `SWEET_GPU_MAX_BOS` raised to `4096`. `SweetGPUCarve*KB` / init log report the BO pool.
+  - SMMU `CB_TCR2.PASize = 1` (36-bit PA = 64 GiB) and `PTE_ADDR`/`ats()` already cover `0x27c000000`; `smmu_probe()` also logs `S_IDR2`.
+- **How to disable:** Pass `--gpu-bo none` to `op6/tools/mkadt-op6.py` to omit `bo-dma`; the kernel then falls back to `dma-region` for BOs identically to `0119`.

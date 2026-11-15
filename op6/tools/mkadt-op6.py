@@ -142,10 +142,11 @@ GPU_FW = [
     ('zap-firmware', 'a630_zap.mbn', '9780956733759d24740b3df5bd804e5dddc48bc0e956271b0288631890080df9'),
 ]
 GPU_DMA = (0xa0000000, 0x1000000)   # below dram-base, in the scan's free [0xa0000000,0xac000000)
+GPU_BO = (0x180000000, 0x40000000)   # 1 GiB high BO pool above the XNU span (xnu 0120)
 
 
-def gpu_node(fw_dir, dma, phys_base, top, ph):
-    """/sweet-gpu: firmware blobs + carve-out (sweet_gpu.c setup())."""
+def gpu_node(fw_dir, dma, bo, phys_base, top, ph):
+    """/sweet-gpu: firmware blobs + carve-out + optional high BO pool (sweet_gpu.c setup())."""
     pa, size = dma
     if pa & 0xffff or size & 0xffff or not 0x800000 <= size <= 0x10000000:
         raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: 64 KiB aligned, 8..256 MiB '
@@ -154,6 +155,16 @@ def gpu_node(fw_dir, dma, phys_base, top, ph):
         raise SystemExit(f'gpu-dma {pa:#x},{size:#x}: must stay inside the free [0xa0000000,0xac000000)')
     if pa < top and pa + size > phys_base:
         raise SystemExit(f'gpu-dma {pa:#x},{size:#x} overlaps the XNU span {phys_base:#x}-{top:#x}')
+    if bo is not None:
+        bpa, bsize = bo
+        if bpa & 0x1fffff or bsize & 0x1fffff or bsize < 0x200000:
+            raise SystemExit(f'gpu-bo {bpa:#x},{bsize:#x}: must be 2 MiB aligned and >= 2 MiB')
+        if bpa < 0xf6000000 or bpa + bsize > 0x27c000000:
+            raise SystemExit(f'gpu-bo {bpa:#x},{bsize:#x}: must stay inside [0xf6000000,0x27c000000)')
+        if bpa < top and bpa + bsize > phys_base:
+            raise SystemExit(f'gpu-bo {bpa:#x},{bsize:#x} overlaps the XNU span {phys_base:#x}-{top:#x}')
+        if bpa < pa + size and bpa + bsize > pa:
+            raise SystemExit(f'gpu-bo {bpa:#x},{bsize:#x} overlaps gpu-dma {pa:#x},{size:#x}')
     props = [ph()]
     for prop, name, sha in GPU_FW:
         data = open(os.path.join(fw_dir, name), 'rb').read()
@@ -161,11 +172,13 @@ def gpu_node(fw_dir, dma, phys_base, top, ph):
             raise SystemExit(f'{name}: sha256 differs from op6/GPU-NOTES.md sec. 4 (wrong file / OEM zap?)')
         props.append((prop, data + b'\0' * (-len(data) & 3)))
     props.append(('dma-region', u64(pa, size)))
+    if bo is not None:
+        props.append(('bo-dma', u64(*bo)))
     return node('sweet-gpu', props)
 
 
 def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22ap=D22AP_ADT,
-          gpu_fw=None, gpu_dma=GPU_DMA):
+          gpu_fw=None, gpu_dma=GPU_DMA, gpu_bo=GPU_BO):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     mem_size = top - phys_base
     holes = ram_holes(phys_base, top)
@@ -365,7 +378,7 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]) +
-       ([gpu_node(gpu_fw, gpu_dma, phys_base, top, ph)] if gpu_fw else []))
+       ([gpu_node(gpu_fw, gpu_dma, gpu_bo, phys_base, top, ph)] if gpu_fw else []))
 
 
 if __name__ == '__main__':
@@ -380,10 +393,22 @@ if __name__ == '__main__':
     ap.add_argument('--d22ap', default=D22AP_ADT, help='D22AP device tree extracted from the iPhone X IPSW')
     ap.add_argument('--gpu-fw', metavar='DIR', help='a630_gmu.bin/a630_sqe.fw/a630_zap.mbn -> /sweet-gpu (xnu 0107)')
     ap.add_argument('--gpu-dma', default='%#x,%#x' % GPU_DMA, help='GPU carve-out PA,SIZE (outside the span)')
+    ap.add_argument('--gpu-bo', default='%#x,%#x' % GPU_BO,
+                    help='GPU BO pool PA,SIZE or "none" (default %#x,%#x when --gpu-fw is given; xnu 0120)' % GPU_BO)
     a = ap.parse_args()
-    dma = tuple(int(x, 0) for x in a.gpu_dma.split(','))
+    dma_parts = [int(x, 0) for x in a.gpu_dma.split(',')]
+    if len(dma_parts) != 2:
+        raise SystemExit(f'bad --gpu-dma {a.gpu_dma!r}: expected PA,SIZE')
+    dma = tuple(dma_parts)
+    if a.gpu_bo.lower() == 'none':
+        bo = None
+    else:
+        bo_parts = [int(x, 0) for x in a.gpu_bo.split(',')]
+        if len(bo_parts) != 2:
+            raise SystemExit(f'bad --gpu-bo {a.gpu_bo!r}: expected PA,SIZE or "none"')
+        bo = tuple(bo_parts)
     root = build(qemu=a.qemu, scale=2 if a.scale2 else 3, phys_base=a.phys_base, top=a.mem_top, d22ap=a.d22ap,
-                 gpu_fw=a.gpu_fw, gpu_dma=dma)
+                 gpu_fw=a.gpu_fw, gpu_dma=dma, gpu_bo=bo)
     blob = adt.serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:

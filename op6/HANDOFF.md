@@ -182,6 +182,14 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - **Wallpaper:** the default 7400 was "not compatible": the OP6 logical screen class is `414w-896h@2x~iphone`, the iPhone X bundles are `375w-812h@3x`. `op6/tools/op6-wallpaper-class.sh` (PC, idempotent) clones the 375x812@3x bundles under the OP6 class (same aspect). ADT also gets `platform-name t8015` and `/arm-io soc-generation H10` + `chip-revision` (D22AP values; MobileGestalt HardwarePlatform/soc-generation errors gone). Wallpaper visible on screen.
 - **Automatic reboot to fastboot (0118 + 0090):** `sysctl -w kern.sweet_next_boot=1; reboot`. On the OP6 use **1**, not 2: 0090 picks reason shift 2 from PON subtype 0x04, but the pm8998 wants shift 1 (Linux `qcom,pm8998-pon`), so bootloader (2<<1) = `0x04` = what value 1 writes. With 2 (`0x08`) ABL boots `boot_b` (old pmOS kernel). TODO: fix the shift in 0090 for the OP6.
 
+## 5e. High GPU BO pool (`gpu-pool-0120`, host-verified only — not yet built/tested on device)
+
+- **Problem (device-measured 2026-11-15):** With Metal enabled on all processes, the 192 MiB low carve-out (`--gpu-dma 0xa0000000,0x0c000000`) exhausted/fragmented (`5120` refused `GEM_NEW`s).
+- **Changes:**
+  - `xnu/patches/0120-op6-gpu-bo-pool-high.patch` (mirrored in `op6/xnu-patches/`): adds optional `/sweet-gpu` `bo-dma` (`u64 PA, u64 SIZE`) for all `GEM_NEW` BOs while keeping GMU/FW/rings/page tables in low `dma-region`. Scales the GPU page-table pool (`L2`+`L3`) and allocates the 16 KiB-unit BO bitmap + `bo_va_pool` via `kalloc_data`, moves high BO GPU IOVAs to `0x80000000+`, uses best-fit contiguous + non-contiguous 16 KiB segment fallback (`withAddressRanges` + `kIOWriteCombineCache`), raises `SWEET_GPU_MAX_BOS` to `4096`, keeps `SweetGPUCarve*KB` reporting the BO pool, and logs both regions at init.
+  - `op6/tools/mkadt-op6.py`: adds `--gpu-bo PA,SIZE` (default `0x180000000,0x40000000` when `--gpu-fw` is set), validated 2 MiB-aligned inside `[0xf6000000, 0x27c000000)` and disjoint from `[phys_base, top)` and `--gpu-dma`.
+- **How to disable:** Rebuild the ADT with `--gpu-bo none` (`bo-dma` omitted; kernel falls back to low `dma-region`).
+
 ## 6. What comes next (GPU-XNU-PLAN.md)
 
 - **G4:** EAGL bridge inside backboardd (`libsweet-gl.dylib` + `libsweet-ca.dylib` + kernel selector `0x7e` IOSurface import), so that CoreAnimation renders through Mesa on the Adreno 630. Read `s9/ESTUDO-2026-10-25-gpu.md` section 2.

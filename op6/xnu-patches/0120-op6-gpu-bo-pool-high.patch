@@ -1,0 +1,939 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -55,6 +55,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm/protos.h>
++#include <kern/kalloc.h>
+ #include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -73,8 +74,15 @@ struct sweet_gpu_result {
+ int sweet_gpu_g1(int keep, struct sweet_gpu_result *res);
+ int sweet_gpu_ready(void);
+ int sweet_gpu_get_param(uint32_t param, uint64_t *val);
+-int sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out, uint32_t *actual_size_out);
+-void sweet_gpu_bo_free(uint64_t pa, uint64_t iova, uint32_t size);
++struct sweet_gpu_bo_seg {
++	uint64_t pa;
++	uint32_t size;
++	uint32_t _pad;
++};
++int sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out,
++    uint32_t *actual_size_out, struct sweet_gpu_bo_seg **segs_out, uint32_t *nranges_out);
++void sweet_gpu_bo_free(uint64_t pa, struct sweet_gpu_bo_seg *segs, uint32_t nranges,
++    uint64_t iova, uint32_t size);
+ uint64_t sweet_gpu_surf_alloc_va(uint32_t size);
+ int sweet_gpu_surf_map_page(uint64_t iova, uint64_t pa);
+ void sweet_gpu_surf_tlb_inv(void);
+@@ -119,8 +127,8 @@ void sweet_gpu_irq_drain_logs(void);
+ 
+ static struct {
+ 	vm_offset_t gcc, gpucc, gmu, pdc, pdcseq, smmu, gpu, cmddb, zap;
+-	vm_offset_t dma_va;
+-	uint64_t dma_pa;
++	vm_offset_t dma_va, bo_va;
++	uint64_t dma_pa, bo_pa, bo_size;
+ 	uint32_t dma_size, dma_used;
+ 	const uint8_t *fw_gmu, *fw_sqe, *fw_zap;
+ 	uint32_t fw_gmu_len, fw_sqe_len, fw_zap_len;
+@@ -238,6 +246,7 @@ static struct {
+ #define S_CR0_USFCFG		(1u << 10)
+ #define S_IDR0			0x020
+ #define S_IDR1			0x024
++#define S_IDR2			0x028
+ #define S_GFSR			0x048
+ #define S_GFSYNR0		0x050
+ #define S_GFSYNR1		0x054
+@@ -373,8 +382,10 @@ static struct {
+ #define VA_RING			0x01010000u
+ #define VA_SCRATCH		0x01020000u
+ #define VA_BO_BASE		0x10000000ull
++#define VA_BO_SIZE_LEGACY	0x10000000ull
+ #define VA_SURF_BASE		0x20000000ull
+ #define VA_SURF_SIZE		0x60000000ull
++#define VA_BO_HIGH		0x80000000ull
+ #define SCR_SHADOW		0
+ #define SCR_FENCE		16
+ #define SCR_MAGIC		64
+@@ -382,17 +393,19 @@ static struct {
+ #define SID_GPU			0u
+ #define RING_DW			8192u
+ /*
+- * GPU page-table pool (patch 0114): every table the GPU context can ever need is reserved at
+- * bring-up, so pt_new() cannot fail afterwards (tables are never freed, only reused when the
+- * same VA is mapped again). io-pgtable stage 1, 4K granule, 39-bit VA, walk starts at L1:
+- *   1 L1 + 2 L2 (VA 0..2 GiB: SQE/ring/scratch, BOs at 0x10000000, surfaces 0x20000000..0x80000000)
++ * GPU page-table pool (patches 0114, 0120): every table the GPU context can ever need is
++ * reserved at bring-up, so pt_new() cannot fail afterwards (tables are never freed, only
++ * reused when the same VA is mapped again). io-pgtable stage 1, 4K granule, 39-bit VA,
++ * walk starts at L1:
++ *   1 L1 + 2 L2 (VA 0..2 GiB: SQE/ring/scratch, legacy BOs at 0x10000000, surfaces 0x20000000..0x80000000)
+  *   + 1 L3 (SQE/ring/scratch, all inside 0x01000000..0x011fffff)
+- *   + 1 L3 per 2 MiB of BO window (BO VA = VA_BO_BASE + page index: at most the carve-out size)
++ *   + 1 L2 per 1 GiB of high BO VA (when bo-dma puts BO VA at 0x80000000+)
++ *   + 1 L3 per 2 MiB of BO VA window
+  *   + 1 L3 per 2 MiB of surface VA window (VA_SURF_SIZE / 2 MiB = 768)
+- * 192 MiB carve-out: 4 + 96 + 768 = 868 pages (3.4 MiB); 128 MiB: 836; 16 MiB: 780.
+- * (0108 had 64 pages, 0109 512.) The pool stays in the carve-out: the context bank walks
+- * tables non-cacheable (TCR IRGN0/ORGN0 = 0), and the carve-out's Normal-NC mapping needs
+- * no cache maintenance per PTE write, unlike cacheable kernel memory.
++ * The pool stays in the low carve-out: the context bank walks tables non-cacheable
++ * (TCR IRGN0/ORGN0 = 0), and the carve-out's Normal-NC mapping needs no cache maintenance
++ * per PTE write, unlike cacheable kernel memory. TCR2_VAL sets PASize=1 (36-bit PA = 64 GiB),
++ * covering bo-dma above 4 GiB up to 0x27c000000.
+  */
+ #define GPU_PT_FIXED		4u
+ #define GPU_PT_L3_SPAN		0x200000u
+@@ -544,6 +557,15 @@ dma_va(uint64_t pa)
+ 	return g.dma_va + (vm_offset_t)(pa - g.dma_pa);
+ }
+ 
++static vm_offset_t
++bo_va_from_pa(uint64_t pa)
++{
++	if (g.bo_pa != 0) {
++		return g.bo_va + (vm_offset_t)(pa - g.bo_pa);
++	}
++	return dma_va(pa);
++}
++
+ static uint32_t
+ fw32(const uint8_t *p, uint32_t off)
+ {
+@@ -748,14 +770,29 @@ struct pt {
+ };
+ static struct pt gmu_pt, gpu_pt;
+ 
++static uint64_t bo_va_base, bo_va_size;
++
+ /* Size of the GPU context's page-table pool, see GPU_PT_FIXED. */
+ static uint32_t
+-gpu_pt_pages(void)
++gpu_pt_pages_for(uint64_t va_base, uint64_t va_size)
+ {
+-	return GPU_PT_FIXED + (g.dma_size + GPU_PT_L3_SPAN - 1u) / GPU_PT_L3_SPAN +
++	uint64_t l2 = 0, bo_span = va_size;
++	if (g.bo_pa != 0 && va_size != 0) {
++		l2 = ((va_base + va_size - 1ull) >> 30) - (va_base >> 30) + 1ull;
++	} else {
++		bo_span = g.dma_size;
++	}
++	return GPU_PT_FIXED + (uint32_t)l2 +
++	       (uint32_t)((bo_span + GPU_PT_L3_SPAN - 1ull) / GPU_PT_L3_SPAN) +
+ 	       (uint32_t)(VA_SURF_SIZE / GPU_PT_L3_SPAN);
+ }
+ 
++static uint32_t
++gpu_pt_pages(void)
++{
++	return gpu_pt_pages_for(bo_va_base, bo_va_size);
++}
++
+ static uint64_t
+ pt_new(struct pt *t)
+ {
+@@ -771,7 +808,7 @@ pt_new(struct pt *t)
+ static int
+ pt_map(struct pt *t, uint64_t va, uint64_t pa, uint32_t size, uint64_t attr)
+ {
+-	for (uint32_t off = 0; off < size; off += 4096) {
++	for (uint64_t off = 0; off < size; off += 4096) {
+ 		uint64_t v = va + off, tpa = t->root_pa;
+ 		for (int shift = 30; shift >= 21; shift -= 9) {
+ 			volatile uint64_t *e = (volatile uint64_t *)dma_va(tpa) + ((v >> shift) & 0x1ff);
+@@ -793,7 +830,7 @@ pt_map(struct pt *t, uint64_t va, uint64
+ static void
+ pt_unmap(struct pt *t, uint64_t va, uint32_t size)
+ {
+-	for (uint32_t off = 0; off < size; off += 4096) {
++	for (uint64_t off = 0; off < size; off += 4096) {
+ 		uint64_t v = va + off, tpa = t->root_pa;
+ 		int ok = 1;
+ 		for (int shift = 30; shift >= 21; shift -= 9) {
+@@ -814,16 +851,17 @@ pt_unmap(struct pt *t, uint64_t va, uint
+ static int
+ smmu_probe(void)
+ {
+-	uint32_t idr1, busy = 0, used = 0;
++	uint32_t idr1, idr2, busy = 0, used = 0;
+ 
+ 	idr0 = rd32(SMMU(S_IDR0));
+ 	idr1 = rd32(SMMU(S_IDR1));
++	idr2 = rd32(SMMU(S_IDR2));
+ 	nsmr = idr0 & 0xff;
+ 	ncb = idr1 & 0xff;
+ 	pgsz = (idr1 >> 31) ? 0x10000 : 0x1000;
+ 	npage = 2u << ((idr1 >> 28) & 7);
+-	LOG("2 SMMU idr0=%08x idr1=%08x cr0=%08x smr=%u cb=%u pg=%uK n=%u\n", idr0, idr1,
+-	    rd32(SMMU(S_CR0)), nsmr, ncb, pgsz >> 10, npage);
++	LOG("2 SMMU idr0=%08x idr1=%08x idr2=%08x cr0=%08x smr=%u cb=%u pg=%uK n=%u\n",
++	    idr0, idr1, idr2, rd32(SMMU(S_CR0)), nsmr, ncb, pgsz >> 10, npage);
+ 	if (2 * npage * pgsz != LEN_SMMU || ncb == 0 || ncb > 32 || nsmr > 128) {
+ 		LOG("SMMU layout does not match 0x10000: stopping\n");
+ 		return 0;
+@@ -1730,11 +1768,25 @@ cp_prepare(void)
+ 		return 0;
+ 	}
+ 	if (!(sqe = dma_get(9 * 1024 * 4, &pa_sqe)) || words * 4 > 9 * 1024 * 4 ||
+-	    !(ring = dma_get(RING_DW * 4, &pa_ring)) || !(scratch = dma_get(4096, &pa_scratch)) ||
+-	    !dma_get(gpu_pt_pages() * 4096, &gpu_pt.pool_pa)) {
++	    !(ring = dma_get(RING_DW * 4, &pa_ring)) || !(scratch = dma_get(4096, &pa_scratch))) {
+ 		LOG("carve-out too small\n");
+ 		return 0;
+ 	}
++	if (g.bo_pa != 0) {
++		bo_va_base = VA_BO_HIGH;
++		bo_va_size = g.bo_size * 2ull;
++		if ((uint64_t)gpu_pt_pages_for(bo_va_base, bo_va_size) * 4096ull >
++		    (uint64_t)(g.dma_size - g.dma_used)) {
++			bo_va_size = g.bo_size;
++		}
++	} else {
++		bo_va_base = VA_BO_BASE;
++		bo_va_size = VA_BO_SIZE_LEGACY;
++	}
++	if (!dma_get(gpu_pt_pages() * 4096u, &gpu_pt.pool_pa)) {
++		LOG("carve-out too small for page-table pool (%u pages)\n", gpu_pt_pages());
++		return 0;
++	}
+ 	uint32_t bad = 0;
+ 	for (uint32_t i = 0; i < words; i++) {
+ 		((volatile uint32_t *)sqe)[i] = fw32(g.fw_sqe, 4 * (i + 1));
+@@ -1749,8 +1801,8 @@ cp_prepare(void)
+ 	}
+ 	gpu_pt.used = 0;
+ 	gpu_pt.cap = gpu_pt_pages();
+-	LOG("GPU page-table pool: %u pages (%u KiB) for a %u MiB carve-out + %u MiB surface VA\n",
+-	    gpu_pt.cap, gpu_pt.cap * 4u, g.dma_size >> 20, (uint32_t)(VA_SURF_SIZE >> 20));
++	LOG("GPU page-table pool: %u pages (%u KiB) for %u MiB carve-out + %llu MiB BO VA + %u MiB surface VA\n",
++	    gpu_pt.cap, gpu_pt.cap * 4u, g.dma_size >> 20, bo_va_size >> 20, (uint32_t)(VA_SURF_SIZE >> 20));
+ 	gpu_pt.root_pa = pt_new(&gpu_pt);
+ 	if (!pt_map(&gpu_pt, VA_SQE, pa_sqe, 9 * 1024 * 4, PTE_RW | PTE_RDONLY) ||
+ 	    !pt_map(&gpu_pt, VA_RING, pa_ring, RING_DW * 4, PTE_RW) ||
+@@ -1965,8 +2017,23 @@ setup(void)
+ 		LOG("dma-region %llx+%llx refused\n", region[0], region[1]);
+ 		return 0;
+ 	}
+-	LOG("firmware from ADT: gmu %u, sqe %u, zap %u bytes; carve-out %llx+%llx\n", g.fw_gmu_len,
+-	    g.fw_sqe_len, g.fw_zap_len, region[0], region[1]);
++	uint64_t bo_region[2] = { 0, 0 };
++	if (SecureDTGetProperty(e, "bo-dma", &prop, &size) == kSuccess) {
++		if (size != sizeof(bo_region)) {
++			LOG("ADT /sweet-gpu bo-dma bad size %u\n", size);
++			return 0;
++		}
++		memcpy(bo_region, prop, sizeof(bo_region));
++		if ((bo_region[0] & 0x1fffffull) || (bo_region[1] & 0x1fffffull) ||
++		    bo_region[1] < 0x200000ull || bo_region[0] > (1ull << 36) ||
++		    bo_region[1] > (1ull << 36) - bo_region[0] ||
++		    !(bo_region[0] + bo_region[1] <= region[0] || region[0] + region[1] <= bo_region[0])) {
++			LOG("bo-dma %llx+%llx refused\n", bo_region[0], bo_region[1]);
++			return 0;
++		}
++	}
++	LOG("firmware from ADT: gmu %u, sqe %u, zap %u bytes; carve-out %llx+%llx; bo-dma %llx+%llx\n",
++	    g.fw_gmu_len, g.fw_sqe_len, g.fw_zap_len, region[0], region[1], bo_region[0], bo_region[1]);
+ 	g.gcc = ml_io_map(PA_GCC, LEN_GCC);
+ 	g.gpucc = ml_io_map(PA_GPUCC, LEN_GPUCC);
+ 	g.gmu = ml_io_map(PA_GMU, LEN_GMU);
+@@ -1980,8 +2047,18 @@ setup(void)
+ 	g.dma_pa = region[0];
+ 	g.dma_size = (uint32_t)region[1];
+ 	g.dma_used = 0;
++	if (bo_region[1] != 0) {
++		g.bo_va = ml_io_map_unmappable((vm_offset_t)bo_region[0], (vm_size_t)bo_region[1],
++		    SWEET_WIMG_WCOMB);
++		g.bo_pa = bo_region[0];
++		g.bo_size = bo_region[1];
++	} else {
++		g.bo_va = 0;
++		g.bo_pa = 0;
++		g.bo_size = 0;
++	}
+ 	if (!g.gcc || !g.gpucc || !g.gmu || !g.pdc || !g.pdcseq || !g.smmu || !g.gpu || !g.cmddb ||
+-	    !g.zap || !g.dma_va) {
++	    !g.zap || !g.dma_va || (bo_region[1] != 0 && !g.bo_va)) {
+ 		LOG("a mapping failed\n");
+ 		return 0;
+ 	}
+@@ -1993,40 +2070,134 @@ setup(void)
+ 
+ /* ---- 8. Milestone G2: BO allocator, IB submit, fence wait, msm uAPI params ---- */
+ 
+-#define BO_MAX_PAGES		65536u		/* up to 256 MiB carve-out in 4K pages */
+-static uint64_t bo_bmap[BO_MAX_PAGES / 64];
++/* 16 KiB unit bitmap (1 bit = 16 KiB XNU page = 4 GPU 4K PTEs), allocated at init */
++static uint64_t *bo_bmap;
++static uint32_t bo_bmap_words;
+ static uint64_t bo_base_pa;
+-static uint32_t bo_total_pages, bo_used_pages;
++static uint32_t bo_total_16k, bo_used_16k;
+ static uint32_t gpu_fence, gpu_faults;
+ static int gpu_ready;
+ 
+ #define SURF_MAX_FREE		128u
+-struct surf_range {
++#define BO_VA_MAX_FREE		4096u
++struct va_range {
+ 	uint64_t start, size;
+ };
+-static struct surf_range surf_free[SURF_MAX_FREE];
+-static unsigned surf_free_count;
++struct va_pool {
++	struct va_range *free;
++	uint32_t count, cap;
++};
++static struct va_range surf_free[SURF_MAX_FREE];
++static struct va_range *bo_va_buf;
++static struct va_pool surf_va_pool, bo_va_pool;
+ 
+ static void
+-bo_init(void)
++va_pool_init(struct va_pool *p, struct va_range *buf, uint32_t cap, uint64_t start, uint64_t size)
++{
++	p->free = buf;
++	p->cap = cap;
++	p->count = 1;
++	buf[0].start = start;
++	buf[0].size = size;
++}
++
++static uint64_t
++va_pool_alloc(struct va_pool *p, uint64_t need)
+ {
+-	uint32_t off = (g.dma_used + 0x3fffu) & ~0x3fffu;
++	for (uint32_t i = 0; i < p->count; i++) {
++		if (p->free[i].size < need) {
++			continue;
++		}
++		uint64_t va = p->free[i].start;
++		p->free[i].start += need;
++		p->free[i].size -= need;
++		if (p->free[i].size == 0) {
++			p->count--;
++			for (uint32_t j = i; j < p->count; j++) {
++				p->free[j] = p->free[j + 1];
++			}
++		}
++		return va;
++	}
++	return 0;
++}
+ 
+-	bzero(bo_bmap, sizeof(bo_bmap));
+-	surf_free[0].start = VA_SURF_BASE;
+-	surf_free[0].size = VA_SURF_SIZE;
+-	surf_free_count = 1;
+-	if (off >= g.dma_size) {
+-		bo_base_pa = 0;
+-		bo_total_pages = 0;
++static void
++va_pool_free(struct va_pool *p, uint64_t start, uint64_t span)
++{
++	uint32_t i = 0;
++	while (i < p->count && p->free[i].start < start) {
++		i++;
++	}
++	if (i > 0 && p->free[i - 1].start + p->free[i - 1].size == start) {
++		p->free[i - 1].size += span;
++		if (i < p->count && p->free[i - 1].start + p->free[i - 1].size == p->free[i].start) {
++			p->free[i - 1].size += p->free[i].size;
++			p->count--;
++			for (uint32_t j = i; j < p->count; j++) {
++				p->free[j] = p->free[j + 1];
++			}
++		}
++		return;
++	}
++	if (i < p->count && start + span == p->free[i].start) {
++		p->free[i].start = start;
++		p->free[i].size += span;
+ 		return;
+ 	}
+-	bo_base_pa = g.dma_pa + off;
+-	bo_total_pages = (g.dma_size - off) / 4096u;
+-	if (bo_total_pages > BO_MAX_PAGES) {
+-		bo_total_pages = BO_MAX_PAGES;
++	if (p->count < p->cap) {
++		for (uint32_t j = p->count; j > i; j--) {
++			p->free[j] = p->free[j - 1];
++		}
++		p->free[i].start = start;
++		p->free[i].size = span;
++		p->count++;
++	}
++}
++
++static int
++bo_init(void)
++{
++	if (g.bo_pa != 0) {
++		bo_base_pa = g.bo_pa;
++		bo_total_16k = (uint32_t)(g.bo_size >> 14);
++	} else {
++		uint32_t off = (g.dma_used + 0x3fffu) & ~0x3fffu;
++		if (off >= g.dma_size) {
++			bo_base_pa = 0;
++			bo_total_16k = 0;
++		} else {
++			bo_base_pa = g.dma_pa + off;
++			bo_total_16k = (g.dma_size - off) >> 14;
++		}
++	}
++	bo_used_16k = 0;
++	if (bo_total_16k != 0) {
++		uint32_t words = (bo_total_16k + 63u) / 64u;
++		if (bo_bmap != NULL && bo_bmap_words != words) {
++			kfree_data(bo_bmap, (size_t)bo_bmap_words * sizeof(uint64_t));
++			bo_bmap = NULL;
++			bo_bmap_words = 0;
++		}
++		if (bo_bmap == NULL) {
++			bo_bmap = (uint64_t *)kalloc_data((size_t)words * sizeof(uint64_t), Z_WAITOK);
++			if (bo_bmap == NULL) {
++				bo_total_16k = 0;
++				return 0;
++			}
++			bo_bmap_words = words;
++		}
++		bzero(bo_bmap, (size_t)bo_bmap_words * sizeof(uint64_t));
+ 	}
+-	bo_used_pages = 0;
++	if (bo_va_buf == NULL) {
++		bo_va_buf = (struct va_range *)kalloc_data(BO_VA_MAX_FREE * sizeof(*bo_va_buf), Z_WAITOK);
++		if (bo_va_buf == NULL) {
++			return 0;
++		}
++	}
++	va_pool_init(&bo_va_pool, bo_va_buf, BO_VA_MAX_FREE, bo_va_base, bo_va_size);
++	va_pool_init(&surf_va_pool, surf_free, SURF_MAX_FREE, VA_SURF_BASE, VA_SURF_SIZE);
++	return 1;
+ }
+ 
+ int
+@@ -2042,22 +2213,7 @@ sweet_gpu_surf_alloc_va(uint32_t size)
+ 	if (!gpu_ready || need == 0) {
+ 		return 0;
+ 	}
+-	for (unsigned i = 0; i < surf_free_count; i++) {
+-		if (surf_free[i].size < need) {
+-			continue;
+-		}
+-		uint64_t va = surf_free[i].start;
+-		surf_free[i].start += need;
+-		surf_free[i].size -= need;
+-		if (surf_free[i].size == 0) {
+-			surf_free_count--;
+-			for (unsigned j = i; j < surf_free_count; j++) {
+-				surf_free[j] = surf_free[j + 1];
+-			}
+-		}
+-		return va;
+-	}
+-	return 0;
++	return va_pool_alloc(&surf_va_pool, need);
+ }
+ 
+ int
+@@ -2081,34 +2237,7 @@ sweet_gpu_surf_unmap(uint64_t iova, uint
+ 	}
+ 	pt_unmap(&gpu_pt, iova, (uint32_t)span);
+ 	cb_tlb_inv(gcbbase);
+-	unsigned i = 0;
+-	while (i < surf_free_count && surf_free[i].start < iova) {
+-		i++;
+-	}
+-	if (i > 0 && surf_free[i - 1].start + surf_free[i - 1].size == iova) {
+-		surf_free[i - 1].size += span;
+-		if (i < surf_free_count && surf_free[i - 1].start + surf_free[i - 1].size == surf_free[i].start) {
+-			surf_free[i - 1].size += surf_free[i].size;
+-			surf_free_count--;
+-			for (unsigned j = i; j < surf_free_count; j++) {
+-				surf_free[j] = surf_free[j + 1];
+-			}
+-		}
+-		return;
+-	}
+-	if (i < surf_free_count && iova + span == surf_free[i].start) {
+-		surf_free[i].start = iova;
+-		surf_free[i].size += span;
+-		return;
+-	}
+-	if (surf_free_count < SURF_MAX_FREE) {
+-		for (unsigned j = surf_free_count; j > i; j--) {
+-			surf_free[j] = surf_free[j - 1];
+-		}
+-		surf_free[i].start = iova;
+-		surf_free[i].size = span;
+-		surf_free_count++;
+-	}
++	va_pool_free(&surf_va_pool, iova, span);
+ }
+ 
+ int
+@@ -2176,11 +2305,12 @@ bmap_clr(uint32_t p)
+ 	bo_bmap[p >> 6] &= ~(1ull << (p & 63));
+ }
+ 
+-/* sweet_gpu_bo_alloc() failures (patch 0114); nothing is left allocated or mapped after any of them. */
++/* sweet_gpu_bo_alloc() failures (patches 0114, 0120); nothing is left allocated or mapped after any of them. */
+ #define BO_ERR_ARGS		(-1)	/* GPU not ready, size 0 or > 256 MiB */
+-#define BO_ERR_FULL		(-2)	/* fewer free carve-out pages than asked for */
+-#define BO_ERR_FRAGMENTED	(-3)	/* enough free pages, but no contiguous 16K-aligned run */
+-#define BO_ERR_PT		(-4)	/* GPU page-table pool exhausted (cannot happen with 0114's pool) */
++#define BO_ERR_FULL		(-2)	/* fewer free BO pool pages than asked for */
++#define BO_ERR_FRAGMENTED	(-3)	/* GPU BO VA window fragmented */
++#define BO_ERR_PT		(-4)	/* GPU page-table pool exhausted (cannot happen with scaled pool) */
++#define BO_ERR_NOMEM		(-5)	/* kernel memory exhausted allocating segment list */
+ 
+ const char *
+ sweet_gpu_bo_error(int err)
+@@ -2189,114 +2319,241 @@ sweet_gpu_bo_error(int err)
+ 	case BO_ERR_ARGS:
+ 		return "GPU not ready or size refused";
+ 	case BO_ERR_FULL:
+-		return "carve-out full";
++		return "BO pool full";
+ 	case BO_ERR_FRAGMENTED:
+-		return "carve-out fragmented (no contiguous run)";
++		return "BO VA fragmented";
+ 	case BO_ERR_PT:
+ 		return "GPU page-table pool exhausted";
++	case BO_ERR_NOMEM:
++		return "out of kernel memory";
+ 	default:
+ 		return "?";
+ 	}
+ }
+ 
++static void
++bo_bmap_free_run(uint64_t pa, uint32_t bytes)
++{
++	if (pa < bo_base_pa) {
++		return;
++	}
++	uint32_t start = (uint32_t)((pa - bo_base_pa) >> 14);
++	uint32_t cnt = bytes >> 14;
++	for (uint32_t i = 0; i < cnt && start + i < bo_total_16k; i++) {
++		if (bmap_test(start + i)) {
++			bmap_clr(start + i);
++			if (bo_used_16k > 0) {
++				bo_used_16k--;
++			}
++		}
++	}
++}
++
++static int
++bo_next_free_run(uint32_t *cursor, uint32_t max_len, uint32_t *start_out, uint32_t *len_out)
++{
++	uint32_t p = *cursor;
++
++	while (p < bo_total_16k) {
++		if ((p & 63u) == 0 && bo_bmap[p >> 6] == ~0ull) {
++			p += 64u;
++			continue;
++		}
++		if (!bmap_test(p)) {
++			break;
++		}
++		p++;
++	}
++	if (p >= bo_total_16k) {
++		*cursor = p;
++		return 0;
++	}
++	uint32_t start = p;
++	while (p < bo_total_16k && (max_len == 0 || (p - start) < max_len)) {
++		if ((p & 63u) == 0 && p + 64u <= bo_total_16k &&
++		    (max_len == 0 || (p - start) + 64u <= max_len) &&
++		    bo_bmap[p >> 6] == 0ull) {
++			p += 64u;
++			continue;
++		}
++		if (bmap_test(p)) {
++			break;
++		}
++		p++;
++	}
++	*cursor = p;
++	*start_out = start;
++	*len_out = p - start;
++	return 1;
++}
++
+ /*
+- * Allocate a BO from the carve-out bitmap (16K-aligned for XNU's 16K VM
+- * device pager, mapped with 4K PTEs in the GPU SMMU at VA_BO_BASE + p*4K).
+- * First fit from the bottom; every BO is a whole number of 4-page (16K) groups
+- * starting on a group boundary, so the bitmap only ever holds whole groups.
++ * Allocate a BO from the BO pool bitmap (16K units for XNU's 16K VM device pager, mapped
++ * with 4K PTEs in the GPU SMMU from a coalescing GPU VA window). Prefers best-fit contiguous;
++ * if fragmented, gathers non-contiguous 16K runs and maps them into one contiguous GPU IOVA
++ * (caller maps them to user CPU VA via IOMemoryDescriptor::withAddressRanges).
+  * Called with gSweetGPULock held. Returns 0 or a BO_ERR_* code.
+  */
+ int
+-sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out, uint32_t *actual_size_out)
++sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out,
++    uint32_t *actual_size_out, struct sweet_gpu_bo_seg **segs_out, uint32_t *nranges_out)
+ {
+ 	if (!gpu_ready || size == 0 || size > 0x10000000u) {
+ 		return BO_ERR_ARGS;
+ 	}
+ 	uint32_t actual = (size + 0x3fffu) & ~0x3fffu;
+-	uint32_t npages = actual / 4096u;
+-	if (npages > bo_total_pages - bo_used_pages) {
++	uint32_t n16k = actual >> 14;
++	if (n16k > bo_total_16k - bo_used_16k) {
+ 		return BO_ERR_FULL;
+ 	}
+-	for (uint32_t p = 0; p + npages <= bo_total_pages; p += 4) {
+-		uint32_t k = 0;
+-		while (k < npages && !bmap_test(p + k)) {
+-			k++;
++	uint64_t attr = PTE_RW | ((flags & 2u) ? PTE_RDONLY : 0);
++
++	/* Pass 1: best-fit contiguous 16K run. */
++	uint32_t cursor = 0, start = 0, len = 0, best_start = 0, best_len = ~0u;
++	while (bo_next_free_run(&cursor, 0, &start, &len)) {
++		if (len >= n16k && len < best_len) {
++			best_start = start;
++			best_len = len;
++			if (len == n16k) {
++				break;
++			}
+ 		}
+-		if (k < npages) {
+-			p += k & ~3u;
+-			continue;
++	}
++
++	if (best_len != ~0u) {
++		uint64_t pa = bo_base_pa + (uint64_t)best_start * 16384ull;
++		uint64_t iova = va_pool_alloc(&bo_va_pool, actual);
++		if (iova == 0) {
++			return BO_ERR_FRAGMENTED;
+ 		}
+-		uint64_t pa = bo_base_pa + (uint64_t)p * 4096ull;
+-		uint64_t iova = VA_BO_BASE + (uint64_t)p * 4096ull;
+-		uint64_t attr = PTE_RW | ((flags & 2u) ? PTE_RDONLY : 0);
+-		zero(dma_va(pa), actual);
++		zero(bo_va_from_pa(pa), actual);
+ 		if (!pt_map(&gpu_pt, iova, pa, actual, attr)) {
+ 			pt_unmap(&gpu_pt, iova, actual);
+ 			cb_tlb_inv(gcbbase);
++			va_pool_free(&bo_va_pool, iova, actual);
+ 			return BO_ERR_PT;
+ 		}
+ 		cb_tlb_inv(gcbbase);
+-		for (uint32_t i = 0; i < npages; i++) {
+-			bmap_set(p + i);
++		for (uint32_t i = 0; i < n16k; i++) {
++			bmap_set(best_start + i);
+ 		}
+-		bo_used_pages += npages;
++		bo_used_16k += n16k;
+ 		*pa_out = pa;
+ 		*iova_out = iova;
+ 		*actual_size_out = actual;
++		*segs_out = NULL;
++		*nranges_out = 1;
+ 		return 0;
+ 	}
+-	return BO_ERR_FRAGMENTED;
++
++	/* Fallback: gather non-contiguous 16K runs. Count segments first so allocation never leaks. */
++	uint32_t need = n16k, nranges = 0;
++	cursor = 0;
++	while (need > 0 && bo_next_free_run(&cursor, need, &start, &len)) {
++		need -= len;
++		nranges++;
++	}
++	if (need != 0 || nranges == 0) {
++		return BO_ERR_FULL;
++	}
++
++	struct sweet_gpu_bo_seg *segs = (struct sweet_gpu_bo_seg *)kalloc_data(
++	    (size_t)nranges * sizeof(*segs), Z_WAITOK);
++	if (segs == NULL) {
++		return BO_ERR_NOMEM;
++	}
++	uint64_t iova = va_pool_alloc(&bo_va_pool, actual);
++	if (iova == 0) {
++		kfree_data(segs, (size_t)nranges * sizeof(*segs));
++		return BO_ERR_FRAGMENTED;
++	}
++
++	uint32_t seg_idx = 0, va_off = 0;
++	need = n16k;
++	cursor = 0;
++	while (need > 0 && seg_idx < nranges && bo_next_free_run(&cursor, need, &start, &len)) {
++		uint32_t bytes = len * 16384u;
++		uint64_t pa = bo_base_pa + (uint64_t)start * 16384ull;
++		segs[seg_idx].pa = pa;
++		segs[seg_idx].size = bytes;
++		segs[seg_idx]._pad = 0;
++		zero(bo_va_from_pa(pa), bytes);
++		if (!pt_map(&gpu_pt, iova + va_off, pa, bytes, attr)) {
++			pt_unmap(&gpu_pt, iova, va_off + bytes);
++			cb_tlb_inv(gcbbase);
++			va_pool_free(&bo_va_pool, iova, actual);
++			kfree_data(segs, (size_t)nranges * sizeof(*segs));
++			return BO_ERR_PT;
++		}
++		va_off += bytes;
++		need -= len;
++		seg_idx++;
++	}
++	cb_tlb_inv(gcbbase);
++	for (uint32_t k = 0; k < seg_idx; k++) {
++		uint32_t rstart = (uint32_t)((segs[k].pa - bo_base_pa) >> 14);
++		uint32_t rcnt = segs[k].size >> 14;
++		for (uint32_t i = 0; i < rcnt; i++) {
++			bmap_set(rstart + i);
++		}
++	}
++	bo_used_16k += n16k;
++	*pa_out = segs[0].pa;
++	*iova_out = iova;
++	*actual_size_out = actual;
++	*segs_out = segs;
++	*nranges_out = seg_idx;
++	return 0;
+ }
+ 
+ /*
+- * Carve-out and page-table pool usage for the ioreg counters (patch 0114). Called with
++ * BO pool and page-table pool usage for the ioreg counters (patches 0114, 0120). Called with
+  * gSweetGPULock held (the bitmap and counters only change under it). Largest free = the
+- * longest run of free 16K groups, i.e. the biggest GEM_NEW that can succeed now.
++ * longest contiguous run of free 16K groups.
+  */
+ void
+ sweet_gpu_mem_stats(struct sweet_gpu_mem_stats *st)
+ {
+-	uint32_t run = 0, best = 0;
++	uint32_t cursor = 0, start = 0, len = 0, best = 0;
+ 
+ 	bzero(st, sizeof(*st));
+ 	if (!gpu_ready) {
+ 		return;
+ 	}
+-	for (uint32_t p = 0; p + 4u <= bo_total_pages; p += 4u) {
+-		if (bmap_test(p)) {
+-			run = 0;
+-		} else if (++run > best) {
+-			best = run;
++	while (bo_next_free_run(&cursor, 0, &start, &len)) {
++		if (len > best) {
++			best = len;
+ 		}
+ 	}
+-	st->carve_kb = bo_total_pages * 4u;
+-	st->carve_used_kb = bo_used_pages * 4u;
+-	st->carve_free_kb = (bo_total_pages - bo_used_pages) * 4u;
+-	st->carve_largest_free_kb = best * 16u;
++	st->carve_kb = (uint32_t)((uint64_t)bo_total_16k * 16ull);
++	st->carve_used_kb = (uint32_t)((uint64_t)bo_used_16k * 16ull);
++	st->carve_free_kb = (uint32_t)((uint64_t)(bo_total_16k - bo_used_16k) * 16ull);
++	st->carve_largest_free_kb = (uint32_t)((uint64_t)best * 16ull);
+ 	st->pt_used = gpu_pt.used;
+ 	st->pt_total = gpu_pt.cap;
+ }
+ 
+ void
+-sweet_gpu_bo_free(uint64_t pa, uint64_t iova, uint32_t size)
++sweet_gpu_bo_free(uint64_t pa, struct sweet_gpu_bo_seg *segs, uint32_t nranges,
++    uint64_t iova, uint32_t size)
+ {
+-	if (!gpu_ready || pa < bo_base_pa || size == 0) {
+-		return;
+-	}
+-	uint32_t p = (uint32_t)((pa - bo_base_pa) / 4096ull);
+-	uint32_t npages = ((size + 0x3fffu) & ~0x3fffu) / 4096u;
+-	if (p + npages > bo_total_pages) {
++	if (!gpu_ready || size == 0) {
++		if (segs != NULL && nranges != 0) {
++			kfree_data(segs, (size_t)nranges * sizeof(*segs));
++		}
+ 		return;
+ 	}
+-	pt_unmap(&gpu_pt, iova, npages * 4096u);
++	uint32_t actual = (size + 0x3fffu) & ~0x3fffu;
++	pt_unmap(&gpu_pt, iova, actual);
+ 	cb_tlb_inv(gcbbase);
+-	for (uint32_t i = 0; i < npages; i++) {
+-		if (bmap_test(p + i)) {
+-			bmap_clr(p + i);
+-			if (bo_used_pages > 0) {
+-				bo_used_pages--;
+-			}
++	va_pool_free(&bo_va_pool, iova, actual);
++	if (segs != NULL) {
++		for (uint32_t k = 0; k < nranges; k++) {
++			bo_bmap_free_run(segs[k].pa, segs[k].size);
+ 		}
++		kfree_data(segs, (size_t)nranges * sizeof(*segs));
++	} else {
++		bo_bmap_free_run(pa, actual);
+ 	}
+ }
+ 
+@@ -2748,12 +3005,19 @@ down:
+ 		LOG("G1 FAILED at stage %u\n", res->stage);
+ 	}
+ 	if (ok && keep) {
+-		bo_init();
++		if (!bo_init()) {
++			LOG("BO allocator init failed\n");
++			drop();
++			return -1;
++		}
+ 		gpu_irq_arm();
+ 		gpu_ready = 1;
+ 		res->kept_on = 1;
+-		LOG("GPU left on: GMU running, GX held by OOB GPU_SET, ring idle at wptr %u, BO pool %u pages (%u KiB)\n",
+-		    wp, bo_total_pages, bo_total_pages * 4);
++		LOG("GPU left on: GMU running, GX held by OOB GPU_SET, ring idle at wptr %u; "
++		    "dma 0x%llx+%u MiB, BO pool %s 0x%llx+%u MiB (%u 4K pages, %u KiB; GPU VA 0x%llx+%llu MiB)\n",
++		    wp, g.dma_pa, g.dma_size >> 20, g.bo_pa ? "high" : "carve-out",
++		    bo_base_pa, bo_total_16k / 64u, bo_total_16k * 4u,
++		    bo_total_16k * 16u, bo_va_base, bo_va_size >> 20);
+ 		return 0;
+ 	}
+ 	drop();
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -83,8 +83,15 @@ struct sweet_gpu_result {
+ int sweet_gpu_g1(int keep, struct sweet_gpu_result *res);       /* bsd/dev/sweet_gpu.c */
+ int sweet_gpu_ready(void);
+ int sweet_gpu_get_param(uint32_t param, uint64_t *val);
+-int sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out, uint32_t *actual_size_out);
+-void sweet_gpu_bo_free(uint64_t pa, uint64_t iova, uint32_t size);
++struct sweet_gpu_bo_seg {
++	uint64_t pa;
++	uint32_t size;
++	uint32_t _pad;
++};
++int sweet_gpu_bo_alloc(uint32_t size, uint32_t flags, uint64_t *pa_out, uint64_t *iova_out,
++    uint32_t *actual_size_out, struct sweet_gpu_bo_seg **segs_out, uint32_t *nranges_out);
++void sweet_gpu_bo_free(uint64_t pa, struct sweet_gpu_bo_seg *segs, uint32_t nranges,
++    uint64_t iova, uint32_t size);
+ uint64_t sweet_gpu_surf_alloc_va(uint32_t size);
+ int sweet_gpu_surf_map_page(uint64_t iova, uint64_t pa);
+ void sweet_gpu_surf_tlb_inv(void);
+@@ -586,16 +593,18 @@ struct drm_gem_close {
+ #define MSM_SUBMIT_CMD_BUF      1u
+ #define MSM_SUBMIT_FENCE_FD_OUT 0x20000000u
+ 
+-#define SWEET_GPU_MAX_BOS       1024u
++#define SWEET_GPU_MAX_BOS       4096u
+ #define SWEET_GPU_MAX_CMDS      128u
+ #define SWEET_GPU_PATIENCE_MS   5000u
+ 
+ struct sweet_gpu_bo {
+ 	IOMemoryDescriptor *mem;
+ 	SweetSurface *surface;
++	struct sweet_gpu_bo_seg *segs;
+ 	uint64_t pa;
+ 	uint64_t iova;
+ 	uint32_t size;
++	uint32_t nranges;
+ 	uint32_t flags;
+ 	uint32_t fence;
+ 	uint32_t seed;
+@@ -784,14 +793,14 @@ SweetGPUUserClient::allocFailedLocked(ui
+ 	}
+ 	struct sweet_gpu_mem_stats ms;
+ 	sweet_gpu_mem_stats(&ms);
+-	printf("SWEET GPU: GEM_NEW %s %llu bytes flags 0x%x REFUSED (#%llu): %s; carve-out used %u KiB, free %u KiB, "
++	printf("SWEET GPU: GEM_NEW %s %llu bytes flags 0x%x REFUSED (#%llu): %s; BO pool used %u KiB, free %u KiB, "
+ 	    "largest free %u KiB of %u KiB; page tables %u/%u; %llu live BOs\n", fProcName, size, flags, n,
+ 	    sweet_gpu_bo_error(err), ms.carve_used_kb, ms.carve_free_kb, ms.carve_largest_free_kb, ms.carve_kb,
+ 	    ms.pt_used, ms.pt_total, SWEET_STAT_LOAD(gStatBOs));
+ 	for (uint32_t i = 0; i < SWEET_GPU_LISTED; i++) {
+ 		SweetGPUUserClient *c = gGPUClients[i];
+ 		if (c != NULL && (c->fCarveBOs != 0 || c->fImports != 0)) {
+-			printf("SWEET GPU:   holder %s: %u BOs %llu KiB of carve-out, %u imports %llu KiB of surfaces\n",
++			printf("SWEET GPU:   holder %s: %u BOs %llu KiB, %u imports %llu KiB of surfaces\n",
+ 			    c->fProcName, c->fCarveBOs, c->fCarveBytes >> 10, c->fImports, c->fImportBytes >> 10);
+ 		}
+ 	}
+@@ -884,13 +893,18 @@ SweetGPUUserClient::releaseBOLocked(stru
+ 		fImportBytes -= b->size;
+ 		fImports--;
+ 		b->surface->release();
++		b->mem->release();
+ 	} else {
+-		sweet_gpu_bo_free(b->pa, b->iova, b->size);
++		struct sweet_gpu_bo_seg *segs = b->segs;
++		uint32_t nranges = b->nranges;
++		uint64_t pa = b->pa, iova = b->iova;
++		uint32_t size = b->size;
++		b->mem->release();
++		sweet_gpu_bo_free(pa, segs, nranges, iova, size);
+ 		__atomic_fetch_sub(&gStatBOs, 1ull, __ATOMIC_RELAXED);
+-		fCarveBytes -= b->size;
++		fCarveBytes -= size;
+ 		fCarveBOs--;
+ 	}
+-	b->mem->release();
+ 	bzero(b, sizeof(*b));
+ }
+ 
+@@ -955,29 +969,43 @@ SweetGPUUserClient::gemNew(struct drm_ms
+ 		return kIOReturnNoResources;    /* sweet-drm: ENOMEM */
+ 	}
+ 	uint64_t pa = 0, iova = 0;
+-	uint32_t actual = 0;
+-	int err = sweet_gpu_bo_alloc((uint32_t)req->size, req->flags, &pa, &iova, &actual);
++	uint32_t actual = 0, nranges = 0;
++	struct sweet_gpu_bo_seg *segs = NULL;
++	int err = sweet_gpu_bo_alloc((uint32_t)req->size, req->flags, &pa, &iova, &actual, &segs, &nranges);
+ 	if (err != 0) {
+ 		/* sweet_gpu_bo_alloc() leaves nothing behind on failure; the slot was not touched */
+ 		allocFailedLocked(req->size, req->flags, err);
+ 		IOLockUnlock(gSweetGPULock);
+ 		return kIOReturnNoMemory;       /* sweet-drm: ENOMEM, Mesa purges its BO cache and retries once */
+ 	}
+-	IOMemoryDescriptor *mem = IOMemoryDescriptor::withAddressRange(
+-	    pa, actual,
+-	    kIODirectionInOut | kIOMemoryMapperNone |
+-	    (kIOWriteCombineCache << kIOMemoryBufferCacheShift),
+-	    TASK_NULL);
++	IOOptionBits memOpts = kIODirectionInOut | kIOMemoryMapperNone |
++	    (kIOWriteCombineCache << kIOMemoryBufferCacheShift);
++	IOMemoryDescriptor *mem = NULL;
++	if (segs == NULL) {
++		mem = IOMemoryDescriptor::withAddressRange(pa, actual, memOpts, TASK_NULL);
++	} else {
++		IOAddressRange *ior = (IOAddressRange *)IOMallocData((size_t)nranges * sizeof(IOAddressRange));
++		if (ior != NULL) {
++			for (uint32_t i = 0; i < nranges; i++) {
++				ior[i].address = segs[i].pa;
++				ior[i].length = segs[i].size;
++			}
++			mem = IOMemoryDescriptor::withAddressRanges(ior, nranges, memOpts, TASK_NULL);
++			IOFreeData(ior, (size_t)nranges * sizeof(IOAddressRange));
++		}
++	}
+ 	if (mem == NULL) {
+-		sweet_gpu_bo_free(pa, iova, actual);
++		sweet_gpu_bo_free(pa, segs, nranges, iova, actual);
+ 		IOLockUnlock(gSweetGPULock);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	struct sweet_gpu_bo *b = &fBOs[slot];
+ 	b->mem = mem;
++	b->segs = segs;
+ 	b->pa = pa;
+ 	b->iova = iova;
+ 	b->size = actual;
++	b->nranges = nranges;
+ 	b->flags = req->flags;
+ 	b->fence = 0;
+ 	req->handle = slot + 1;
