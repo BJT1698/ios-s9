@@ -588,7 +588,7 @@ bg_check_spi(void)
    if (family >= 1001 && family <= 1009) r = family - 1000 <= apple_max;          // MTLGPUFamilyApple1..9
    else if (family == 3001 || family == 3002) r = YES;                            // MTLGPUFamilyCommon1, Common2
    else {
-      Class base = [self superclass];
+      Class base = class_getSuperclass([BGMTLDevice class]);
       if ([base instancesRespondToSelector:_cmd])
          r = ((BOOL (*)(struct objc_super *, SEL, NSInteger))objc_msgSendSuper)(&(struct objc_super){ self, base }, _cmd, family);
       else
@@ -600,7 +600,7 @@ bg_check_spi(void)
 - (BOOL)supportsFeatureSet:(NSUInteger)set
 {
    BOOL r = NO;
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLDevice class]);
    if ([base instancesRespondToSelector:_cmd])
       r = ((BOOL (*)(struct objc_super *, SEL, NSUInteger))objc_msgSendSuper)(&(struct objc_super){ self, base }, _cmd, set);
    else
@@ -656,7 +656,7 @@ bg_air_slice(NSData *d)
                                   userInfo:@{ NSLocalizedDescriptionKey : @"no AIR slice in the metallib" }];
       return nil;
    }
-   if (![[self superclass] instancesRespondToSelector:@selector(newLibraryWithData:error:)] &&
+   if (![class_getSuperclass([BGMTLDevice class]) instancesRespondToSelector:@selector(newLibraryWithData:error:)] &&
        ![self respondsToSelector:@selector(newLibraryWithData:error:)]) {
       BG_LOG("SPI missing: _MTLDevice newLibraryWithData:error:\n");
       if (error)
@@ -692,7 +692,7 @@ bg_air_slice(NSData *d)
 // Binary archives: opened empty if _MTLDevice implements newBinaryArchiveWithDescriptor:error:.
 - (id)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error
 {
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLDevice class]);
    if (![base instancesRespondToSelector:_cmd]) {
       BG_LOG("SPI missing: %s newBinaryArchiveWithDescriptor:error:\n", class_getName(base));
       return [self bgFail:error with:@"newBinaryArchiveWithDescriptor:error: missing on base device"];
@@ -991,7 +991,7 @@ bg_air_slice(NSData *d)
 @implementation BGMTLCommandQueue
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor
 {
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLCommandQueue class]);
    if ([base instancesRespondToSelector:@selector(initWithDevice:descriptor:)])
       self = [super initWithDevice:device descriptor:descriptor];
    else if ([base instancesRespondToSelector:@selector(initWithDevice:)]) {
@@ -1015,7 +1015,7 @@ bg_air_slice(NSData *d)
 @implementation BGMTLCommandBuffer
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue
 {
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLCommandBuffer class]);
    if ([base instancesRespondToSelector:@selector(initWithQueue:retainedReferences:synchronousDebugMode:)])
       self = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];
    else if ([base instancesRespondToSelector:@selector(initWithQueue:retainedReferences:)]) {
@@ -1697,7 +1697,7 @@ bg_super_end_encoding(id self, Class cls)
 + (void)load { ensure_protocol(self, "MTLSamplerState"); }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLSamplerDescriptor *)d
 {
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLSampler class]);
    if ([base instancesRespondToSelector:@selector(initWithDevice:samplerDescriptor:)])
       self = [super initWithDevice:device samplerDescriptor:d];
    else {
@@ -1731,7 +1731,7 @@ bg_super_end_encoding(id self, Class cls)
 + (void)load { ensure_protocol(self, "MTLDepthStencilState"); }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d
 {
-   Class base = [self superclass];
+   Class base = class_getSuperclass([BGMTLDepthStencil class]);
    if ([base instancesRespondToSelector:@selector(initWithDevice:depthStencilDescriptor:)])
       self = [super initWithDevice:device depthStencilDescriptor:d];
    else {
