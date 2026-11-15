@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "bgmtl.h"
 
 struct ProbeParams {
    uint32_t seed;
@@ -231,32 +230,68 @@ main(int argc, char **argv)
    @autoreleasepool {
       setvbuf(stdout, NULL, _IONBF, 0);
 
+      BOOL system_mode = NO;
+      const char *explicit_lib = NULL;
+      for (int i = 1; i < argc; i++) {
+         if (strcmp(argv[i], "--system") == 0) {
+            system_mode = YES;
+         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("usage: op6-mtl-probe [--system] [op6_probe.metallib]\n");
+            return 0;
+         } else if (!explicit_lib) {
+            explicit_lib = argv[i];
+         }
+      }
+
       NSArray<id<MTLDevice>> *(*copy_all)(void) = dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
       void (*add_dev)(id<MTLDevice>) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
       id<MTLDevice> (*create_def)(void) = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
 
-      NSArray *before = copy_all ? copy_all() : nil;
-      printf("devices before registration: %lu\n", (unsigned long)[before count]);
-
-      id<MTLDevice> created = bgmtl_create_device();
-      if (!created) {
-         printf("DEVICE: FAIL (bgmtl_create_device returned nil)\n");
-         return 1;
-      }
-
-      /*
-       * iOS 16.7.16: with no accelerator in the system, Metal.framework never creates its internal
-       * device array and MTLAddDevice() asserts (_deviceArray != NULL). Registering a system-wide
-       * device is G6b's job (IOAcceleratorES + MetalPlugin); for G6a, test our device directly.
-       */
       id<MTLDevice> sysdev = nil;
-      if ([before count] > 0 && add_dev) {
-         add_dev(created);
-         sysdev = create_def ? create_def() : nil;
+      if (system_mode) {
+         printf("mode: system (MTLCreateSystemDefaultDevice, no libbgmtl preloaded)\n");
+         NSArray *devs = copy_all ? copy_all() : nil;
+         printf("MTLCopyAllDevices count: %lu\n", (unsigned long)[devs count]);
+         sysdev = create_def ? create_def() : MTLCreateSystemDefaultDevice();
+         if (!sysdev) {
+            printf("DEVICE: FAIL (MTLCreateSystemDefaultDevice returned nil)\n");
+            return 1;
+         }
       } else {
-         printf("DEVICE: note: Metal has no device array on this system (no accelerator): "
-                "MTLAddDevice skipped, testing BGMTLDevice directly\n");
-         sysdev = created;
+         NSArray *before = copy_all ? copy_all() : nil;
+         printf("devices before registration: %lu\n", (unsigned long)[before count]);
+
+         void *bg_handle = dlopen("@rpath/libbgmtl.dylib", RTLD_NOW);
+         if (!bg_handle) bg_handle = dlopen("/usr/local/lib/libbgmtl.dylib", RTLD_NOW);
+         if (!bg_handle) {
+            printf("DEVICE: FAIL (dlopen libbgmtl.dylib: %s)\n", dlerror() ?: "unknown");
+            return 1;
+         }
+         id (*create_bgmtl)(void) = dlsym(bg_handle, "bgmtl_create_device");
+         if (!create_bgmtl) {
+            printf("DEVICE: FAIL (dlsym bgmtl_create_device: %s)\n", dlerror() ?: "unknown");
+            return 1;
+         }
+
+         id<MTLDevice> created = create_bgmtl();
+         if (!created) {
+            printf("DEVICE: FAIL (bgmtl_create_device returned nil)\n");
+            return 1;
+         }
+
+         /*
+          * iOS 16.7.16: without an IOAcceleratorES service (sweetmetal=1 + bundle), Metal.framework
+          * has no internal device array and MTLAddDevice() asserts (_deviceArray != NULL).
+          * In direct G6a mode without an accelerator, test BGMTLDevice directly.
+          */
+         if ([before count] > 0 && add_dev) {
+            add_dev(created);
+            sysdev = create_def ? create_def() : nil;
+         } else {
+            printf("DEVICE: note: Metal has no device array on this system (no accelerator): "
+                   "MTLAddDevice skipped, testing BGMTLDevice directly\n");
+            sysdev = created;
+         }
       }
       if (!sysdev) {
          printf("DEVICE: FAIL (no device)\n");
@@ -266,7 +301,7 @@ main(int argc, char **argv)
              sysdev.name.UTF8String, class_getName([sysdev class]),
              (unsigned long long)[sysdev registryID]);
 
-      NSString *lib_path = find_metallib(argc > 1 ? argv[1] : NULL);
+      NSString *lib_path = find_metallib(explicit_lib);
       if (!lib_path) {
          printf("LIBRARY: FAIL (op6_probe.metallib not found)\n");
          return 1;

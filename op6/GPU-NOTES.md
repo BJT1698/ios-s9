@@ -547,3 +547,72 @@ write went elsewhere.
       ```
       (Exits 0; no reboot or `backboardd` restart required.)
 - 2026-11-14 **Metal G6a PASS on device** (Chlorophyll MIT port by Antigravity e29298c + Claude fixes: air_metal.c uses struct sweet_drm_sbo; probe skips MTLAddDevice; op6-mesa run 43649519327). Installed only /usr/local/lib/libbgair.dylib + libbgmtl.dylib and /var/root/op6-mtl-probe + op6_probe.metallib (backboardd's libOSMesa untouched). Output: `rwa_device_open: FD630`; DEVICE PASS `FD630 (OP6)` class BGMTLDevice registryID 0x10000b630; LIBRARY PASS (AIR slice 10585 bytes); COMPUTE PASS (pipeline max_threads 1024, exec_width 32; 272 words, 0 mismatches); RENDER PASS (256x256: clear (128,0,0,255) at corners, triangle center (127,65,63), apex blue-dominant, bottom-left red-dominant, bottom-right green-dominant). iOS 16.7.16 note: Metal.framework has no device array without an accelerator, so MTLAddDevice() asserts (`_deviceArray != NULL`): system-wide registration needs G6b (IOAcceleratorES + MetalPlugin bundle).
+
+
+## 2026-11-15 — Metal G6b: System-wide IOAcceleratorES + Chlorophyll.bundle (ready for CI/device)
+
+Goal G6b makes `MTLCreateSystemDefaultDevice()` return our `CHLDevice` (`BGMTLDevice` subclass, `Adreno 630`) system-wide for allowlisted processes while keeping `backboardd` on the G4 GLES compositor (`op6/ca-bridge` + `0116` zero-copy scan-out, "metal=2 sandwich").
+
+### Architecture & design
+
+1. **Kernel (`xnu/patches/0117-op6-metal-accelerator.patch`, mirrored in `op6/xnu-patches/`):**
+   - Defines `IOAcceleratorES : IOService` and `SweetAccelerator : IOAcceleratorES` in `iokit/Kernel/arm/SweetGPU.cpp`.
+   - Inside `SweetGPU::bringup()`, after `self->registerService()`, checks boot-arg `sweetmetal=1` (default off).
+   - Only when `sweetmetal=1`, board is `oneplus,enchilada`, `fMode == 2` (`sweetgpu=2`), and `sweet_gpu_g1()` succeeded with `kept_on != 0`, `SweetGPU` attaches and registers `SweetAccelerator` with:
+     - `MetalPluginName` = `"Chlorophyll"`
+     - `MetalPluginClassName` = `"CHLDevice"`
+     - `model` = `"Adreno 630"`
+   - Sets `SweetGPU` registry property `SweetGPUMetal` = `"on"`, `"disabled"`, `"off"`, or `"failed"`.
+   - Publishing inside `bringup()` avoids publishing `IOAcceleratorES` during the `sweetgpudelay` window (before `gSweetGPUState == 1`), which would otherwise cause early processes to fail `bgmtl_gpu_state()` and cache `nil` via `Metal.framework`'s `dispatch_once`.
+   - `IOGLBundleName` is intentionally omitted so `OpenGLES.framework` ignores `SweetAccelerator`.
+
+2. **Plugin bundle (`op6/metal/plugin/`):**
+   - Built by `op6/metal/plugin/build.sh` as `out/bundle/Chlorophyll.bundle` (`NSPrincipalClass = CHLDevice`, ad-hoc signed, `-Wl,-rpath,/usr/local/lib -Wl,-rpath,@loader_path` with `install_name_tool` rewriting `libbgair.dylib` to `@rpath/libbgair.dylib`).
+   - All `BG*` Objective-C classes and `bgmtl_*` C entry points in the bundled copy of `bgmtl.m` are prefixed (`CHL_BG*` / `chl_bgmtl_*`) so loading `/System/Library/Extensions/Chlorophyll.bundle` into a process that also has `/usr/local/lib/libbgmtl.dylib` cannot collide.
+   - `+[CHLDevice allocWithZone:]` runs process and GPU gating **before** `[super allocWithZone:]` (returning `nil` before `_MTLDevice` allocation avoids `-dealloc` `dispatch_release(NULL)` crashes):
+     - Unconditionally refuses `backboardd` (returns `nil` -> `MTLCreateSystemDefaultDevice()` returns `nil` -> `20H392` `QuartzCore` `EAGLServer::renderer()` falls back to `EAGLContext` / `libsweet-gl.dylib`). Note: `20H392` `QuartzCore` has no `CA_USE_METAL=0` env var; `caenv=CA_ENABLE_OGL=1` can also be set via `sweetinject` if an explicit override is ever needed.
+     - Reads `/var/local/op6-mtl-clients` (one process name per line, `#` comments, `*` = all except `backboardd`, `-name` = explicit exclude). If `/var/local/op6-mtl-clients` is missing (`ENOENT`), defaults to `op6-mtl-probe` only. Emergency kill switch: `/var/local/op6-mtl.off`.
+     - Verifies `bgmtl_gpu_state()` reports ready (`1`).
+     - Sets `CA_USE_CGTEXTUREDATA=0`, `CI_USE_MTL_DAG_FOR_CIKL_SRC=0`, and `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` before device creation.
+   - `-[CHLDevice newPipelineLibraryWithFilePath:error:]` returns `nil` cleanly so `20H392` `QuartzCore`/`UIKit` callers do not attempt to parse Apple-GPU `.pipelinelib` caches (`supportsExtendedXR10Formats` -> `NO` is already in `bgmtl.m`).
+
+3. **Probe & CI (`.github/workflows/op6-mesa.yml`, `op6/metal/test/op6-mtl-probe.m`):**
+   - Added `--system` mode to `op6-mtl-probe`: calls `MTLCopyAllDevices()` and `MTLCreateSystemDefaultDevice()` directly without calling `bgmtl_create_device()` or `MTLAddDevice()`. Non-`--system` G6a mode loads `libbgmtl.dylib` lazily via `dlopen`, so `--system` starts with zero `libbgmtl.dylib` preloaded.
+   - Extended `.github/workflows/op6-mesa.yml` to build `out/bundle/Chlorophyll.bundle` (ad-hoc signed) and `out/bundle/op6-mtl-clients`.
+
+### Device install steps (after CI builds `xnu` and `op6-mesa`)
+
+1. Ensure G6a libraries are installed in `/usr/local/lib/` (`libbgair.dylib`, `libbgmtl.dylib`) and `/usr/local/bin/` (`op6-mtl-probe`, `op6_probe.metallib`).
+2. Copy the bundle and default allowlist from the `op6-mesa` artifact onto the rootfs:
+   - `out/bundle/Chlorophyll.bundle` -> `/System/Library/Extensions/Chlorophyll.bundle` (`chmod -R 0755`, `Info.plist` `0644`, `chown -R 0:0`).
+   - `out/bundle/op6-mtl-clients` -> `/var/local/op6-mtl-clients` (`0644`, `chown 0:0`; contains `op6-mtl-probe`).
+3. Flash/boot the CI-built kernel containing patch `0117` and add `sweetmetal=1` to boot-args (keeping `sweetgpu=2`).
+
+### Expected logs & device test plan
+
+- **Kernel (`dmesg` / persistent log):**
+  - After `SWEET GPU: service registered (stage 7, magic 0xc0ffee01, GPU on)`:
+    `SWEET GPU: IOAcceleratorES published (SweetAccelerator, Chlorophyll/CHLDevice)`
+  - `ioreg -l -c IOAcceleratorES` shows `SweetAccelerator` with `MetalPluginName = "Chlorophyll"`, `MetalPluginClassName = "CHLDevice"`, `model = "Adreno 630"`, and `SweetGPU` has `SweetGPUMetal = "on"`.
+- **Userspace (`os_log`, subsystem `com.op6.chlorophyll`, category `plugin`):**
+  - `backboardd`: `refused backboardd: backboardd stays on G4 GLES compositor`; screen remains on working G4 GLES compositor (`sweet-gl` + `0116` scan-out).
+  - `op6-mtl-probe`: `allowing op6-mtl-probe (GPU ready, kernel ABI minor ...)`
+- **Test 1 (`op6-mtl-probe --system`):**
+  - Run `/usr/local/bin/op6-mtl-probe --system /usr/local/bin/op6_probe.metallib`.
+  - Expect:
+    - `mode: system (MTLCreateSystemDefaultDevice, no libbgmtl preloaded)`
+    - `MTLCopyAllDevices count: 1`
+    - `DEVICE: PASS name="FD630 (OP6)" class=CHLDevice registryID=0x...`
+    - `LIBRARY: PASS`, `COMPUTE: PASS`, `RENDER: PASS`.
+- **Test 2 (simple stock `20H392` consumer without App Store):**
+  - Keep `op6-mtl-probe` in `/var/local/op6-mtl-clients` and test adding a single stock UIKit/CoreAnimation process (e.g. `Calculator`, `MobileNotes`, or `SpringBoard`) one line at a time, launch it on-device, verify the screen stays intact and `os_log` shows `allowing <proc>` without `SIGSEGV`/`SIGABRT` or missing-SPI traps, then remove it if unstable.
+
+### Rollback
+
+- Drop `sweetmetal=1` from boot-args (kernel no longer publishes `IOAcceleratorES`; G4 GLES + G6a `bgmtl_create_device()` remain unchanged), or create `/var/local/op6-mtl.off` / empty `/var/local/op6-mtl-clients` for an immediate runtime disable without touching the kernel.
+
+### Separate prerequisite notes for `PosterBoard` / `ExtensionFoundation` (not implemented in G6b)
+
+- On iOS 16.7.16 (`20H392`), `PosterBoard` relies on `ExtensionFoundation` to discover poster `.appex` plugins (`lsd` + signed extension point cache).
+- Before enumerating extension caches, `ExtensionFoundation` queries the `AppleMobileFileIntegrity` IOKit user client selector `6` (trust-cache query). `ios-op6`'s `sweet_amfi.c` does not yet implement selector `6` (reference: `ios-flame` patch `0103-flame-amfi-trust-query.patch`).
+- `PosterBoard` + wallpaper poster plugins (`AegirPoster`, `InfinityPoster`, etc.) also require those processes in `/var/local/op6-mtl-clients` (or `*`), plus working LaunchServices / extension registration.

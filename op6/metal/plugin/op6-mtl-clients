@@ -1,0 +1,4 @@
+# OP6 Metal system-wide client allowlist (/var/local/op6-mtl-clients)
+# One process name per line; '#' starts a comment; '*' allows all except backboardd;
+# '-name' explicitly excludes a process even when '*' is set.
+op6-mtl-probe

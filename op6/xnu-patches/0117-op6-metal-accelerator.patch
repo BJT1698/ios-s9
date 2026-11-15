@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index c9fc0c6..0db8e71 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -16,6 +16,9 @@
+  *   SweetGPUFirmwareSQE SQE firmware version
+  *   SweetGPUState       "off" (sweetgpu=1, shut down after the test),
+  *                       "on" (sweetgpu=2, GPU left running), "failed"
++ *   SweetGPUMetal       "disabled" (no sweetmetal=1), "off" (GPU off/failed),
++ *                       "on" (SweetAccelerator : IOAcceleratorES published),
++ *                       or "failed"
+  *
+  * When sweetgpu=2, SweetGPUUserClient exposes the Linux msm DRM uAPI subset
+  * that Mesa's freedreno and sweetgpu-test use (selectors 0x09 and 0x40..0x4c,
+@@ -155,6 +158,24 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetGPU, IOService);
+ 
++/*
++ * Milestone G6b: IOAcceleratorES service published when sweetmetal=1 and the
++ * GPU is left running (sweetgpu=2). Metal.framework on iOS 16.7.16 (20H392)
++ * matches IOServiceMatching("IOAcceleratorES") and loads
++ * /System/Library/Extensions/<MetalPluginName>.bundle with principal class
++ * <MetalPluginClassName>. IOGLBundleName is intentionally omitted so
++ * OpenGLES.framework ignores it and backboardd stays on G4 GLES.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class SweetAccelerator : public IOAcceleratorES {
++	OSDeclareDefaultStructors(SweetAccelerator);
++};
++OSDefineMetaClassAndStructors(SweetAccelerator, IOAcceleratorES);
++
+ static void
+ sweet_gpu_irq_wakeup(void *arg __unused)
+ {
+@@ -275,6 +296,33 @@ SweetGPU::bringup(void *arg, wait_result_t wr)
+ 	self->registerService();
+ 	IOLog("SWEET GPU: service registered (stage %u, magic 0x%08x, %s)\n", r.stage, r.magic,
+ 	    rc ? "failed" : r.kept_on ? "GPU on" : "GPU off");
++
++	uint32_t metal = 0;
++	(void)PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal));
++	if (metal == 1) {
++		if (self->fMode != 2 || rc != 0 || r.kept_on == 0 ||
++		    !sweet_gpu_board_is("oneplus,enchilada")) {
++			self->setProperty("SweetGPUMetal", "off");
++			IOLog("SWEET GPU: sweetmetal=1 ignored (fMode=%d rc=%d kept_on=%u)\n",
++			    self->fMode, rc, r.kept_on);
++		} else {
++			SweetAccelerator *accel = OSTypeAlloc(SweetAccelerator);
++			if (accel != NULL && accel->init(NULL) && accel->attach(self)) {
++				accel->setProperty("MetalPluginName", "Chlorophyll");
++				accel->setProperty("MetalPluginClassName", "CHLDevice");
++				accel->setProperty("model", "Adreno 630");
++				accel->registerService();
++				self->setProperty("SweetGPUMetal", "on");
++				IOLog("SWEET GPU: IOAcceleratorES published (SweetAccelerator, Chlorophyll/CHLDevice)\n");
++			} else {
++				self->setProperty("SweetGPUMetal", "failed");
++				IOLog("SWEET GPU: IOAcceleratorES publish failed\n");
++			}
++			OSSafeReleaseNULL(accel);
++		}
++	} else {
++		self->setProperty("SweetGPUMetal", "disabled");
++	}
+ 	self->release();
+ 	(void)thread_terminate(current_thread());
+ }

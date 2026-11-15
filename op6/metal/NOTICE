@@ -37,3 +37,10 @@ Chlorophyll (`@787338f`, MIT), which in turn builds upon the `metal` branch of h
      `Metal.framework` compatibility.
    - `op6/mesa/patches/`: dropped `fd-bo-new-purge-retry.patch` in favor of OP6's existing
      `0004-freedreno-gpu-oom.patch` and `0005-freedreno-skip-null-bo-draws.patch`.
+
+4. **ios-flame (`SweetMetal2.mm`, MIT) & OP6 Milestone G6b**
+   - `op6/metal/plugin/` (`chlorophyll_plugin.m`, `build.sh`, `Info.plist`, `op6-mtl-clients`):
+     adapted from `Chlorophyll/plugin/` (`@787338f`, MIT) with OP6 `/var/local/op6-mtl-clients`
+     allowlist parsing (`*` and `-name` exclusions) and `-newPipelineLibraryWithFilePath:error:`
+     refusal + `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` patterns derived from `ios-flame`
+     `phone/metal2/SweetMetal2.mm` (MIT; no GPL/LGPL code reused).
