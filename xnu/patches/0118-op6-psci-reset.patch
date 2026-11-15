@@ -1,0 +1,178 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 7182b44..d256b4d 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -143,6 +143,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ #define SP_IMEM_RESTART_REASON  0x65cu
+ 
+ static int sweet_next_boot;
++static vm_offset_t sp_pon_chan, sp_imem;
++static uint16_t sp_pon_chan_apid = SP_NO_APID;
+ 
+ static int
+ sp_pon_read(uint16_t apid, unsigned reg, uint8_t *out)
+@@ -188,7 +190,11 @@ sp_pon_set_reason(unsigned reason)
+ 	unsigned shift = (subtype == 0x08 || subtype == 0x09) ? 1 : 2;
+ 	uint8_t keep = (uint8_t)((1u << shift) - 1);
+ 	uint8_t value = (uint8_t)((spare & keep) | (reason << shift));
+-	vm_offset_t chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x100);
++	if (!sp_pon_chan || sp_pon_chan_apid != apid) {
++		sp_pon_chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x100);
++		sp_pon_chan_apid = apid;
++	}
++	vm_offset_t chan = sp_pon_chan;
+ 	if (!chan) {
+ 		goto out;
+ 	}
+@@ -206,7 +212,10 @@ sp_pon_set_reason(unsigned reason)
+ 	}
+ 	uint8_t check = 0;
+ 	(void)sp_pon_read(apid, SP_PON_SOFT_RB_SPARE, &check);
+-	vm_offset_t imem = ml_io_map(SP_IMEM_PA, 0x1000);
++	if (!sp_imem) {
++		sp_imem = ml_io_map(SP_IMEM_PA, 0x1000);
++	}
++	vm_offset_t imem = sp_imem;
+ 	if (imem) {
+ 		*(volatile uint32_t *)(imem + SP_IMEM_RESTART_REASON) = reason ? 0x77665500u | reason : 0;
+ 		__asm__ volatile("dsb sy" ::: "memory");
+@@ -218,6 +227,23 @@ out:
+ 	return err;
+ }
+ 
++void
++sweet_spmi_flush_next_boot(void)
++{
++	int reason = __atomic_load_n(&sweet_next_boot, __ATOMIC_ACQUIRE);
++
++	/*
++	 * sysctl_sweet_next_boot already wrote PON SOFT_RB_SPARE and IMEM when
++	 * kern.sweet_next_boot was set. In normal reboot context (IRQs on),
++	 * re-run sp_pon_set_reason() to ensure ordering before PSCI reset;
++	 * in panic/IRQ-off context skip IOLock/ml_io_map and just drain writes.
++	 */
++	if (reason != 0 && ml_get_interrupts_enabled()) {
++		(void)sp_pon_set_reason((unsigned)reason);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static int
+ sysctl_sweet_next_boot SYSCTL_HANDLER_ARGS
+ {
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..8be53fc 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* Flush/order any pending kern.sweet_next_boot write before SoC reset. */
++void sweet_spmi_flush_next_boot(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..e3c8bda 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,66 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++extern "C" void sweet_spmi_flush_next_boot(void);
++
++#define PSCI_SYSTEM_OFF         0x84000008ULL
++#define PSCI_SYSTEM_RESET       0x84000009ULL
++
++static uint32_t sweet_panic_reboot;
++
++static int32_t
++sweet_psci_call(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
++	    :
++	    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	      "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	uint64_t fn;
++	const char *op;
++
++	if (type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) {
++		if (!sweet_panic_reboot) {
++			kprintf("SWEET: panic screen held (set sweetpanicreboot=1 to reset on panic)\n");
++			for (;;) {
++				__asm__ volatile("wfe");
++			}
++		}
++		type = kPERestartCPU;
++	}
++
++	switch (type) {
++	case kPERestartCPU:
++		sweet_spmi_flush_next_boot();
++		fn = PSCI_SYSTEM_RESET;
++		op = "SYSTEM_RESET";
++		break;
++	case kPEHaltCPU:
++		fn = PSCI_SYSTEM_OFF;
++		op = "SYSTEM_OFF";
++		break;
++	default:
++		return -1;
++	}
++
++	kprintf("SWEET: PSCI %s (fn=0x%llx, type=%u)\n", op, fn, type);
++	__asm__ volatile("dsb sy" ::: "memory");
++	int32_t rc = sweet_psci_call(fn);
++	kprintf("SWEET: PSCI %s returned %d\n", op, rc);
++	return -1;
++}
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -29,8 +89,11 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	(void)PE_parse_boot_argn("sweetpanicreboot", &sweet_panic_reboot, sizeof(sweet_panic_reboot));
++	PE_halt_restart = sweet_halt_restart;
+ 	registerService();
+-	IOLog("SWEET: platform expert registered\n");
++	IOLog("SWEET: platform expert registered (PSCI reset/off installed, panicreboot=%u)\n",
++	    sweet_panic_reboot ? 1u : 0u);
+ 	return true;
+ }
+ 
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..8e70bc1 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -408,6 +408,14 @@ panic_init(void)
+ #endif /* defined(__arm64__) */
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint32_t sweet_panic_reboot = 0;
++	if (PE_parse_boot_argn("sweetpanicreboot", &sweet_panic_reboot, sizeof(sweet_panic_reboot)) &&
++	    sweet_panic_reboot != 0) {
++		panicDebugging = FALSE;
++	}
++#endif
++
+ #if defined(__arm64__)
+ 	char kdpname[80];
+ 
