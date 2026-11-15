@@ -10,6 +10,8 @@
 // G6a does NOT register automatically on +load and does NOT touch backboardd/CoreAnimation or IOAcceleratorES.
 // The test tool creates the device via bgmtl_create_device() and registers it in-process with MTLAddDevice().
 #import <Foundation/Foundation.h>
+#include <os/log.h>
+#include <unistd.h>
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
 #include <pthread.h>
@@ -67,18 +69,24 @@ static void
 bg_log(const char *fmt, ...)
 {
    va_list ap;
+   char line[1024];
    va_start(ap, fmt);
-   fprintf(stderr, "op6mtl[%d]: ", getpid());
-   vfprintf(stderr, fmt, ap);
+   vsnprintf(line, sizeof line, fmt, ap);
    va_end(ap);
+   fprintf(stderr, "op6mtl[%d]: %s", getpid(), line);
+   // Daemons (chronod, SpringBoard...) have no stderr: also send every line to the unified log (oslog -l).
+   static os_log_t lg;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{ lg = os_log_create("com.op6.metal", "runtime"); });
+   os_log(lg, "%{public}s", line);
 }
 
-// OP6MTL_TRACE=1: one line per command buffer, render pass, pipeline build and commit
+// OP6MTL_TRACE=1 or the file /var/local/op6-mtl-trace: one line per command buffer, render pass, pipeline build and commit
 static int
 bg_trace(void)
 {
    static int t = -1;
-   if (t < 0) t = getenv("OP6MTL_TRACE") != NULL;
+   if (t < 0) t = getenv("OP6MTL_TRACE") != NULL || access("/var/local/op6-mtl-trace", F_OK) == 0;
    return t;
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
