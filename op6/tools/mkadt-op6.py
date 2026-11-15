@@ -285,6 +285,10 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
         ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+        # D22AP values: MobileGestalt reads soc-generation (wallpaper and
+        # feature compatibility by SoC class).
+        ('soc-generation', cstr('H10')),
+        ('chip-revision', u32(0)),
     ], [gic,
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
         # otherwise crashes trying to set the PMU boot stage (customer builds
@@ -354,6 +358,9 @@ def build(seed=None, qemu=False, scale=3, phys_base=PHYS_BASE, top=MEM_TOP, d22a
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
+        # MobileGestalt HardwarePlatform (iBoot fills it on the real D22AP);
+        # without it CoreVideo/WallpaperKit find no compatible wallpaper.
+        ('platform-name', cstr('t8015')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),

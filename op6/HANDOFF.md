@@ -168,7 +168,7 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - `boot-G4g-192.img` restored and verified.
 - **Next:** GPU IRQs (G5); wallpaper; real battery level; daemon trim; booting without the PC (flash `boot-G4g-192.img` to boot_b, after asking the user).
 
-## 5d. App extensions & wallpaper (`amfi-0119`, host-verified only)
+## 5d. App extensions & wallpaper (`amfi-0119`, device-verified 2026-11-15)
 
 - **Problem:** widgets and wallpaper are black (`ioreg -l | grep -c AppleMobileFileIntegrity` = 0). `ExtensionFoundation` queries `AppleMobileFileIntegrity` selector `6` (trust-cache query) before reading the signed extension point cache, and `installd` waits 5 s per bundle when `/chosen/mac-address-wifi0` is missing.
 - **Fixes (ported from `ios-flame`, MIT):**
@@ -176,6 +176,11 @@ The same debug shell can export `userdata` to the PC as a USB disk: `. /init_fun
   - `op6/tools/mkadt-op6.py`: emits `/chosen/mac-address-{wifi0,bluetooth0,ethernet0}` (`02:4f:50:36:00:01..03`, 6-byte data, default on).
   - `op6/phone-tools/`: ports `lsreg.m` (+ `lsreg-ents.plist`), `oslog.m` (+ `oslog-ents.plist`), `exq.m`, and `build.sh`, built into `out/bin/` by `.github/workflows/op6-mesa.yml`.
 - **On-device procedure (after CI `xnu` + `op6-mesa` builds):** rebuild ADT with `mkadt-op6.py` + kernel with `0119`, boot the image, install `lsreg`/`oslog`/`exq` to `/var/local/bin/`, run `lsreg -r` once (LaunchServices database persists on `userdata`), check `exq` (expect hundreds of extension records and `com.apple.posterkit.provider` providers instead of ~0-1), then reboot so `PosterBoard` / `chronod` pick up the rebuilt database.
+
+- **Device result 2026-11-15 (`boot-K19b.img` = kernel run 43700203130 with 0118+0119, ADT `op6-gpu192n.adt`, G6b boot-args incl. `sweetmetal=1`):** `SWEET AMFI: trust cache query ... trusted`; `lsreg -r` (40 s) took LaunchServices from 1 to 414 extension records; widget extensions and PosterBoard + 8 poster providers now run.
+  - **Widgets:** grey placeholders until chronod was excluded from Metal (`-chronod` in `/var/local/op6-mtl-clients`, same as ios-flame: RenderBox widgets only work on the CPU path); chronod had spun ~9 min CPU in Metal. Now they load ("No content available" only where there is no data).
+  - **Wallpaper:** the default 7400 was "not compatible": the OP6 logical screen class is `414w-896h@2x~iphone`, the iPhone X bundles are `375w-812h@3x`. `op6/tools/op6-wallpaper-class.sh` (PC, idempotent) clones the 375x812@3x bundles under the OP6 class (same aspect). ADT also gets `platform-name t8015` and `/arm-io soc-generation H10` + `chip-revision` (D22AP values; MobileGestalt HardwarePlatform/soc-generation errors gone). Wallpaper visible on screen.
+- **Automatic reboot to fastboot (0118 + 0090):** `sysctl -w kern.sweet_next_boot=1; reboot`. On the OP6 use **1**, not 2: 0090 picks reason shift 2 from PON subtype 0x04, but the pm8998 wants shift 1 (Linux `qcom,pm8998-pon`), so bootloader (2<<1) = `0x04` = what value 1 writes. With 2 (`0x08`) ABL boots `boot_b` (old pmOS kernel). TODO: fix the shift in 0090 for the OP6.
 
 ## 6. What comes next (GPU-XNU-PLAN.md)
 

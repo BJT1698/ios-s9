@@ -31,4 +31,6 @@ Labels: device-verified unless noted.
 | 2026-11-14 | GPU G4 zero-copy | backboardd's b3a8 screen surface imported into the GPU (0112/0113 + Mesa 0003): drawn in place, 10-19 ms/frame (was 47-64), colours correct, much smoother |
 | 2026-11-14 | GPU OOM (Mesa 0004/0005) | Mesa 0004 + 0005 (`op6-mesa` run `43598167134`): 32 MiB carve-out stress test (`boot-G4g-32.img`, 120s) survives `SweetGPUAllocFails=95` / `GL_OUT_OF_MEMORY` with 0 `backboardd` crashes and 0 GPU faults; `boot-G4g-192.img` (192 MiB) restored as default |
 
+| 2026-11-15 | Widgets + wallpaper | AMFI stand-in 0119 + `lsreg -r` (1 -> 414 extension records), chronod off Metal, wallpaper class 414w-896h@2x clones, ADT soc-generation/platform-name: widgets load, wallpaper visible; 0118 PSCI reset: automatic reboot to fastboot from iOS (`kern.sweet_next_boot=1`) |
+
 Next: IRQs (G5), daemon trim, CPU clocks, full 8 GB. See XNU-PLAN.md.
